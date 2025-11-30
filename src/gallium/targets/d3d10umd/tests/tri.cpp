@@ -96,10 +96,8 @@ main(int argc, char *argv[])
         D3D_FEATURE_LEVEL_10_0
     };
 
-    HMODULE hSoftware = LoadLibraryA("libgallium_d3d10.dll");
-    if (!hSoftware) {
-       return EXIT_FAILURE;
-    }
+    //HMODULE hSoftware = LoadLibraryA("libgallium_d3d10.dll"); //akre
+    HMODULE hSoftware = NULL;
 
     DXGI_SWAP_CHAIN_DESC SwapChainDesc;
     ZeroMemory(&SwapChainDesc, sizeof SwapChainDesc);
@@ -118,7 +116,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11DeviceContext> pDeviceContext;
     ComPtr<IDXGISwapChain> pSwapChain;
     hr = D3D11CreateDeviceAndSwapChain(nullptr,
-                                       D3D_DRIVER_TYPE_SOFTWARE,
+                                       D3D_DRIVER_TYPE_HARDWARE,
                                        hSoftware,
                                        Flags,
                                        FeatureLevels,
@@ -130,24 +128,28 @@ main(int argc, char *argv[])
                                        nullptr, /* pFeatureLevel */
                                        &pDeviceContext);
     if (FAILED(hr)) {
+        fprintf(stderr, "D3D11CreateDeviceAndSwapChain failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
     ComPtr<IDXGIDevice> pDXGIDevice;
     hr = pDevice->QueryInterface(IID_IDXGIDevice, (void **)&pDXGIDevice);
     if (FAILED(hr)) {
+        fprintf(stderr, "QueryInterface failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
     ComPtr<IDXGIAdapter> pAdapter;
     hr = pDXGIDevice->GetAdapter(&pAdapter);
     if (FAILED(hr)) {
+        fprintf(stderr, "GetAdapter failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
     DXGI_ADAPTER_DESC Desc;
     hr = pAdapter->GetDesc(&Desc);
     if (FAILED(hr)) {
+        fprintf(stderr, "GetDesc failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -156,6 +158,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11Texture2D> pBackBuffer;
     hr = pSwapChain->GetBuffer(0, IID_ID3D11Texture2D, (void **)&pBackBuffer);
     if (FAILED(hr)) {
+        fprintf(stderr, "GetBuffer failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -168,6 +171,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11RenderTargetView> pRenderTargetView;
     hr = pDevice->CreateRenderTargetView(pBackBuffer.Get(), &RenderTargetViewDesc, &pRenderTargetView);
     if (FAILED(hr)) {
+        fprintf(stderr, "CreateRenderTargetView failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -180,6 +184,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11VertexShader> pVertexShader;
     hr = pDevice->CreateVertexShader(g_VS, sizeof g_VS, nullptr, &pVertexShader);
     if (FAILED(hr)) {
+        fprintf(stderr, "CreateVertexShader failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -199,6 +204,7 @@ main(int argc, char *argv[])
                                     g_VS, sizeof g_VS,
                                     &pVertexLayout);
     if (FAILED(hr)) {
+        fprintf(stderr, "CreateInputLayout failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -207,6 +213,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11PixelShader> pPixelShader;
     hr = pDevice->CreatePixelShader(g_PS, sizeof g_PS, nullptr, &pPixelShader);
     if (FAILED(hr)) {
+        fprintf(stderr, "CreatePixelShader failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -235,6 +242,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11Buffer> pVertexBuffer;
     hr = pDevice->CreateBuffer(&BufferDesc, &BufferData, &pVertexBuffer);
     if (FAILED(hr)) {
+        fprintf(stderr, "CreateBuffer failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
 
@@ -260,6 +268,7 @@ main(int argc, char *argv[])
     ComPtr<ID3D11RasterizerState> pRasterizerState;
     hr = pDevice->CreateRasterizerState(&RasterizerDesc, &pRasterizerState);
     if (FAILED(hr)) {
+        fprintf(stderr, "CreateRasterizerState failed %lx\n\r", hr);
         return EXIT_FAILURE;
     }
     pDeviceContext->RSSetState(pRasterizerState.Get());
@@ -268,9 +277,12 @@ main(int argc, char *argv[])
 
     pDeviceContext->Draw(_countof(vertices), 0);
 
-    pSwapChain->Present(0, 0);
-
-    Sleep(1000);
+    hr = pSwapChain->Present(0, 0);
+    if (FAILED(hr)) {
+        fprintf(stderr,"Present failed %lx\n\r", hr);
+        return EXIT_FAILURE;
+    }
+    Sleep(5000);
 
     ID3D11Buffer *pNullBuffer = nullptr;
     UINT NullStride = 0;
