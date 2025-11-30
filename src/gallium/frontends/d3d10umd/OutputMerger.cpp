@@ -49,16 +49,12 @@ GetPipeRenderTargetView(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
 
    // Validate that surface texture matches resource 
    // If it is not (resource rotated) then recreate surface
-   struct pipe_surface *currentSurface = pRenderTargetView->surface;
+   struct pipe_surface *currentSurface = &pRenderTargetView->surface;
    Resource *res = pRenderTargetView->resource;
    if (currentSurface->texture != res->resource) {
-      struct pipe_context *pipe = currentSurface->context;
-      struct pipe_surface *newSurface = pipe->create_surface(pipe, res->resource, currentSurface);
-      pipe_surface_reference(&pRenderTargetView->surface, newSurface);
-      pipe_surface_reference(&newSurface, NULL);
+      pipe_resource_reference(&currentSurface->texture, res->resource);
    }
-
-   return pRenderTargetView->surface;
+   return &pRenderTargetView->surface;
 }
 
 /*
@@ -771,17 +767,8 @@ SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
 
    pDevice->fb.nr_cbufs = 0;
 
-   //akre
-   //for (unsigned i = 0; i < RTargets; ++i) {
-   //    pipe_surface_reference(&pDevice->fb.cbufs[i],
-   //        GetPipeRenderTargetView(phRenderTargetView[i]));
-   //    if (pDevice->fb.cbufs[i]) {
-   //        pDevice->fb.nr_cbufs = i + 1;
-   //    }
-   //}
-
    for (unsigned i = 0; i < RTargets; ++i) {
-      struct pipe_surface *psurf = CastPipeRenderTargetView(phRenderTargetView[i]);
+      struct pipe_surface *psurf = GetPipeRenderTargetView(phRenderTargetView[i]);
       pipe_resource_reference(&pDevice->fb.cbufs[i].texture,
                               psurf && psurf->texture ? psurf->texture : NULL);
       if (psurf && psurf->texture) {
