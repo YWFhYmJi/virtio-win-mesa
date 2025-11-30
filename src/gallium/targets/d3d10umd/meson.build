@@ -28,7 +28,8 @@ libgallium_d3d10 = shared_library(
   install : true,
 )
 
-if with_tests
+#if with_tests
+if true
   test(
     'd3d10',
     executable(
