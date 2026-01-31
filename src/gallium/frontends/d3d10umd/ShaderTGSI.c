@@ -742,6 +742,8 @@ translate_operand(struct Shader_xlate *sx,
             reg = sx->outputs[operand->index[0].imm].reg[0];
          } else {
             unsigned i;
+            /* Default to a valid component in case writemask has no low bits. */
+            reg = sx->outputs[operand->index[0].imm].reg[0];
             for (i = 0; i < 4; ++i) {
                unsigned mask = 1 << i;
                if ((writemask & mask)) {
@@ -894,10 +896,12 @@ translate_src_operand(struct Shader_xlate *sx,
             reg = ureg_src_indirect(sx->inputs[operand->base.index[0].imm].reg, tmp);
          }
             break;
-         default:
-            /* XXX: Other index representations.
-             */
+        default:
+           /* XXX: Other index representations.
+            */
             LOG_UNSUPPORTED(true);
+            /* Ensure reg is initialized even for unsupported index reps. */
+            reg = ureg_src(ureg_DECL_temporary(sx->ureg));
 
          }
       } else {
@@ -920,10 +924,12 @@ translate_src_operand(struct Shader_xlate *sx,
             reg = ureg_src_indirect(sx->inputs[operand->base.index[1].imm].reg, tmp);
          }
             break;
-         default:
-            /* XXX: Other index representations.
-             */
+        default:
+           /* XXX: Other index representations.
+            */
             LOG_UNSUPPORTED(true);
+            /* Ensure reg is initialized even for unsupported index reps. */
+            reg = ureg_src(ureg_DECL_temporary(sx->ureg));
          }
 
          switch (operand->base.index[0].index_rep) {
@@ -942,10 +948,12 @@ translate_src_operand(struct Shader_xlate *sx,
             reg = ureg_src_dimension_indirect(reg, tmp, operand->base.index[0].imm);
          }
             break;
-         default:
-            /* XXX: Other index representations.
-             */
+        default:
+           /* XXX: Other index representations.
+            */
             LOG_UNSUPPORTED(true);
+            /* Ensure reg is initialized even for unsupported index reps. */
+            reg = ureg_src(ureg_DECL_temporary(sx->ureg));
          }
       }
       break;
@@ -1028,6 +1036,8 @@ translate_src_operand(struct Shader_xlate *sx,
          /* XXX: Other index representations.
           */
          LOG_UNSUPPORTED(true);
+         /* Ensure reg is initialized even for unsupported index reps. */
+         reg = ureg_src(ureg_DECL_temporary(sx->ureg));
       }
 
       break;
@@ -1052,6 +1062,8 @@ translate_src_operand(struct Shader_xlate *sx,
          /* XXX: Other index representations.
           */
          LOG_UNSUPPORTED(true);
+         /* Ensure reg is initialized even for unsupported index reps. */
+         reg = ureg_src(ureg_DECL_temporary(sx->ureg));
       }
       break;
 
