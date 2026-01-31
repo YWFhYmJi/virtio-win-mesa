@@ -144,7 +144,7 @@ virgl_hw_res_destroy(struct virgl_gdi_winsys *qdws, struct virgl_hw_res *res)
    FREE(res);
 }
 
-static boolean
+static bool
 virgl_gdi_resource_is_busy(struct virgl_winsys *vws, struct virgl_hw_res *res)
 {
    if (!p_atomic_read(&res->maybe_busy) && !p_atomic_read(&res->shared))
@@ -508,7 +508,7 @@ virgl_gdi_fence_reference(struct virgl_winsys *vws,
    *dst = src;
 }
 
-static boolean virgl_gdi_winsys_resource_get_handle(struct virgl_winsys *qws,
+static bool virgl_gdi_winsys_resource_get_handle(struct virgl_winsys *qws,
                                                     struct virgl_hw_res *res,
                                                     uint32_t stride,
                                                     struct winsys_handle
@@ -588,7 +588,7 @@ virgl_gdi_resource_wait(struct virgl_winsys *qws, struct virgl_hw_res *res)
 
 static void
 virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
-                   struct virgl_hw_res *res, boolean write_buf)
+                   struct virgl_hw_res *res, bool write_buf)
 {
    struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
    struct virgl_gdi_cmd_buf *cbuf = virgl_gdi_cmd_buf(_cbuf);
@@ -625,7 +625,7 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
    }
 }
 
-static boolean
+static bool
 virgl_gdi_res_is_ref(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
                      struct virgl_hw_res *res)
 {
@@ -684,8 +684,8 @@ virgl_gdi_cmd_buf_create(struct virgl_winsys *qws, uint32_t size)
    cbuf->res_bo =
       CALLOC(render.NewAllocationListSize, sizeof(struct virgl_hw_res *));
 
-   cbuf->base.buf =
-      (uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR);
+   cbuf->base.buf = (uint32_t *)
+      ((uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR));
    return &cbuf->base;
 }
 
@@ -741,8 +741,8 @@ virgl_gdi_winsys_submit_cmd(struct virgl_winsys *qws,
       return -1;
    }
 
-   cbuf->base.buf =
-      (uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR);
+   cbuf->base.buf = (uint32_t *)
+      ((uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR));
    cbuf->base.cdw = 0;
 
    for (int i = 0; i < cbuf->alloc_count; i++) {
