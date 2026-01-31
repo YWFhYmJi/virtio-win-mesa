@@ -136,7 +136,9 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
       return S_OK;
    };
 
-   device->device.base.setDisplayMode(&device->device.base, (D3DKMT_HANDLE)handle.handle);
+   const auto kmt_handle =
+      static_cast<D3DKMT_HANDLE>(reinterpret_cast<uintptr_t>(handle.handle));
+   device->device.base.setDisplayMode(&device->device.base, kmt_handle);
 
    return S_OK;
 }
