@@ -27,6 +27,7 @@ struct d3dkmt_callbacks {
    PFND3DKMT_CLOSEADAPTER closeAdapter;
 };
 
+static
 void
 gdikmt_load_callbacks(HINSTANCE gdi32lib, struct d3dkmt_callbacks *cb)
 {
@@ -88,6 +89,7 @@ gdikmt_device_d3dkmt(struct gdikmt_device *iws)
    return (struct gdikmt_device_d3dkmt *)iws;
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_queryadapterinfo(struct gdikmt_device *_device,
                                KMTQUERYADAPTERINFOTYPE Type,
@@ -106,6 +108,7 @@ gdikmt_d3dkmt_queryadapterinfo(struct gdikmt_device *_device,
    return device->cb.queryAdapterInfo(&queryAdapterInfo);
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
                      UINT PrivateDriverDataSize)
@@ -122,6 +125,7 @@ gdikmt_d3dkmt_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
    return device->cb.escape(&escape);
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
 {
@@ -169,6 +173,7 @@ gdikmt_d3dkmt_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
    return Status;
 }
 
+static
 void
 gdikmt_d3dkmt_destroycontext(struct gdikmt_context *_ctx)
 {
@@ -185,6 +190,7 @@ gdikmt_d3dkmt_destroycontext(struct gdikmt_context *_ctx)
    return;
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_createcontext(struct gdikmt_device *_device,
                             struct gdikmt_context **out_ctx)
@@ -222,6 +228,7 @@ gdikmt_d3dkmt_createcontext(struct gdikmt_device *_device,
    return Status;
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_createallocation(struct gdikmt_device *_device,
                                struct gdikmt_createallocation *options)
@@ -245,6 +252,7 @@ gdikmt_d3dkmt_createallocation(struct gdikmt_device *_device,
    return Status;
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_lockallocation(struct gdikmt_device *_device,
                              D3DKMT_HANDLE hAllocation,
@@ -265,6 +273,7 @@ gdikmt_d3dkmt_lockallocation(struct gdikmt_device *_device,
    return Status;
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_destroyallocation(struct gdikmt_device *_device, HANDLE hResource,
                                 D3DKMT_HANDLE hAllocation)
@@ -287,6 +296,7 @@ gdikmt_d3dkmt_destroyallocation(struct gdikmt_device *_device, HANDLE hResource,
    return device->cb.destroyAllocation(&destroyAllocation);
 }
 
+static
 NTSTATUS
 gdikmt_d3dddi_queryallocation(struct gdikmt_device *_device,
                               struct gdikmt_openallocation *openAllocation)
@@ -309,6 +319,7 @@ gdikmt_d3dddi_queryallocation(struct gdikmt_device *_device,
    return Status;
 }
 
+static
 NTSTATUS
 gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
                              struct gdikmt_openallocation *openAllocation)
@@ -339,6 +350,7 @@ gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
    return Status;
 }
 
+static
 NTSTATUS
 gdikmt_d3dkmt_present(struct gdikmt_context *_ctx, D3DKMT_HANDLE hSrcAllocation,
                       void *winsys_drawable_handle, struct pipe_box *sub_box)
@@ -347,6 +359,7 @@ gdikmt_d3dkmt_present(struct gdikmt_context *_ctx, D3DKMT_HANDLE hSrcAllocation,
    return 0;
 };
 
+static
 NTSTATUS
 gdikmt_d3dkmt_setdisplaymode(struct gdikmt_device *ctx,
                              D3DKMT_HANDLE hSrcAllocation)
@@ -355,6 +368,7 @@ gdikmt_d3dkmt_setdisplaymode(struct gdikmt_device *ctx,
    return 0;
 };
 
+static
 void
 gdikmt_d3dkmt_destroy(struct gdikmt_device *_device)
 {
