@@ -20,7 +20,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "util/detect_os.h"
+#ifndef DETECT_OS_WINDOWS
 #include <sys/syscall.h>
+#endif
 #include <vulkan/vulkan.h>
 
 #include "c11/threads.h"
@@ -612,7 +615,9 @@ vn_object_get_id(const void *obj, VkObjectType type)
 static inline pid_t
 vn_gettid(void)
 {
-#if DETECT_OS_ANDROID
+#if DETECT_OS_WINDOWS
+   return GetCurrentThreadId();
+#elif DETECT_OS_ANDROID
    return gettid();
 #elif defined(__FreeBSD__)
    return syscall(SYS_thr_self);
