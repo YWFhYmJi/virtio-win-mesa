@@ -443,6 +443,17 @@ VkResult
 vk_device_get_timestamp(struct vk_device *device, VkTimeDomainKHR domain,
                         uint64_t *timestamp);
 
+#ifdef _WIN32
+#include <windows.h>
+typedef int clockid_t;
+#define CLOCK_MONOTONIC_RAW 0
+#define CLOCK_MONOTONIC 1
+#endif
+
+uint64_t
+vk_clock_gettime(clockid_t clock_id);
+
+
 static inline uint64_t
 vk_time_max_deviation(uint64_t begin, uint64_t end, uint64_t max_clock_period)
 {

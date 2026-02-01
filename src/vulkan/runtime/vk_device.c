@@ -931,3 +931,48 @@ vk_common_GetCalibratedTimestampsKHR(
 
    return VK_SUCCESS;
 }
+
+#ifndef _WIN32
+
+uint64_t
+vk_clock_gettime(clockid_t clock_id)
+{
+   struct timespec current;
+   int ret;
+
+   ret = clock_gettime(clock_id, &current);
+#ifdef CLOCK_MONOTONIC_RAW
+   if (ret < 0 && clock_id == CLOCK_MONOTONIC_RAW)
+      ret = clock_gettime(CLOCK_MONOTONIC, &current);
+#endif
+   if (ret < 0)
+      return 0;
+
+   return (uint64_t)current.tv_sec * 1000000000ULL + current.tv_nsec;
+}
+
+#endif //!_WIN32
+
+#ifdef _WIN32
+
+uint64_t
+vk_clock_gettime(clockid_t clock_id)
+{
+   (void)clock_id;
+
+   static LARGE_INTEGER freq;
+   static bool inited = false;
+
+   LARGE_INTEGER counter;
+
+   if (!inited) {
+      QueryPerformanceFrequency(&freq);
+      inited = true;
+   }
+
+   QueryPerformanceCounter(&counter);
+
+   return (uint64_t)((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
+}
+
+#endif /* _WIN32 */
