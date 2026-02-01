@@ -20,9 +20,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#if DETECT_OS_WINDOWS
-#include <sys/syscall.h>
-#endif
 #include <vulkan/vulkan.h>
 
 #include "util/bitscan.h"
@@ -53,6 +50,7 @@
 
 #if DETECT_OS_WINDOWS
 #include <processthreadsapi.h>
+#include "util/libsync.h"
 #else
 #include <sys/syscall.h>
 
