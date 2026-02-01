@@ -8,6 +8,9 @@
 #if !DETECT_OS_WINDOWS
 #include <sys/resource.h>
 #endif
+#if DETECT_OS_WINDOWS
+#include <windows.h>
+#endif
 
 #include "venus-protocol/vn_protocol_driver_transport.h"
 
@@ -19,6 +22,25 @@
 
 static_assert(ATOMIC_INT_LOCK_FREE == 2 && sizeof(atomic_uint) == 4,
               "vn_ring_shared requires lock-free 32-bit atomic_uint");
+
+#if DETECT_OS_WINDOWS
+static bool
+vn_ring_get_thread_priority(int *prio)
+{
+   const int win_prio = GetThreadPriority(GetCurrentThread());
+   if (win_prio == THREAD_PRIORITY_ERROR_RETURN)
+      return false;
+
+   int nice = -win_prio;
+   if (nice < -20)
+      nice = -20;
+   if (nice > 19)
+      nice = 19;
+
+   *prio = nice;
+   return true;
+}
+#endif
 
 /* pointers to a ring in a BO */
 struct vn_ring_shared {
@@ -339,6 +361,14 @@ vn_ring_create(struct vn_instance *instance,
       ring_priority = is_tls_ring && !(prio == -1 && errno);
    }
 #endif /* !DETECT_OS_WINDOWS */
+#if DETECT_OS_WINDOWS
+   if (instance->renderer->info.vk_mesa_venus_protocol_spec_version >= 2) {
+      errno = 0;
+      if (is_tls_ring)
+         ring_priority = vn_ring_get_thread_priority(&prio);
+   }
+#endif /* !DETECT_OS_WINDOWS */
+
    const struct VkRingPriorityInfoMESA priority_info = {
       .sType = VK_STRUCTURE_TYPE_RING_PRIORITY_INFO_MESA,
       .priority = prio,
