@@ -898,3 +898,27 @@ vk_clock_gettime(clockid_t clock_id)
 }
 
 #endif //!_WIN32
+
+#ifdef _WIN32
+
+uint64_t
+vk_clock_gettime(clockid_t clock_id)
+{
+   (void)clock_id;
+
+   static LARGE_INTEGER freq;
+   static bool inited = false;
+
+   LARGE_INTEGER counter;
+
+   if (!inited) {
+      QueryPerformanceFrequency(&freq);
+      inited = true;
+   }
+
+   QueryPerformanceCounter(&counter);
+
+   return (uint64_t)((counter.QuadPart * 1000000000ULL) / freq.QuadPart);
+}
+
+#endif /* _WIN32 */
