@@ -30,23 +30,90 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
 
 #include "util/detect_os.h"
 #include "util/os_file.h"
 
+#if DETECT_OS_WINDOWS
+#include <windows.h>
+#include <io.h>
+#ifndef close
+#define close _close
+#endif
+#else
+#include <poll.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#endif
+
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
-#if DETECT_OS_ANDROID
+#if DETECT_OS_WINDOWS
+struct sync_file_info;
+
+static inline bool
+sync_valid_fd(int fd)
+{
+	if (fd < 0)
+		return false;
+
+	intptr_t os_handle = _get_osfhandle(fd);
+	if (os_handle == -1)
+		return false;
+
+	DWORD flags = 0;
+	return GetHandleInformation((HANDLE)os_handle, &flags) != 0;
+}
+
+static inline int
+sync_wait(int fd, int timeout)
+{
+	if (fd < 0) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	HANDLE handle = (HANDLE)_get_osfhandle(fd);
+	if (handle == INVALID_HANDLE_VALUE) {
+		errno = EINVAL;
+		return -1;
+	}
+
+	DWORD wait_ms = (timeout < 0) ? INFINITE : (DWORD)timeout;
+	DWORD ret = WaitForSingleObject(handle, wait_ms);
+	if (ret == WAIT_OBJECT_0)
+		return 0;
+	if (ret == WAIT_TIMEOUT) {
+		errno = ETIME;
+		return -1;
+	}
+
+	errno = EINVAL;
+	return -1;
+}
+
+static inline int
+sync_merge(const char *name, int fd1, int fd2)
+{
+	(void)name;
+	(void)fd1;
+	(void)fd2;
+
+	/* we should never end up here */
+	assert(0);
+
+	errno = ENOTSUP;
+	return -1;
+}
+
+#elif DETECT_OS_ANDROID
 /* On Android, rely on the system's libsync instead of rolling our own
  * sync_wait() and sync_merge().  This gives us compatibility with pre-4.7
  * Android kernels.
