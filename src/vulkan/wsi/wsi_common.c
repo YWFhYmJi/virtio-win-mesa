@@ -2002,7 +2002,8 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
 
    VkMemoryRequirements reqs;
    wsi->GetBufferMemoryRequirements(chain->device, image->blit.buffer, &reqs);
-   assert(reqs.size <= info->linear_size);
+   //akre make sure alloc_size is at least linear_size
+   const VkDeviceSize alloc_size = MAX2(info->linear_size, reqs.size);
 
    struct wsi_memory_allocate_info memory_wsi_info = {
       .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA,
@@ -2020,14 +2021,14 @@ wsi_create_buffer_blit_context(const struct wsi_swapchain *chain,
    VkMemoryAllocateInfo buf_mem_info = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
       .pNext = &buf_mem_dedicated_info,
-      .allocationSize = info->linear_size,
+      .allocationSize = alloc_size,
       .memoryTypeIndex =
          info->select_blit_dst_memory_type(wsi, reqs.memoryTypeBits),
    };
 
    void *sw_host_ptr = NULL;
    if (info->alloc_shm)
-      sw_host_ptr = info->alloc_shm(image, info->linear_size);
+      sw_host_ptr = info->alloc_shm(image, alloc_size);
 
    VkExportMemoryAllocateInfo memory_export_info;
    VkImportMemoryHostPointerInfoEXT host_ptr_info;
