@@ -75,7 +75,6 @@ libvn_files = files(
   'vn_ring.c',
   'vn_renderer_internal.c',
   'vn_renderer_util.c',
-  'vn_renderer_vtest.c',
 )
 
 vn_deps = [
@@ -94,6 +93,15 @@ vn_flags = [
 ])
 
 vn_libs = []
+
+if with_platform_windows
+  libvn_files += files('vn_renderer_d3dkmt.c')
+  libvn_files += files('vn_wsi.c')
+  vn_flags += '-DVN_USE_WSI_PLATFORM'
+  vn_flags += '-DVK_USE_PLATFORM_WIN32_KHR'
+else
+  libvn_files += files('vn_renderer_vtest.c')
+endif
 
 if system_has_kms_drm
   libvn_files += files('vn_renderer_virtgpu.c')
@@ -122,6 +130,7 @@ endif
 libvulkan_virtio = shared_library(
   'vulkan_virtio',
   [libvn_files, vn_entrypoints, sha1_h],
+  vs_module_defs : vulkan_api_def,
   include_directories : [
     inc_include, inc_src, inc_virtio,
   ],
