@@ -31,6 +31,10 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
 {
    VkDevice dev_handle = vn_device_to_handle(dev);
    VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
+#ifdef _WIN32
+   return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
+                                   alloc_info, NULL, &mem_handle);
+#else
    if (VN_PERF(NO_ASYNC_MEM_ALLOC)) {
       return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
                                       alloc_info, NULL, &mem_handle);
@@ -45,6 +49,7 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
    mem->bo_ring_seqno_valid = true;
    mem->bo_ring_seqno = ring_submit.ring_seqno;
    return VK_SUCCESS;
+#endif
 }
 
 static inline void

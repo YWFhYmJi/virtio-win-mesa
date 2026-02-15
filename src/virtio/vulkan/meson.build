@@ -111,6 +111,13 @@ if not with_platform_windows
   libvn_files += files('vn_renderer_vtest.c')
 endif
 
+if with_platform_windows
+  libvn_files += files('vn_renderer_d3dkmt.c')
+  libvn_files += files('vn_wsi.c')
+  vn_c_args += '-DVN_USE_WSI_PLATFORM'
+  vn_c_args += '-DVK_USE_PLATFORM_WIN32_KHR'
+endif
+
 if system_has_kms_drm
   libvn_files += files('vn_renderer_virtgpu.c')
   vn_deps += dep_libdrm
@@ -140,6 +147,7 @@ libvulkan_virtio = shared_library(
   'vulkan_virtio',
   [libvn_files, vn_entrypoints, sha1_h],
   include_directories : vn_incs,
+  vs_module_defs : vulkan_api_def,
   link_with : vn_libs,
   dependencies : vn_deps,
   c_args : vn_c_args,

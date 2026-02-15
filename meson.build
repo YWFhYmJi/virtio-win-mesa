@@ -1774,7 +1774,11 @@ endif
 dep_m = cc.find_library('m', required : false)
 
 if host_machine.system() == 'windows'
-  dep_regex = meson.get_compiler('c').find_library('regex', required : false)
+  # Prefer vcpkg-provided regex via pkg-config or CMake configs.
+  dep_regex = dependency('regex', required : false, method : 'pkg-config')
+  if not dep_regex.found()
+    dep_regex = dependency('regex', required : false, method : 'cmake')
+  endif
   if not dep_regex.found()
     dep_regex = declare_dependency(compile_args : ['-DNO_REGEX'])
   endif

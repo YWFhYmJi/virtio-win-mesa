@@ -229,7 +229,7 @@ struct vn_renderer {
    struct vn_renderer_sync_ops sync_ops;
 };
 
-#ifdef HAVE_LIBDRM
+#if defined(HAVE_LIBDRM) || defined(_WIN32)
 VkResult
 vn_renderer_create_virtgpu(struct vn_instance *instance,
                            const VkAllocationCallbacks *alloc,
@@ -253,6 +253,8 @@ vn_renderer_create(struct vn_instance *instance,
          return VK_SUCCESS;
    }
 
+   return vn_renderer_create_virtgpu(instance, alloc, renderer);
+#elif _WIN32
    return vn_renderer_create_virtgpu(instance, alloc, renderer);
 #else
    return vn_renderer_create_vtest(instance, alloc, renderer);
