@@ -40,6 +40,13 @@
 #ifndef VIRTGPU_LOG_SYNC
 #define VIRTGPU_LOG_SYNC 0
 #endif
+#ifndef VIRTGPU_SUBMIT_VIA_ESCAPE
+#define VIRTGPU_SUBMIT_VIA_ESCAPE 1
+#endif
+
+#ifndef NDEBUG
+static unsigned int vn_large_submit_warn_count;
+#endif
 
 struct virtgpu;
 
@@ -83,7 +90,6 @@ struct virtgpu_resource_info {
    uint32_t res_handle;
    uint32_t size;
    uint32_t blob_mem;
-   //akre uint64_t blob_offset;
 };
 
 struct virtgpu {
@@ -171,6 +177,12 @@ virtgpu_submit_ctx_init(struct virtgpu *gpu);
 
 static void
 virtgpu_submit_ctx_fini(struct virtgpu *gpu);
+
+#if VIRTGPU_SUBMIT_VIA_ESCAPE
+static int
+virtgpu_submit_escape(struct virtgpu *gpu, uint32_t cmd_type,
+                      const void *payload, uint32_t payload_size);
+#endif
 
 static int
 d3dkmt_submit_signal_syncs(struct virtgpu *gpu,
@@ -283,6 +295,36 @@ d3dkmt_submit_resize(struct virtgpu *gpu, size_t cmd_size, uint32_t bo_count)
 static int
 d3dkmt_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
 {
+#if VIRTGPU_SUBMIT_VIA_ESCAPE
+   if (!virtgpu_submit_ctx_init(gpu)) {
+      vn_log(gpu->instance, "failed to init D3DKMT submit context");
+      return -1;
+   }
+   int ret = 0;
+   for (uint32_t i = 0; i < submit->batch_count; i++) {
+      const struct vn_renderer_submit_batch *batch = &submit->batches[i];
+#ifndef NDEBUG
+      if (batch->cs_size > 256 && vn_large_submit_warn_count < 5) {
+         vn_log(gpu->instance,
+                "large submit (escape) cs_size=%zu batch=%u",
+                (size_t)batch->cs_size, i);
+         vn_large_submit_warn_count++;
+      }
+#endif
+      if (virtgpu_submit_escape(gpu, VIOGPU_CMD_SUBMIT,
+                                batch->cs_data, batch->cs_size)) {
+         ret = -1;
+         break;
+      }
+      if (batch->sync_count) {
+         ret = d3dkmt_submit_signal_syncs(gpu, batch->syncs, batch->sync_values,
+                                          batch->sync_count);
+         if (ret)
+            break;
+      }
+   }
+   return ret;
+#else
    if (!virtgpu_submit_ctx_init(gpu)) {
       vn_log(gpu->instance, "failed to init D3DKMT submit context");
       return -1;
@@ -361,6 +403,7 @@ d3dkmt_submit(struct virtgpu *gpu, const struct vn_renderer_submit *submit)
 
    free(alloc_handles);
    return ret;
+#endif
 }
 
 static bool
@@ -382,6 +425,60 @@ virtgpu_d3dkmt_escape(struct virtgpu *gpu, VIOGPU_ESCAPE *esc)
    }
    return true;
 }
+
+#if VIRTGPU_SUBMIT_VIA_ESCAPE
+static bool
+virtgpu_d3dkmt_escape_data(struct virtgpu *gpu, VIOGPU_ESCAPE *esc, size_t size)
+{
+   if (!gpu->pfnEscape || !gpu->hAdapter || !gpu->hDevice)
+      return false;
+
+   D3DKMT_ESCAPE args = {0};
+   args.hAdapter = gpu->hAdapter;
+   args.hDevice = gpu->hDevice;
+   args.pPrivateDriverData = esc;
+   args.PrivateDriverDataSize = (UINT)size;
+
+   NTSTATUS status = gpu->pfnEscape(&args);
+   if (!NT_SUCCESS(status)) {
+      vn_log(gpu->instance, "escape type=0x%x failed status=0x%lx", esc ? esc->Type : 0, status);
+      return false;
+   }
+   return true;
+}
+
+static int
+virtgpu_submit_escape(struct virtgpu *gpu, uint32_t cmd_type,
+                      const void *payload, uint32_t payload_size)
+{
+   const size_t req_size = sizeof(VIOGPU_SUBMIT_CMD_REQ) + payload_size;
+   if (req_size > UINT16_MAX) {
+      vn_log(gpu->instance, "escape submit too large: %zu", req_size);
+      return -1;
+   }
+
+   const size_t total = sizeof(VIOGPU_ESCAPE) + req_size;
+   uint8_t *buf = calloc(1, total);
+   if (!buf)
+      return -1;
+
+   VIOGPU_ESCAPE *esc = (VIOGPU_ESCAPE *)buf;
+   esc->Type = VIOGPU_SUBMIT_CMD;
+   esc->DataLength = (USHORT)req_size;
+
+   VIOGPU_SUBMIT_CMD_REQ *req = (VIOGPU_SUBMIT_CMD_REQ *)(esc + 1);
+   req->hContext = gpu->hContext;
+   req->CmdType = cmd_type;
+   req->CmdSize = payload_size;
+
+   if (payload_size)
+      memcpy(req + 1, payload, payload_size);
+
+   const bool ok = virtgpu_d3dkmt_escape_data(gpu, esc, total);
+   free(buf);
+   return ok ? 0 : -1;
+}
+#endif
 
 static bool
 virtgpu_submit_ctx_init(struct virtgpu *gpu)
@@ -591,7 +688,6 @@ virtgpu_d3dkmt_resource_info(struct virtgpu *gpu,
       .res_handle = 0,
       .size = 0,
       .blob_mem = 0,
-      //akre .blob_offset = 0,
    };
 
    VIOGPU_ESCAPE resinfo = {0};
@@ -602,7 +698,6 @@ virtgpu_d3dkmt_resource_info(struct virtgpu *gpu,
       return -1;
 
    info->res_handle = resinfo.ResourceInfo.Id;
-   //akre info->blob_offset = resinfo.ResourceInfo.BlobOffset;
    return 0;
 }
 
@@ -1459,6 +1554,10 @@ virtgpu_bo_create_from_device_memory(
       virtgpu_bo_blob_flags(gpu, flags, external_handles);
 
    uint32_t res_id;
+#if VIRTGPU_LOG_SHMEM   
+   vn_log(gpu->instance, "resource_create_blob path=bo_create size=0x%llx mem_id=0x%llx flags=0x%x ext=0x%x",
+           (unsigned long long)size, (unsigned long long)mem_id, flags, external_handles);
+#endif
    uint32_t alloc_handle = virtgpu_d3dkmt_resource_create_blob(
       gpu, gpu->bo_blob_mem, blob_flags, size, mem_id, &res_id);
 
