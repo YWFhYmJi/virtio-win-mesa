@@ -586,6 +586,99 @@ virgl_gdi_resource_wait(struct virgl_winsys *qws, struct virgl_hw_res *res)
    return;
 }
 
+static bool
+virgl_gdi_cmd_buf_resize_alloc_lists(struct virgl_gdi_cmd_buf *cbuf,
+                                     unsigned new_size)
+{
+   uint32_t cmd_len = 0;
+   uint8_t *cmd_backup = NULL;
+   if (cbuf->driver_length)
+      cmd_len = cbuf->driver_length;
+   else if (cbuf->base.cdw)
+      cmd_len = sizeof(VIOGPU_COMMAND_HDR) + cbuf->base.cdw * 4;
+   if (cmd_len)
+   {
+      cmd_backup = MALLOC(cmd_len);
+      if (!cmd_backup) {
+         return false;
+      }
+      memcpy(cmd_backup, cbuf->ctx->pCommandBuffer, cmd_len);
+   }
+
+   struct gdikmt_render render;
+   memset(&render, 0, sizeof(render));
+
+   render.ResizeAllocationList = true;
+   render.ResizePatchLocationList = true;
+   render.NewAllocationListSize = new_size;
+   render.NewPatchLocationListSize = new_size;
+
+   NTSTATUS Status = cbuf->ctx->render(cbuf->ctx, &render);
+   if (!NT_SUCCESS(Status))
+   {
+      FREE(cmd_backup);
+      return false;
+   }
+
+   cbuf->base.buf = (uint32_t *)
+      ((uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR));
+
+   if (cmd_backup)
+   {
+      if (cbuf->ctx->CommandBufferSize < cmd_len) {
+         FREE(cmd_backup);
+         return false;
+      }
+      memcpy(cbuf->ctx->pCommandBuffer, cmd_backup, cmd_len);
+      FREE(cmd_backup);
+   }
+
+   unsigned new_alloc = cbuf->ctx->AllocationListSize;
+   unsigned new_patch = cbuf->ctx->PatchLocationListSize;
+   unsigned actual = MIN2(new_alloc, new_patch);
+
+   if (new_alloc == 0 || new_patch == 0 ||
+       actual < (unsigned)cbuf->alloc_count)
+      return false;
+
+   cbuf->d3d_list_size = actual;
+
+   return true;
+}
+
+static bool
+virgl_gdi_cmd_buf_grow_res_list(struct virgl_gdi_cmd_buf *cbuf,
+                                unsigned new_size)
+{
+   struct virgl_hw_res **new_res_bo = REALLOC(
+      cbuf->res_bo, cbuf->max_alloc * sizeof(*cbuf->res_bo),
+      new_size * sizeof(*cbuf->res_bo));
+   if (!new_res_bo)
+      return false;
+
+   cbuf->res_bo = new_res_bo;
+   memset(&cbuf->res_bo[cbuf->max_alloc], 0,
+          (new_size - cbuf->max_alloc) * sizeof(*cbuf->res_bo));
+   cbuf->max_alloc = new_size;
+   return true;
+}
+
+static void
+virgl_gdi_cmd_buf_build_alloc_lists(struct virgl_gdi_cmd_buf *cbuf)
+{
+   for (int i = 0; i < cbuf->alloc_count; i++) {
+      struct virgl_hw_res *res = cbuf->res_bo[i];
+      assert(res);
+      memset(&cbuf->ctx->pAllocationList[i], 0,
+             sizeof(D3DDDI_ALLOCATIONLIST));
+      cbuf->ctx->pAllocationList[i].hAllocation = res->hAllocation;
+
+      memset(&cbuf->ctx->pPatchLocationList[i], 0,
+             sizeof(D3DDDI_PATCHLOCATIONLIST));
+      cbuf->ctx->pPatchLocationList[i].AllocationIndex = i;
+   }
+}
+
 static void
 virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
                    struct virgl_hw_res *res, bool write_buf)
@@ -594,7 +687,7 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
    struct virgl_gdi_cmd_buf *cbuf = virgl_gdi_cmd_buf(_cbuf);
    boolean already_in_list = false;
    for (int i = 0; i < cbuf->alloc_count; i++) {
-      if (cbuf->ctx->pAllocationList[i].hAllocation == res->hAllocation) {
+      if (cbuf->res_bo[i] == res) {
          already_in_list = true;
          break;
       }
@@ -603,17 +696,14 @@ virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
    if (write_buf)
       cbuf->base.buf[cbuf->base.cdw++] = res->res_handle;
    if (!already_in_list) {
-      assert(cbuf->alloc_count <= cbuf->max_alloc);
-
-      memset(&cbuf->ctx->pAllocationList[cbuf->alloc_count], 0,
-             sizeof(D3DDDI_ALLOCATIONLIST));
-      cbuf->ctx->pAllocationList[cbuf->alloc_count].hAllocation =
-         res->hAllocation;
-
-      memset(&cbuf->ctx->pPatchLocationList[cbuf->alloc_count], 0,
-             sizeof(D3DDDI_PATCHLOCATIONLIST));
-      cbuf->ctx->pPatchLocationList[cbuf->alloc_count].AllocationIndex =
-         cbuf->alloc_count;
+      if (cbuf->alloc_count >= cbuf->max_alloc) {
+         unsigned new_size = cbuf->max_alloc + 256;
+         if (!virgl_gdi_cmd_buf_grow_res_list(cbuf, new_size)) {
+            assert(cbuf->alloc_count < cbuf->max_alloc);
+            return;
+         }
+      }
+      assert(cbuf->alloc_count < cbuf->max_alloc);
 
       cbuf->res_bo[cbuf->alloc_count] = NULL;
       virgl_gdi_resource_reference(&qdws->base,
@@ -678,11 +768,37 @@ virgl_gdi_cmd_buf_create(struct virgl_winsys *qws, uint32_t size)
       return NULL;
    }
 
+   unsigned max_cdw = 0;
+   if (cbuf->ctx->CommandBufferSize > sizeof(VIOGPU_COMMAND_HDR))
+   {
+      max_cdw = (cbuf->ctx->CommandBufferSize - sizeof(VIOGPU_COMMAND_HDR)) / 4;
+   }
+   if (max_cdw < size)
+   {
+      _debug_printf("Command buffer smaller than requested: %u < %u\n",
+                     max_cdw, size);
+      cbuf->ctx->destroy(cbuf->ctx);
+      FREE(cbuf);
+      return NULL;
+   }
+
    cbuf->driver_length = 0;
 
-   cbuf->max_alloc = render.NewAllocationListSize;
-   cbuf->res_bo =
-      CALLOC(render.NewAllocationListSize, sizeof(struct virgl_hw_res *));
+   unsigned new_alloc = cbuf->ctx->AllocationListSize;
+   unsigned new_patch = cbuf->ctx->PatchLocationListSize;
+   unsigned actual = MIN2(new_alloc, new_patch);
+   unsigned req_alloc = render.NewAllocationListSize;
+   unsigned req_patch = render.NewPatchLocationListSize;
+   if (new_alloc == 0 || new_patch == 0) {
+      _debug_printf("Allocation lists are zero: %u/%u\n",
+                    new_alloc, new_patch);
+      cbuf->ctx->destroy(cbuf->ctx);
+      FREE(cbuf);
+      return NULL;
+   }
+   cbuf->d3d_list_size = actual;
+   cbuf->max_alloc = actual;
+   cbuf->res_bo = CALLOC(cbuf->max_alloc, sizeof(struct virgl_hw_res *));
 
    cbuf->base.buf = (uint32_t *)
       ((uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR));
@@ -721,6 +837,16 @@ virgl_gdi_winsys_submit_cmd(struct virgl_winsys *qws,
    } else {
       render.CommandLength = cbuf->driver_length;
    }
+
+   if (cbuf->alloc_count > cbuf->d3d_list_size) {
+      unsigned new_size = cbuf->alloc_count + 256;
+      if (!virgl_gdi_cmd_buf_resize_alloc_lists(cbuf, new_size)) {
+         _debug_printf("Failed to grow D3DKMT lists for submit\n");
+         return -1;
+      }
+   }
+   if (cbuf->alloc_count > 0)
+      virgl_gdi_cmd_buf_build_alloc_lists(cbuf);
 
    render.AllocationCount = cbuf->alloc_count;
    render.PatchLocationCount = cbuf->alloc_count;
