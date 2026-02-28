@@ -253,6 +253,8 @@ wgl_dxgi_framebuffer_get_resource(struct stw_winsys_framebuffer *pframebuffer,
    struct pipe_resource *texture =
       fb->screen->resource_from_handle(fb->screen, nullptr, &whandle, 0);
    fb->textures[index] = texture;
+   if (texture)
+      pipe_reference(NULL, &texture->reference);
    return texture;
 }
 
