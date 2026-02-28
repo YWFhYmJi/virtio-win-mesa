@@ -211,7 +211,8 @@ wgl_dxgi_framebuffer_present(struct stw_winsys_framebuffer *_fb, int interval,
    }
 
    return S_OK == fb->swapchain->Present(
-                     0, interval < 1 ? DXGI_PRESENT_ALLOW_TEARING : 0);
+                     interval < 1 ? 0 : interval,
+                     interval < 1 ? DXGI_PRESENT_ALLOW_TEARING : 0);
 }
 
 static struct pipe_resource *

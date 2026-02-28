@@ -567,7 +567,7 @@
                   "Override default maximum frame latency")
 
 #define DRI_CONF_WGL_SWAP_INTERVAL(def) \
-   DRI_CONF_OPT_I(wgl_swap_interval, def, 1, 4, \
+   DRI_CONF_OPT_I(wgl_swap_interval, def, 0, 4, \
                   "Override default swap interval")
 
 /**
