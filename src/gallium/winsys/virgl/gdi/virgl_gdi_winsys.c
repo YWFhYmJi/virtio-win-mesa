@@ -368,7 +368,7 @@ virgl_gdi_winsys_resource_create_handle(struct virgl_winsys *qws,
    struct virgl_hw_res *res = NULL;
 
    struct gdikmt_openallocation openAllocation;
-   openAllocation.hGlobalHandle = (D3DKMT_HANDLE)whandle->handle;
+   openAllocation.hGlobalHandle = (D3DKMT_HANDLE)(uintptr_t)whandle->handle;
 
    NTSTATUS Status =
       qdws->device->queryAllocation(qdws->device, &openAllocation);
@@ -526,7 +526,7 @@ static bool virgl_gdi_winsys_resource_get_handle(struct virgl_winsys *qws,
       */
       whandle->handle = 0;
    } else if(whandle->type == WINSYS_HANDLE_TYPE_D3DKMT_ALLOC) {
-      whandle->handle = (HANDLE)res->hAllocation;
+      whandle->handle = (HANDLE)(uintptr_t)res->hAllocation;
    }
    
    whandle->stride = stride;

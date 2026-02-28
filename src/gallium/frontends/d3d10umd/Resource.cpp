@@ -455,7 +455,7 @@ OpenResource(D3D10DDI_HDEVICE hDevice,                            // IN
    struct winsys_handle whandle;
    memset(&whandle, 0, sizeof(whandle));
    whandle.type = WINSYS_HANDLE_TYPE_WIN32_HANDLE;
-   whandle.handle = (HANDLE)pOpenResource->hKMResource.handle;
+   whandle.handle = (HANDLE)(uintptr_t)pOpenResource->hKMResource.handle;
    
    pResource->resource =
       pDevice->screen->resource_from_handle(pDevice->screen, NULL, &whandle, 0);
