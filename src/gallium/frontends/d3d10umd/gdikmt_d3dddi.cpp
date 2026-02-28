@@ -176,7 +176,7 @@ gdikmt_d3dddi_createallocation(struct gdikmt_device *_device,
    NTSTATUS Status =
       device->KTCallbacks.pfnAllocateCb(device->hRTDevice, &createAllocation);
 
-   options->hResource = (HANDLE)createAllocation.hKMResource;
+   options->hResource = (HANDLE)(uintptr_t)createAllocation.hKMResource;
 
    return Status;
 }

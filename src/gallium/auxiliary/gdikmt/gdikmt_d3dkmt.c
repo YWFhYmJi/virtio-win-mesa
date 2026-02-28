@@ -247,7 +247,7 @@ gdikmt_d3dkmt_createallocation(struct gdikmt_device *_device,
 
    NTSTATUS Status = device->cb.createAllocation(&createAllocation);
 
-   options->hResource = (HANDLE)createAllocation.hResource;
+   options->hResource = (HANDLE)(uintptr_t)createAllocation.hResource;
 
    return Status;
 }
@@ -285,7 +285,7 @@ gdikmt_d3dkmt_destroyallocation(struct gdikmt_device *_device, HANDLE hResource,
    destroyAllocation.hDevice = device->hDevice;
 
    if (hResource != NULL) {
-      destroyAllocation.hResource = (D3DKMT_HANDLE)hResource;
+      destroyAllocation.hResource = (D3DKMT_HANDLE)(uintptr_t)hResource;
    } else {
       D3DKMT_HANDLE handles[1];
       handles[0] = hAllocation;
