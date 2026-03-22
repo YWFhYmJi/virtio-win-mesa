@@ -787,8 +787,8 @@ virgl_gdi_cmd_buf_create(struct virgl_winsys *qws, uint32_t size)
    unsigned new_alloc = cbuf->ctx->AllocationListSize;
    unsigned new_patch = cbuf->ctx->PatchLocationListSize;
    unsigned actual = MIN2(new_alloc, new_patch);
-   unsigned req_alloc = render.NewAllocationListSize;
-   unsigned req_patch = render.NewPatchLocationListSize;
+   // unsigned req_alloc = render.NewAllocationListSize;
+   // unsigned req_patch = render.NewPatchLocationListSize;
    if (new_alloc == 0 || new_patch == 0) {
       _debug_printf("Allocation lists are zero: %u/%u\n",
                     new_alloc, new_patch);
@@ -1029,7 +1029,7 @@ virgl_gdi_get_caps(struct virgl_winsys *vws, struct virgl_drm_caps *caps)
 
    args.Capset.CapsetId = 2;
    args.Capset.Size = sizeof(union virgl_caps);
-   args.Capset.Capset = (UCHAR *)&caps->caps;
+   args.Capset.Capset = (ULONGLONG)(UCHAR *)&caps->caps;
 
    ret = vdws->device->escape(vdws->device, &args, sizeof(args));
    if (!NT_SUCCESS(ret)) {
