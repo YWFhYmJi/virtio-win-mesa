@@ -543,11 +543,11 @@ vn_queue_submission_alloc_storage(struct vn_queue_submission *submit)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
    submit->temp.batches = submit->temp.storage;
-   submit->temp.cmds = submit->temp.storage + total_batch_size;
+   submit->temp.cmds = (unsigned char *)submit->temp.storage + total_batch_size;
    submit->temp.pnexts =
-      submit->temp.storage + total_batch_size + total_cmd_size;
-   submit->temp.dev_masks = submit->temp.storage + total_batch_size +
-                            total_cmd_size + total_pnext_size;
+      (struct vn_submit_info_pnext_fix *)((unsigned char *)submit->temp.storage + total_batch_size + total_cmd_size);
+   submit->temp.dev_masks = (uint32_t *)((unsigned char *)submit->temp.storage + total_batch_size +
+                            total_cmd_size + total_pnext_size);
 
    return VK_SUCCESS;
 }
@@ -858,7 +858,7 @@ vn_queue_submission_setup_batch(struct vn_queue_submission *submit,
          return result;
 
       /* advance the temp cmds for working on next batch cmds */
-      submit->temp.cmds += total_cmd_size + (extra_cmd_count * cmd_size);
+      submit->temp.cmds = (unsigned char *)(submit->temp.cmds) + total_cmd_size + (extra_cmd_count * cmd_size);
    }
 
    return VK_SUCCESS;

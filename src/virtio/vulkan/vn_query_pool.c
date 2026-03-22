@@ -187,7 +187,7 @@ vn_ResetQueryPool(VkDevice device,
        */
       const uint32_t slot_size = (pool->result_array_size * 8) + 8;
       const uint32_t offset = slot_size * firstQuery;
-      memset(pool->fb_buf->data + offset, 0, slot_size * queryCount);
+      memset((unsigned char *)pool->fb_buf->data + offset, 0, slot_size * queryCount);
    }
 }
 
@@ -357,33 +357,33 @@ vn_GetQueryPoolResults(VkDevice device,
    if (result == VK_SUCCESS) {
       for (uint32_t i = 0; i < queryCount; i++) {
          memcpy(dst, src, copy_size);
-         src += packed_stride;
-         dst += stride;
+         src = (unsigned char *)src + packed_stride;
+         dst = (unsigned char *)dst + stride;
       }
    } else if (result == VK_NOT_READY) {
       assert(!result_always_written &&
              (packed_flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
       if (flags & VK_QUERY_RESULT_64_BIT) {
          for (uint32_t i = 0; i < queryCount; i++) {
-            const bool avail = *(const uint64_t *)(src + result_size);
+            const bool avail = *(const uint64_t *)((unsigned char *)src + result_size);
             if (avail)
                memcpy(dst, src, copy_size);
             else if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-               *(uint64_t *)(dst + result_size) = 0;
+               *(uint64_t *)((unsigned char *)dst + result_size) = 0;
 
-            src += packed_stride;
-            dst += stride;
+            src = (unsigned char *)src + packed_stride;
+            dst = (unsigned char *)dst + stride;
          }
       } else {
          for (uint32_t i = 0; i < queryCount; i++) {
-            const bool avail = *(const uint32_t *)(src + result_size);
+            const bool avail = *(const uint32_t *)((unsigned char *)src + result_size);
             if (avail)
                memcpy(dst, src, copy_size);
             else if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-               *(uint32_t *)(dst + result_size) = 0;
+               *(uint32_t *)((unsigned char *)dst + result_size) = 0;
 
-            src += packed_stride;
-            dst += stride;
+            src = (unsigned char *)src + packed_stride;
+            dst = (unsigned char *)dst + stride;
          }
       }
    }

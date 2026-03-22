@@ -612,6 +612,10 @@ vn_object_get_id(const void *obj, VkObjectType type)
    }
 }
 
+#ifdef _MSC_VER
+typedef int pid_t;
+#endif
+
 static inline pid_t
 vn_gettid(void)
 {

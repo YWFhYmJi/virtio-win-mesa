@@ -51,10 +51,10 @@
       }                                                                      \
    } while (false)
 
-#define INIT_SUBPASSES(_pass, _pCreateInfo)                                  \
+#define INIT_SUBPASSES(_pass, _pCreateInfo, _subpassDescriptionType)                                  \
    do {                                                                      \
       for (uint32_t i = 0; i < _pCreateInfo->subpassCount; i++) {            \
-         __auto_type subpass_desc = &_pCreateInfo->pSubpasses[i];            \
+         const _subpassDescriptionType *subpass_desc = &_pCreateInfo->pSubpasses[i];            \
          struct vn_subpass *subpass = &_pass->subpasses[i];                  \
                                                                              \
          for (uint32_t j = 0; j < subpass_desc->colorAttachmentCount; j++) { \
@@ -214,7 +214,7 @@ vn_CreateRenderPass(VkDevice device,
    if (!pass)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   INIT_SUBPASSES(pass, pCreateInfo);
+   INIT_SUBPASSES(pass, pCreateInfo, VkSubpassDescription);
 
    STACK_ARRAY(VkAttachmentDescription, attachments,
                pCreateInfo->attachmentCount);
@@ -269,7 +269,7 @@ vn_CreateRenderPass2(VkDevice device,
    if (!pass)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   INIT_SUBPASSES(pass, pCreateInfo);
+   INIT_SUBPASSES(pass, pCreateInfo, VkSubpassDescription2);
 
    STACK_ARRAY(VkAttachmentDescription2, attachments,
                pCreateInfo->attachmentCount);

@@ -62,7 +62,7 @@ vn_cs_encoder_sanity_check(struct vn_cs_encoder *enc)
       const struct vn_cs_encoder_buffer *cur_buf =
          &enc->buffers[enc->buffer_count - 1];
       assert(cur_buf->base <= enc->cur && enc->cur <= enc->end &&
-             enc->end <= cur_buf->base + enc->current_buffer_size);
+             enc->end <= (void *)((unsigned char *)cur_buf->base + enc->current_buffer_size));
       if (cur_buf->committed_size)
          assert(enc->cur == enc->end);
    } else {
@@ -89,7 +89,7 @@ vn_cs_encoder_add_buffer(struct vn_cs_encoder *enc,
 
    /* update the write pointer */
    enc->cur = base;
-   enc->end = base + size;
+   enc->end = (unsigned char *)base + size;
 }
 
 static void
@@ -98,7 +98,7 @@ vn_cs_encoder_commit_buffer(struct vn_cs_encoder *enc)
    assert(enc->buffer_count);
    struct vn_cs_encoder_buffer *cur_buf =
       &enc->buffers[enc->buffer_count - 1];
-   const size_t written_size = enc->cur - cur_buf->base;
+   const size_t written_size = (unsigned char *)enc->cur - (unsigned char *)cur_buf->base;
    if (cur_buf->committed_size) {
       assert(cur_buf->committed_size == written_size);
    } else {
@@ -138,7 +138,7 @@ vn_cs_encoder_gc_buffers(struct vn_cs_encoder *enc)
    const size_t used = cur_buf->offset + cur_buf->committed_size;
    enc->buffer_count = 0;
    vn_cs_encoder_add_buffer(enc, cur_buf->shmem, used,
-                            cur_buf->base + cur_buf->committed_size,
+                            (unsigned char *)cur_buf->base + cur_buf->committed_size,
                             enc->current_buffer_size - used);
 
    enc->total_committed_size = 0;
@@ -272,7 +272,7 @@ vn_cs_encoder_reserve_internal(struct vn_cs_encoder *enc, size_t size)
       return false;
 
    vn_cs_encoder_add_buffer(enc, shmem, buf_offset,
-                            shmem->mmap_ptr + buf_offset, buf_size);
+                            (unsigned char *)shmem->mmap_ptr + buf_offset, buf_size);
    enc->current_buffer_size = buf_size;
 
    vn_cs_encoder_sanity_check(enc);
