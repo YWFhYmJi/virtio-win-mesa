@@ -1176,8 +1176,14 @@ vn_physical_device_get_native_extensions(
       exts->KHR_incremental_present = true;
       exts->KHR_present_id = true;
       exts->KHR_present_id2 = true;
+      /* Common win32 WSI does not provide wait_for_present callbacks yet.
+       * Advertising present_wait would make vkWaitForPresent* reach a NULL
+       * function pointer (or assert in debug builds).
+       */
+#ifndef VK_USE_PLATFORM_WIN32_KHR
       exts->KHR_present_wait = true;
       exts->KHR_present_wait2 = true;
+#endif
       exts->KHR_swapchain = true;
       exts->KHR_swapchain_mutable_format = true;
       exts->EXT_hdr_metadata = true;
