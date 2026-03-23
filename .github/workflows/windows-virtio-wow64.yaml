@@ -1,0 +1,80 @@
+name: Build Mesa WOW64
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Chocolatey packages
+      shell: powershell
+      run: |
+        choco install -y ninja winflexbison3
+
+    - name: Setup Visual Studio 2022
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x86
+        # sdk: 10.0.20348.0
+
+    - name: Configure caching
+      uses: actions/cache@v3
+      id: cache
+      with:
+        path: |
+          ~\AppData\Local\pip\Cache
+          ~\.cache\meson
+          mesa_build
+        key: ${{ runner.os }}-mesa-wow64-${{ hashFiles('**/meson.build') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-mesa-wow64-
+
+    - name: Install Python modules
+      shell: powershell
+      run: |
+        pip install meson Mako PyYAML
+
+    - name: Build Mesa
+      shell: powershell
+      run: |
+        New-Item -ItemType Directory -Path mesa_prefix_wow64 -Force
+        $env:MESA_PREFIX_WOW64 = "$PWD\mesa_prefix_wow64"
+        
+        New-Item -ItemType Directory -Path build -Force
+        cd build
+        
+        meson setup .. --prefix=$env:MESA_PREFIX_WOW64 `
+          -Dgallium-drivers=virgl `
+          -Dgallium-d3d10umd=true `
+          -Dgallium-wgl-dll-name=viogpu_wgl_wow64 `
+          -Dgallium-d3d10-dll-name=viogpu_d3d10_wow64 `
+          -Dvulkan-drivers=virtio `
+          -Dzlib=disabled `
+          -Db_vscrt=mt `
+          -Dc_std=c11 `
+          -Dc_args="/experimental:c11atomics"
+        
+        ninja install
+
+    - name: Package artifacts
+      shell: powershell
+      run: |
+        Compress-Archive -Path mesa_prefix_wow64 -DestinationPath mesa_wow64_build.zip -Force
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mesa_wow64_build
+        path: mesa_wow64_build.zip
