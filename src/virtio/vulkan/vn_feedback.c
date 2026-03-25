@@ -526,8 +526,8 @@ vn_semaphore_feedback_cmd_alloc(struct vn_device *dev,
    VkCommandBuffer *cmd_handles;
 
    VK_MULTIALLOC(ma);
-   vk_multialloc_add(&ma, &sfb_cmd, __typeof__(*sfb_cmd), 1);
-   vk_multialloc_add(&ma, &cmd_handles, __typeof__(*cmd_handles),
+   vk_multialloc_add(&ma, &sfb_cmd, struct vn_semaphore_feedback_cmd, 1);
+   vk_multialloc_add(&ma, &cmd_handles, VkCommandBuffer,
                      dev->queue_family_count);
    if (!vk_multialloc_zalloc(&ma, alloc, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT))
       return NULL;

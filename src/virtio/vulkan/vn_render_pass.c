@@ -160,10 +160,10 @@ vn_render_pass_create(struct vn_device *dev,
    struct vn_subpass *subpasses;
 
    VK_MULTIALLOC(ma);
-   vk_multialloc_add(&ma, &pass, __typeof__(*pass), 1);
-   vk_multialloc_add(&ma, &present_atts, __typeof__(*present_atts),
+   vk_multialloc_add(&ma, &pass, struct vn_render_pass, 1);
+   vk_multialloc_add(&ma, &present_atts, struct vn_present_src_attachment,
                      present_count);
-   vk_multialloc_add(&ma, &subpasses, __typeof__(*subpasses), subpass_count);
+   vk_multialloc_add(&ma, &subpasses, struct vn_subpass, subpass_count);
 
    if (!vk_multialloc_zalloc(&ma, alloc, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT))
       return NULL;
@@ -194,7 +194,7 @@ vn_render_pass_create(struct vn_device *dev,
 
 /* render pass commands */
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateRenderPass(VkDevice device,
                     const VkRenderPassCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
@@ -249,7 +249,7 @@ vn_CreateRenderPass(VkDevice device,
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateRenderPass2(VkDevice device,
                      const VkRenderPassCreateInfo2 *pCreateInfo,
                      const VkAllocationCallbacks *pAllocator,
@@ -299,7 +299,7 @@ vn_CreateRenderPass2(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyRenderPass(VkDevice device,
                      VkRenderPass renderPass,
                      const VkAllocationCallbacks *pAllocator)
@@ -318,7 +318,7 @@ vn_DestroyRenderPass(VkDevice device,
    vk_free(alloc, pass);
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_GetRenderAreaGranularity(VkDevice device,
                             VkRenderPass renderPass,
                             VkExtent2D *pGranularity)
@@ -334,7 +334,7 @@ vn_GetRenderAreaGranularity(VkDevice device,
    *pGranularity = pass->granularity;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_GetRenderingAreaGranularity(VkDevice device,
                                const VkRenderingAreaInfo *pRenderingAreaInfo,
                                VkExtent2D *pGranularity)
@@ -348,7 +348,7 @@ vn_GetRenderingAreaGranularity(VkDevice device,
 
 /* framebuffer commands */
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateFramebuffer(VkDevice device,
                      const VkFramebufferCreateInfo *pCreateInfo,
                      const VkAllocationCallbacks *pAllocator,
@@ -386,7 +386,7 @@ vn_CreateFramebuffer(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyFramebuffer(VkDevice device,
                       VkFramebuffer framebuffer,
                       const VkAllocationCallbacks *pAllocator)

@@ -535,7 +535,7 @@ out_destroy_device:
    return result;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
                 const VkAllocationCallbacks *pAllocator,
@@ -586,7 +586,7 @@ vn_CreateDevice(VkPhysicalDevice physicalDevice,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
 {
    VN_TRACE_FUNC();
@@ -626,14 +626,14 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
    vk_free(alloc, dev);
 }
 
-PFN_vkVoidFunction
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vn_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
    struct vn_device *dev = vn_device_from_handle(device);
    return vk_device_get_proc_addr(&dev->base.vk, pName);
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_GetDeviceGroupPeerMemoryFeatures(
    VkDevice device,
    uint32_t heapIndex,
@@ -649,7 +649,7 @@ vn_GetDeviceGroupPeerMemoryFeatures(
       remoteDeviceIndex, pPeerMemoryFeatures);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetCalibratedTimestampsKHR(
    VkDevice device,
    uint32_t timestampCount,

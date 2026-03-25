@@ -74,7 +74,7 @@ struct vn_graphics_pipeline_info_self {
 };
 
 static_assert(sizeof(struct vn_graphics_pipeline_info_self) ==
-                 sizeof(((struct vn_graphics_pipeline_info_self){}).mask),
+                 sizeof(((struct vn_graphics_pipeline_info_self *)NULL)->mask),
               "vn_graphics_pipeline_create_info_self::mask is too small");
 
 /**
@@ -97,7 +97,7 @@ struct vn_graphics_pipeline_info_pnext {
 };
 
 static_assert(sizeof(struct vn_graphics_pipeline_info_pnext) ==
-                 sizeof(((struct vn_graphics_pipeline_info_pnext){}).mask),
+                 sizeof(((struct vn_graphics_pipeline_info_pnext *)NULL)->mask),
               "vn_graphics_pipeline_create_info_pnext::mask is too small");
 
 /**
@@ -244,7 +244,7 @@ struct vn_graphics_pipeline_fix_tmp {
 
 /* shader module commands */
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateShaderModule(VkDevice device,
                       const VkShaderModuleCreateInfo *pCreateInfo,
                       const VkAllocationCallbacks *pAllocator,
@@ -271,7 +271,7 @@ vn_CreateShaderModule(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyShaderModule(VkDevice device,
                        VkShaderModule shaderModule,
                        const VkAllocationCallbacks *pAllocator)
@@ -326,7 +326,7 @@ vn_pipeline_layout_unref(struct vn_device *dev,
       vn_pipeline_layout_destroy(dev, pipeline_layout);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreatePipelineLayout(VkDevice device,
                         const VkPipelineLayoutCreateInfo *pCreateInfo,
                         const VkAllocationCallbacks *pAllocator,
@@ -378,7 +378,7 @@ vn_CreatePipelineLayout(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyPipelineLayout(VkDevice device,
                          VkPipelineLayout pipelineLayout,
                          const VkAllocationCallbacks *pAllocator)
@@ -395,7 +395,7 @@ vn_DestroyPipelineLayout(VkDevice device,
 
 /* pipeline cache commands */
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreatePipelineCache(VkDevice device,
                        const VkPipelineCacheCreateInfo *pCreateInfo,
                        const VkAllocationCallbacks *pAllocator,
@@ -434,7 +434,7 @@ vn_CreatePipelineCache(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyPipelineCache(VkDevice device,
                         VkPipelineCache pipelineCache,
                         const VkAllocationCallbacks *pAllocator)
@@ -480,7 +480,7 @@ vn_get_target_ring(struct vn_device *dev)
    return ring;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetPipelineCacheData(VkDevice device,
                         VkPipelineCache pipelineCache,
                         size_t *pDataSize,
@@ -526,7 +526,7 @@ vn_GetPipelineCacheData(VkDevice device,
    return result;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_MergePipelineCaches(VkDevice device,
                        VkPipelineCache dstCache,
                        uint32_t srcCacheCount,
@@ -664,29 +664,29 @@ vn_graphics_pipeline_fix_tmp_alloc(const VkAllocationCallbacks *alloc,
    VkRenderingInputAttachmentIndexInfo *riai_infos;
 
    VK_MULTIALLOC(ma);
-   vk_multialloc_add(&ma, &tmp, __typeof__(*tmp), 1);
-   vk_multialloc_add(&ma, &infos, __typeof__(*infos), info_count);
+   vk_multialloc_add(&ma, &tmp, struct vn_graphics_pipeline_fix_tmp, 1);
+   vk_multialloc_add(&ma, &infos, VkGraphicsPipelineCreateInfo, info_count);
    vk_multialloc_add(&ma, &multisample_state_infos,
-                     __typeof__(*multisample_state_infos), info_count);
-   vk_multialloc_add(&ma, &sl_infos, __typeof__(*sl_infos), info_count);
+                     VkPipelineMultisampleStateCreateInfo, info_count);
+   vk_multialloc_add(&ma, &sl_infos, VkPipelineSampleLocationsStateCreateInfoEXT, info_count);
    vk_multialloc_add(&ma, &viewport_state_infos,
-                     __typeof__(*viewport_state_infos), info_count);
+                     VkPipelineViewportStateCreateInfo, info_count);
 
    if (alloc_pnext) {
-      vk_multialloc_add(&ma, &gpl_infos, __typeof__(*gpl_infos), info_count);
-      vk_multialloc_add(&ma, &flags2_infos, __typeof__(*flags2_infos),
+      vk_multialloc_add(&ma, &gpl_infos, VkGraphicsPipelineLibraryCreateInfoEXT, info_count);
+      vk_multialloc_add(&ma, &flags2_infos, VkPipelineCreateFlags2CreateInfo,
                         info_count);
-      vk_multialloc_add(&ma, &feedback_infos, __typeof__(*feedback_infos),
+      vk_multialloc_add(&ma, &feedback_infos, VkPipelineCreationFeedbackCreateInfo,
                         info_count);
-      vk_multialloc_add(&ma, &fsr_infos, __typeof__(*fsr_infos), info_count);
-      vk_multialloc_add(&ma, &library_infos, __typeof__(*library_infos),
+      vk_multialloc_add(&ma, &fsr_infos, VkPipelineFragmentShadingRateStateCreateInfoKHR, info_count);
+      vk_multialloc_add(&ma, &library_infos, VkPipelineLibraryCreateInfoKHR,
                         info_count);
-      vk_multialloc_add(&ma, &rendering_infos, __typeof__(*rendering_infos),
+      vk_multialloc_add(&ma, &rendering_infos, VkPipelineRenderingCreateInfo,
                         info_count);
-      vk_multialloc_add(&ma, &robustness_infos, __typeof__(*robustness_infos),
+      vk_multialloc_add(&ma, &robustness_infos, VkPipelineRobustnessCreateInfo,
                         info_count);
-      vk_multialloc_add(&ma, &ral_infos, __typeof__(*ral_infos), info_count);
-      vk_multialloc_add(&ma, &riai_infos, __typeof__(*riai_infos),
+      vk_multialloc_add(&ma, &ral_infos, VkRenderingAttachmentLocationInfo, info_count);
+      vk_multialloc_add(&ma, &riai_infos, VkRenderingInputAttachmentIndexInfo,
                         info_count);
    }
 
@@ -1667,7 +1667,7 @@ vn_pipeline_create_flags2(const void *pnext, VkPipelineCreateFlags flags)
    return flags2 ? flags2->flags : flags;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateGraphicsPipelines(VkDevice device,
                            VkPipelineCache pipelineCache,
                            uint32_t createInfoCount,
@@ -1760,7 +1760,7 @@ vn_CreateGraphicsPipelines(VkDevice device,
    return vn_result(dev->instance, result);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateComputePipelines(VkDevice device,
                           VkPipelineCache pipelineCache,
                           uint32_t createInfoCount,
@@ -1821,7 +1821,7 @@ vn_CreateComputePipelines(VkDevice device,
    return vn_result(dev->instance, result);
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyPipeline(VkDevice device,
                    VkPipeline _pipeline,
                    const VkAllocationCallbacks *pAllocator)
@@ -1844,7 +1844,7 @@ vn_DestroyPipeline(VkDevice device,
    vk_free(alloc, pipeline);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateRayTracingPipelinesKHR(
    VkDevice device,
    VkDeferredOperationKHR deferredOperation,
@@ -1914,7 +1914,7 @@ vn_CreateRayTracingPipelinesKHR(
    return vn_result(dev->instance, result);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetRayTracingCaptureReplayShaderGroupHandlesKHR(VkDevice device,
                                                    VkPipeline pipeline,
                                                    uint32_t firstGroup,
@@ -1929,7 +1929,7 @@ vn_GetRayTracingCaptureReplayShaderGroupHandlesKHR(VkDevice device,
       pData);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetRayTracingShaderGroupHandlesKHR(VkDevice device,
                                       VkPipeline pipeline,
                                       uint32_t firstGroup,
@@ -1944,7 +1944,7 @@ vn_GetRayTracingShaderGroupHandlesKHR(VkDevice device,
       pData);
 }
 
-VkDeviceSize
+VKAPI_ATTR VkDeviceSize VKAPI_CALL
 vn_GetRayTracingShaderGroupStackSizeKHR(VkDevice device,
                                         VkPipeline pipeline,
                                         uint32_t group,
