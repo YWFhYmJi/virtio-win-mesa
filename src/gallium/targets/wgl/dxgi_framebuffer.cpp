@@ -158,11 +158,26 @@ wgl_dxgi_framebuffer_resize(struct stw_winsys_framebuffer *_fb,
       PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN createDeviceAndSwapchain =
          (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(
             fb->d3d11, "D3D11CreateDeviceAndSwapChain");
+      if (!createDeviceAndSwapchain) {
+         _debug_printf("Failed to resolve D3D11CreateDeviceAndSwapChain\n");
+         return;
+      }
 
+      /* Try debug layer first for developer visibility, but gracefully
+       * fall back when Graphics Tools (D3D debug runtime) is unavailable.
+       */
       HRESULT hr = createDeviceAndSwapchain(
          NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_DEBUG,
          FeatureLevels, _countof(FeatureLevels), D3D11_SDK_VERSION, &desc,
          &fb->swapchain, &fb->device, NULL, &fb->context);
+
+      if (FAILED(hr)) {
+         _debug_printf("Failed to create debug D3D11 device for WGL path: %x\n", hr);
+         hr = createDeviceAndSwapchain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, FeatureLevels,
+            _countof(FeatureLevels), D3D11_SDK_VERSION, &desc, &fb->swapchain,
+            &fb->device, NULL, &fb->context);
+      }
 
       if (FAILED(hr)) {
          _debug_printf("Failed to create framebuffer dxgi device: %x\n", hr);
