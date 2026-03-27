@@ -1,0 +1,78 @@
+name: Build Mesa x64 (clang)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Chocolatey packages
+      shell: powershell
+      run: |
+        choco install -y ninja winflexbison3
+
+    - name: Install mingw-w64 clang
+      shell: powershell
+      run: |
+        # .\.github\workflows\llvm-mingw-configure.ps1
+        curl https://github.com/YWFhYmJi/d3d10umd-winddk-headers/releases/download/llvm-mingw/llvm-mingw-msvcrt-x86_64.7z -O llvm-mingw-msvcrt-x86_64.7z
+        7z x -o"$PWD\llvm-mingw-msvcrt-x86_64" llvm-mingw-msvcrt-x86_64.7z
+
+    - name: Install Python modules
+      shell: powershell
+      run: |
+        pip install meson Mako PyYAML
+
+    - name: Download D3D10UMD headers
+      shell: powershell
+      run: |
+        git clone https://github.com/YWFhYmJi/d3d10umd-winddk-headers.git
+
+    - name: Build Mesa
+      shell: powershell
+      run: |
+        New-Item -ItemType Directory -Path mesa_prefix -Force
+        $env:CC = "$PWD\llvm-mingw-msvcrt-x86_64\bin\clang.exe"
+        $env:CXX = "$PWD\llvm-mingw-msvcrt-x86_64\bin\clang++.exe"
+        $WINDDK_INCLUDE = "$PWD\d3d10umd-winddk-headers"
+        $env:MESA_PREFIX = "$PWD\mesa_prefix"
+        
+        New-Item -ItemType Directory -Path build -Force
+        cd build
+        
+        meson setup .. --prefix=$env:MESA_PREFIX `
+          -Dgallium-drivers=virgl `
+          -Dgallium-d3d10umd=true `
+          -Dgallium-wgl-dll-name=viogpu_wgl `
+          -Dgallium-d3d10-dll-name=viogpu_d3d10 `
+          -Dvulkan-drivers=virtio `
+          -Dzlib=disabled `
+          -Db_vscrt=mt `
+          -Dc_std=c11 `
+          -Dc_args=-I"$WINDDK_INCLUDE" `
+          -Dcpp_args=-I"$WINDDK_INCLUDE"
+        
+        ninja install
+
+    - name: Package artifacts
+      shell: powershell
+      run: |
+        Compress-Archive -Path mesa_prefix -DestinationPath mesa_x64_build.zip -Force
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mesa_x64_build
+        path: mesa_x64_build.zip
