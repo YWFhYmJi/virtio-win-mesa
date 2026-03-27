@@ -1,0 +1,451 @@
+name: Build Mesa (MSVC + clang)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      build_x86:
+        description: 'Build x86 Mesa'
+        type: boolean
+        default: true
+      build_x64:
+        description: 'Build x64 Mesa'
+        type: boolean
+        default: true
+      build_arm64:
+        description: 'Build ARM64 Mesa'
+        type: boolean
+        default: true
+      d3d10umd_repo:
+        description: 'd3d10umd-winddk-headers repository (leave empty for default)'
+        type: string
+        default: ''
+      llvm_url:
+        description: 'LLVM compiler download base URL (leave empty for default)'
+        type: string
+        default: ''
+      release_tag:
+        description: 'Release tag (leave empty to use mesa-<sha>)'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  D3D10UMD_REPO:  ${{ github.event.inputs.d3d10umd_repo || 'https://github.com/YWFhYmJi/d3d10umd-winddk-headers.git' }}
+  LLVM_URL:       ${{ github.event.inputs.llvm_url      || 'https://github.com/YWFhYmJi/d3d10umd-winddk-headers/releases/latest/download' }}
+  RELEASE_TAG:    ${{ github.event.inputs.release_tag   || format('mesa-{0}', github.sha) }}
+
+jobs:
+  # ==================================================================
+  # Prepare: compute the list of architectures to build.
+  # Avoids using matrix in job-level `if` (not allowed by Actions).
+  # ==================================================================
+  prepare:
+    name: Prepare build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      arches: ${{ steps.set.outputs.arches }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          arches=()
+          if [ "${{ github.event.inputs.build_x64 }}"   != "false" ]; then arches+=('"x64"');   fi
+          if [ "${{ github.event.inputs.build_x86 }}"   != "false" ]; then arches+=('"x86"');   fi
+          if [ "${{ github.event.inputs.build_arm64 }}" != "false" ]; then arches+=('"arm64"'); fi
+          joined=$(IFS=,; echo "${arches[*]}")
+          echo "arches=[$joined]" >> "$GITHUB_OUTPUT"
+          echo "Selected arches: [$joined]"
+  # ==================================================================
+  # Build matrix: x64 / x86 / arm64 (only those selected in prepare)
+  # ==================================================================
+  build:
+    name: Build Mesa ${{ matrix.arch }} (MSVC + clang)
+    needs: prepare
+    if: needs.prepare.outputs.arches != '[]'
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.prepare.outputs.arches) }}
+
+    steps:
+      # ==============================================================
+      # 1. Install environment
+      # ==============================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Chocolatey packages
+        shell: powershell
+        run: |
+          choco install -y ninja winflexbison3
+      - name: Download LLVM mingw compiler
+        shell: powershell
+        run: |
+          $base = $env:LLVM_URL.TrimEnd('/')
+          curl.exe -L -o llvm-mingw-ucrt-x86_64.7z "$base/llvm-mingw-ucrt-x86_64.7z"
+          7z x -o"$PWD\llvm-mingw-ucrt-x86_64" llvm-mingw-ucrt-x86_64.7z
+          if ("${{ matrix.arch }}" -eq 'arm64') {
+            curl.exe -L -o llvm-mingw-ucrt-x86_64-arm_diff.7z "$base/llvm-mingw-ucrt-x86_64-arm_diff.7z"
+            7z x -o"$PWD\llvm-mingw-ucrt-x86_64" llvm-mingw-ucrt-x86_64-arm_diff.7z
+          }
+      - name: Install Python modules
+        shell: powershell
+        run: |
+          pip install meson Mako PyYAML
+      - name: Download D3D10UMD headers
+        shell: powershell
+        run: |
+          git clone "$env:D3D10UMD_REPO" d3d10umd-winddk-headers
+      # ==============================================================
+      # 2. MSVC: build gallium drivers (zink / d3d10umd / yttrium / wgl / d3d10)
+      # ==============================================================
+      - name: Setup Visual Studio 2022 (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          # Cross-compile from x64 host: x86 -> amd64_x86, arm64 -> amd64_arm64
+          arch: ${{ matrix.arch == 'x86' && 'amd64_x86' || matrix.arch == 'arm64' && 'amd64_arm64' || 'x64' }}
+
+      - name: Build Mesa gallium drivers with MSVC (${{ matrix.arch }})
+        shell: powershell
+        run: |
+          # MESA_PREFIX_<ARCH> aligned with the clang workflow
+          $archUpper  = "${{ matrix.arch }}".ToUpper()
+          $prefixName = "MESA_PREFIX_$archUpper"
+          $prefix     = "$PWD\mesa_prefix_${{ matrix.arch }}"
+          New-Item -Path "Env:$prefixName" -Value $prefix -Force | Out-Null
+          New-Item -ItemType Directory -Path $prefix -Force | Out-Null
+          # MSVC cross-compilation requires a cross file for arm64.
+          # vcvarsall already points `cl` at the ARM64 target, but Meson still
+          # treats it as a native build and tries to run the produced exe on
+          # the x64 host, which fails with WinError 216. Providing a cross file
+          # with needs_exe_wrapper = true tells Meson this is a cross build and
+          # that it must not execute the sanity-check executable.
+          $crossArgs = @()
+          if ("${{ matrix.arch }}" -eq 'arm64') {
+            $CROSS_FILE = "$PWD\msvc-aarch64.txt"
+            $cross = @(
+              '[binaries]',
+              "c       = 'cl'",
+              "cpp     = 'cl'",
+              "ar      = 'lib'",
+              "windres = 'rc'",
+              '',
+              '[host_machine]',
+              "system     = 'windows'",
+              "cpu_family = 'aarch64'",
+              "cpu        = 'aarch64'",
+              "endian     = 'little'",
+              '',
+              '[properties]',
+              "needs_exe_wrapper = true"
+            )
+            Set-Content -Path $CROSS_FILE -Value $cross -Encoding ASCII
+            $crossArgs = @('--cross-file', $CROSS_FILE)
+          }
+          New-Item -ItemType Directory -Path "build_msvc_${{ matrix.arch }}" -Force | Out-Null
+          Set-Location "build_msvc_${{ matrix.arch }}"
+          $setupArgs = @('setup', '..', "--prefix=$prefix") + $crossArgs + @(
+            '-Dgallium-drivers=zink',
+            '-Dgallium-d3d10umd=true',
+            '-Dgallium-yttrium=true',
+            '-Dgallium-wgl-dll-name=viogpu_wgl',
+            '-Dgallium-d3d10-dll-name=viogpu_d3d10',
+            '-Dvulkan-drivers=',
+            '-Dzlib=disabled',
+            '-Db_vscrt=mt',
+            '-Dc_std=c11',
+            '-Dc_args=/experimental:c11atomics /wd4189'
+          )
+          & meson @setupArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ninja install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # ==============================================================
+      # 3. clang: build vulkan drivers (virtio), install into the same prefix
+      # ==============================================================
+      - name: Build Mesa vulkan drivers with clang (${{ matrix.arch }})
+        shell: powershell
+        run: |
+          # Clear MSVC environment so llvm-mingw clang does not pick up MSVC headers/libs
+          Remove-Item Env:\INCLUDE -ErrorAction SilentlyContinue
+          Remove-Item Env:\LIB     -ErrorAction SilentlyContinue
+          Remove-Item Env:\LIBPATH -ErrorAction SilentlyContinue
+          # MESA_PREFIX_<ARCH> aligned with the clang workflow
+          $archUpper  = "${{ matrix.arch }}".ToUpper()
+          $prefixName = "MESA_PREFIX_$archUpper"
+          $prefix     = "$PWD\mesa_prefix_${{ matrix.arch }}"
+          New-Item -Path "Env:$prefixName" -Value $prefix -Force | Out-Null
+          $WINDDK_INCLUDE = "$PWD\d3d10umd-winddk-headers"
+          $llvmBin        = "$PWD\llvm-mingw-ucrt-x86_64\bin"
+          $env:PATH       = "$llvmBin;$env:PATH"
+          $crossArgs = @()
+          $arch      = "${{ matrix.arch }}"
+          if ($arch -eq 'x64') {
+            $env:CC  = "$llvmBin\clang.exe"
+            $env:CXX = "$llvmBin\clang++.exe"
+          } elseif ($arch -eq 'x86') {
+            $env:CC  = "$llvmBin\i686-w64-mingw32-clang.exe"
+            $env:CXX = "$llvmBin\i686-w64-mingw32-clang++.exe"
+          } elseif ($arch -eq 'arm64') {
+            # Generate the ARM64 cross file inline (no dependency on repo files)
+            $CROSS_FILE = "$PWD\aarch64-w64-mingw32-clang.txt"
+            $cross = @(
+              '[binaries]',
+              "c       = 'aarch64-w64-mingw32-clang.exe'",
+              "cpp     = 'aarch64-w64-mingw32-clang++.exe'",
+              "ar      = 'aarch64-w64-mingw32-ar.exe'",
+              "windres = 'aarch64-w64-mingw32-windres.exe'",
+              "strip   = 'aarch64-w64-mingw32-strip.exe'",
+              '',
+              '[host_machine]',
+              "system     = 'windows'",
+              "cpu_family = 'aarch64'",
+              "cpu        = 'aarch64'",
+              "endian     = 'little'",
+              '',
+              '[properties]',
+              "needs_exe_wrapper = true"
+            )
+            Set-Content -Path $CROSS_FILE -Value $cross -Encoding ASCII
+            $crossArgs = @('--cross-file', $CROSS_FILE)
+          }
+          New-Item -ItemType Directory -Path "build_clang_${{ matrix.arch }}" -Force | Out-Null
+          Set-Location "build_clang_${{ matrix.arch }}"
+          $setupArgs = @(
+            'setup', '..', "--prefix=$prefix"
+          ) + $crossArgs + @(
+            '-Dgallium-drivers=',
+            '-Dgles1=disabled',
+            '-Dgles2=disabled',
+            '-Dopengl=false',
+            '-Degl=disabled',
+            '-Dgallium-yttrium=true',
+            '-Dvulkan-drivers=virtio',
+            '-Dzlib=disabled',
+            '-Dc_std=c11',
+            "-Dc_args=-I$WINDDK_INCLUDE",
+            "-Dcpp_args=-I$WINDDK_INCLUDE"
+          )
+          & meson @setupArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ninja install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # ==============================================================
+      # 4. Collect MSVC PDBs and generate MANIFEST
+      # ==============================================================
+      - name: Collect PDBs and generate manifest (${{ matrix.arch }})
+        shell: powershell
+        run: |
+          $arch      = "${{ matrix.arch }}"
+          $binDir    = Join-Path $PWD "mesa_prefix_$arch\bin"
+          $buildDir  = Join-Path $PWD "build_msvc_$arch"
+          $pdbRoot   = Join-Path $PWD 'pdb_package'
+          $pdbBinDir = Join-Path $pdbRoot 'bin'
+          if (-not (Test-Path $binDir)) {
+            Write-Error "Installed bin directory not found: $binDir"
+            exit 1
+          }
+          if (Test-Path $pdbRoot) { Remove-Item -Recurse -Force $pdbRoot }
+          New-Item -ItemType Directory -Force -Path $pdbBinDir | Out-Null
+          $allPdbs = @(Get-ChildItem -Path $buildDir -Recurse -Filter *.pdb -File)
+          $bins = @(Get-ChildItem -Path $binDir -File | Where-Object {
+            $_.Extension -in '.dll', '.exe'
+          })
+          if ($bins.Count -eq 0) {
+            Write-Error "No DLL/EXE found in $binDir"
+            exit 1
+          }
+          $rows = New-Object System.Collections.Generic.List[string]
+          $rows.Add("binary`tbinary_sha256`tsymbol`tsymbol_sha256")
+          foreach ($b in $bins) {
+            $base = [IO.Path]::GetFileNameWithoutExtension($b.Name)
+            $candidates = @($allPdbs | Where-Object { $_.BaseName -eq $base })
+            if ($candidates.Count -eq 0) {
+              Write-Warning "No PDB found for $($b.Name)"
+              continue
+            }
+            $pick = $null
+            if ($candidates.Count -eq 1) {
+              $pick = $candidates[0]
+            } else {
+              $pick = $candidates |
+                Where-Object { Test-Path (Join-Path $_.DirectoryName $b.Name) } |
+                Select-Object -First 1
+              if (-not $pick) { $pick = $candidates[0] }
+            }
+            $dstPdb = Join-Path $pdbBinDir $pick.Name
+            Copy-Item -Path $pick.FullName -Destination $dstPdb -Force
+            $binHash = (Get-FileHash -Algorithm SHA256 -Path $b.FullName).Hash.ToLower()
+            $pdbHash = (Get-FileHash -Algorithm SHA256 -Path $dstPdb).Hash.ToLower()
+            $binRel = "mesa_prefix_$arch/bin/$($b.Name)"
+            $pdbRel = "bin/$($pick.Name)"
+            $rows.Add("$binRel`t$binHash`t$pdbRel`t$pdbHash")
+          }
+          $manifestPath = Join-Path $pdbRoot 'MANIFEST.tsv'
+          [IO.File]::WriteAllLines($manifestPath, $rows, (New-Object System.Text.UTF8Encoding($false)))
+          $entryCount = $rows.Count - 1
+          Write-Host "Manifest entries: $entryCount"
+          Get-Content $manifestPath | ForEach-Object { Write-Host $_ }
+          if ($entryCount -eq 0) {
+            Write-Error "No PDB collected; PDB package would be empty."
+            exit 1
+          }
+      # ==============================================================
+      # 5. Package PDB only (binary folder is uploaded as-is)
+      # ==============================================================
+      - name: Package PDB artifact (${{ matrix.arch }})
+        shell: powershell
+        run: |
+          $arch = "${{ matrix.arch }}"
+          $sha  = "${{ github.sha }}"
+          Compress-Archive -Path "pdb_package\*" `
+            -DestinationPath "mesa_${arch}_pdb-$sha.zip" -Force
+          Get-ChildItem *.zip | Format-Table Name, Length
+      # ==============================================================
+      # 6. Upload artifacts
+      # ==============================================================
+      - name: Upload binary artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa_${{ matrix.arch }}_build
+          path: mesa_prefix_${{ matrix.arch }}
+
+      - name: Upload PDB artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa_${{ matrix.arch }}_pdb
+          path: mesa_${{ matrix.arch }}_pdb-${{ github.sha }}.zip
+
+  # ==================================================================
+  # Release job: runs after all builds, packages binaries into 7z and
+  # publishes exactly 5 files to GitHub Release.
+  # ==================================================================
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: windows-2022
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifacts = Join-Path $PWD 'artifacts'
+
+          # upload-artifact stores the *contents* of mesa_prefix_<arch>,
+          # so artifacts/mesa_<arch>_build/ already is the prefix root.
+          # Copy it to the expected mesa_prefix_<arch> folder name.
+          foreach ($arch in @('x64', 'x86', 'arm64')) {
+            $src = Join-Path $artifacts "mesa_${arch}_build"
+            if (Test-Path $src) {
+              Copy-Item -Recurse -Force -Path $src -Destination "$PWD\mesa_prefix_$arch"
+              Write-Host "Prepared mesa_prefix_$arch"
+            } else {
+              Write-Warning "Binary for $arch not found, skipping"
+            }
+          }
+
+          # Copy PDB zip files to the workspace root
+          foreach ($arch in @('x64', 'x86', 'arm64')) {
+            $srcDir = Join-Path $artifacts "mesa_${arch}_pdb"
+            if (Test-Path $srcDir) {
+              Get-ChildItem -Path $srcDir -Filter "mesa_${arch}_pdb-*.zip" -File | ForEach-Object {
+                Copy-Item -Force -Path $_.FullName -Destination "$PWD\$($_.Name)"
+                Write-Host "Prepared $($_.Name)"
+              }
+            }
+          }
+
+          Get-ChildItem -Path $PWD -Filter "mesa_*" | Format-Table Name, Length
+
+      - name: Create 7z archives
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sevenZip = '7z.exe'
+
+          # mesa_x64_x86.7z: contains mesa_prefix_x64 and/or mesa_prefix_x86
+          $x86x64Inputs = @()
+          if (Test-Path 'mesa_prefix_x64') { $x86x64Inputs += 'mesa_prefix_x64' }
+          if (Test-Path 'mesa_prefix_x86') { $x86x64Inputs += 'mesa_prefix_x86' }
+          if ($x86x64Inputs.Count -gt 0) {
+            Remove-Item -Force -ErrorAction SilentlyContinue mesa_x64_x86.7z
+            # PowerShell expands the array into separate arguments for native commands
+            & $sevenZip a mesa_x64_x86.7z $x86x64Inputs
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Warning "No x64/x86 binaries to package"
+          }
+
+          # mesa_arm64.7z: contains mesa_prefix_arm64
+          if (Test-Path 'mesa_prefix_arm64') {
+            Remove-Item -Force -ErrorAction SilentlyContinue mesa_arm64.7z
+            & $sevenZip a mesa_arm64.7z mesa_prefix_arm64
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } else {
+            Write-Warning "No ARM64 binaries to package"
+          }
+
+          Get-ChildItem -Path $PWD -Filter "mesa_*.7z" | Format-Table Name, Length
+
+          if (-not (Test-Path 'mesa_x64_x86.7z') -and -not (Test-Path 'mesa_arm64.7z')) {
+            Write-Error "No 7z archive was created."
+            exit 1
+          }
+
+      - name: Publish to GitHub Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag  = $env:RELEASE_TAG
+          $repo = "${{ github.repository }}"
+
+          $files = @()
+          Get-ChildItem -Path $PWD -Filter "mesa_*.7z"        -File | ForEach-Object { $files += $_.FullName }
+          Get-ChildItem -Path $PWD -Filter "mesa_*_pdb-*.zip" -File | ForEach-Object { $files += $_.FullName }
+
+          if ($files.Count -eq 0) {
+            Write-Error "No release files found."
+            exit 1
+          }
+
+          Write-Host "Release tag : $tag"
+          Write-Host "Release files:"
+          $files | ForEach-Object { Write-Host "  $_" }
+
+          # PowerShell 5.1 turns stderr from a native command into a
+          # terminating error when $ErrorActionPreference = 'Stop', even with
+          # 2>&1 | Out-Null. Temporarily switch to 'Continue' for the probe.
+          $prevEAP = $ErrorActionPreference
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag -R $repo 2>&1 | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = $prevEAP
+
+          if ($exists) {
+            Write-Host "Release $tag exists, uploading with --clobber"
+            gh release upload $tag $files --clobber -R $repo
+          } else {
+            Write-Host "Creating release $tag"
+            gh release create $tag $files --title $tag --notes "Mesa build $tag" -R $repo
+          }
+
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

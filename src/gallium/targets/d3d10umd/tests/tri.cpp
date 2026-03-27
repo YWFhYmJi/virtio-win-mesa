@@ -45,6 +45,7 @@
 
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <math.h>
 
 using Microsoft::WRL::ComPtr;
@@ -2593,7 +2594,7 @@ main(int argc, char *argv[])
              * buffers until something flushes them, so without this fence the
              * timer stops before the bus has seen the data and WC memory looks
              * as fast as cached memory. */
-            _mm_sfence();
+            std::atomic_thread_fence(std::memory_order_release);
             QueryPerformanceCounter(&t2);
 
             pDeviceContext->Unmap(pUploadBuffer.Get(), 0);
