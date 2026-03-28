@@ -129,6 +129,17 @@ __forceinline short _interlockedadd16(short volatile * _Addend, short _Value)
    return _InterlockedExchangeAdd16(_Addend, _Value) + _Value;
 }
 
+__forceinline long _interlockedadd(long volatile * _Addend, long _Value)
+{
+   return _InterlockedExchangeAdd(_Addend, _Value) + _Value;
+}
+
+__forceinline __int64 _interlockedadd64(__int64 volatile * _Addend, __int64 _Value)
+{
+   return _InterlockedExchangeAdd64(_Addend, _Value) + _Value;
+}
+
+
 /* MSVC supports decltype keyword, but it's only supported on C++ and doesn't
  * quite work here; and if a C++-only solution is worthwhile, then it would be
  * better to use templates / function overloading, instead of decltype magic.
@@ -169,7 +180,7 @@ __forceinline short _interlockedadd16(short volatile * _Addend, short _Value)
    sizeof *(_v) == sizeof(char)    ? p_atomic_add_return((_v), 1) : \
    sizeof *(_v) == sizeof(short)   ? _InterlockedIncrement16((short *)  (_v)) : \
    sizeof *(_v) == sizeof(long)    ? _InterlockedIncrement  ((long *)   (_v)) : \
-   sizeof *(_v) == sizeof(__int64) ? _interlockedincrement64((__int64 *)(_v)) : \
+   sizeof *(_v) == sizeof(__int64) ? _InterlockedIncrement64((__int64 *)(_v)) : \
                                      (assert(!"should not get here"), 0))
 
 #define p_atomic_dec(_v) \
@@ -179,7 +190,7 @@ __forceinline short _interlockedadd16(short volatile * _Addend, short _Value)
    sizeof *(_v) == sizeof(char)    ? p_atomic_add_return((_v), -1) : \
    sizeof *(_v) == sizeof(short)   ? _InterlockedDecrement16((short *)  (_v)) : \
    sizeof *(_v) == sizeof(long)    ? _InterlockedDecrement  ((long *)   (_v)) : \
-   sizeof *(_v) == sizeof(__int64) ? _interlockeddecrement64((__int64 *)(_v)) : \
+   sizeof *(_v) == sizeof(__int64) ? _InterlockedDecrement64((__int64 *)(_v)) : \
                                      (assert(!"should not get here"), 0))
 
 #define p_atomic_add(_v, _i) \
@@ -196,7 +207,7 @@ __forceinline short _interlockedadd16(short volatile * _Addend, short _Value)
    sizeof *(_v) == sizeof(char)    ? _InterlockedExchangeAdd8 ((char *)   (_v), (char) (_i)) : \
    sizeof *(_v) == sizeof(short)   ? _InterlockedExchangeAdd16((short *)  (_v), (short) (_i)) : \
    sizeof *(_v) == sizeof(long)    ? _InterlockedExchangeAdd  ((long *)   (_v), (long) (_i)) : \
-   sizeof *(_v) == sizeof(__int64) ? _interlockedexchangeadd64((__int64 *)(_v), (__int64) (_i)) : \
+   sizeof *(_v) == sizeof(__int64) ? _InterlockedExchangeAdd64((__int64 *)(_v), (__int64) (_i)) : \
                                      (assert(!"should not get here"), 0))
 
 #define p_atomic_cmpxchg(_v, _old, _new) (\
@@ -217,7 +228,7 @@ __forceinline short _interlockedadd16(short volatile * _Addend, short _Value)
    sizeof *(_v) == sizeof(char)    ? _InterlockedExchange8 ((char *)   (_v), (char)   (_new)) : \
    sizeof *(_v) == sizeof(short)   ? _InterlockedExchange16((short *)  (_v), (short)  (_new)) : \
    sizeof *(_v) == sizeof(long)    ? _InterlockedExchange  ((long *)   (_v), (long)   (_new)) : \
-   sizeof *(_v) == sizeof(__int64) ? _interlockedexchange64((__int64 *)(_v), (__int64)(_new)) : \
+   sizeof *(_v) == sizeof(__int64) ? _InterlockedExchange64((__int64 *)(_v), (__int64)(_new)) : \
                                      (assert(!"should not get here"), 0))
 
 #endif
