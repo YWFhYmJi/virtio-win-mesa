@@ -251,7 +251,7 @@ spirv_verify_gl_specialization_constants(
       return false;
 
    /* See also _vtn_fail() */
-   if (vtn_setjmp(b->fail_jump)) {
+   if (vtn_setjmp((void **)b->fail_jump)) {
       ralloc_free(b);
       return SPIRV_VERIFY_PARSER_ERROR;
    }
