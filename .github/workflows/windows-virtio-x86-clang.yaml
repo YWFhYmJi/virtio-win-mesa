@@ -1,4 +1,4 @@
-name: Build Mesa WOW64 (clang)
+name: Build Mesa x86 (clang)
 
 on:
   push:
@@ -43,20 +43,20 @@ jobs:
     - name: Build Mesa
       shell: powershell
       run: |
-        New-Item -ItemType Directory -Path mesa_prefix -Force
+        New-Item -ItemType Directory -Path mesa_prefix_x86 -Force
         $env:CC = "$PWD\llvm-mingw-msvcrt-x86_64\bin\i686-w64-mingw32-clang.exe"
         $env:CXX = "$PWD\llvm-mingw-msvcrt-x86_64\bin\i686-w64-mingw32-clang++.exe"
         $WINDDK_INCLUDE = "$PWD\d3d10umd-winddk-headers"
-        $env:MESA_PREFIX_WOW64 = "$PWD\mesa_prefix_wow64"
+        $env:MESA_PREFIX_x86 = "$PWD\mesa_prefix_x86"
         
         New-Item -ItemType Directory -Path build -Force
         cd build
         
-        meson setup .. --prefix=$env:MESA_PREFIX_WOW64 `
+        meson setup .. --prefix=$env:MESA_PREFIX_x86 `
           -Dgallium-drivers=virgl `
           -Dgallium-d3d10umd=true `
-          -Dgallium-wgl-dll-name=viogpu_wgl_wow64 `
-          -Dgallium-d3d10-dll-name=viogpu_d3d10_wow64 `
+          -Dgallium-wgl-dll-name=viogpu_wgl `
+          -Dgallium-d3d10-dll-name=viogpu_d3d10 `
           -Dvulkan-drivers=virtio `
           -Dzlib=disabled `
           -Db_vscrt=mt `
@@ -66,13 +66,8 @@ jobs:
         
         ninja install
 
-    - name: Package artifacts
-      shell: powershell
-      run: |
-        Compress-Archive -Path mesa_prefix_wow64 -DestinationPath mesa_wow64_build.zip -Force
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: mesa_wow64_build
-        path: mesa_wow64_build.zip
+        name: mesa_x86_build
+        path: mesa_prefix_x86

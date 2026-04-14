@@ -43,16 +43,16 @@ jobs:
     - name: Build Mesa
       shell: powershell
       run: |
-        New-Item -ItemType Directory -Path mesa_prefix -Force
+        New-Item -ItemType Directory -Path mesa_prefix_x64 -Force
         $env:CC = "$PWD\llvm-mingw-msvcrt-x86_64\bin\clang.exe"
         $env:CXX = "$PWD\llvm-mingw-msvcrt-x86_64\bin\clang++.exe"
         $WINDDK_INCLUDE = "$PWD\d3d10umd-winddk-headers"
-        $env:MESA_PREFIX = "$PWD\mesa_prefix"
+        $env:MESA_PREFIX_x64 = "$PWD\mesa_prefix_x64"
         
         New-Item -ItemType Directory -Path build -Force
         cd build
         
-        meson setup .. --prefix=$env:MESA_PREFIX `
+        meson setup .. --prefix=$env:MESA_PREFIX_x64 `
           -Dgallium-drivers=virgl `
           -Dgallium-d3d10umd=true `
           -Dgallium-wgl-dll-name=viogpu_wgl `
@@ -66,13 +66,8 @@ jobs:
         
         ninja install
 
-    - name: Package artifacts
-      shell: powershell
-      run: |
-        Compress-Archive -Path mesa_prefix -DestinationPath mesa_x64_build.zip -Force
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: mesa_x64_build
-        path: mesa_x64_build.zip
+        path: mesa_prefix_x64
