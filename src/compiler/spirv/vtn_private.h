@@ -31,12 +31,17 @@ struct vtn_builder;
 struct vtn_decoration;
 
 /* setjmp/longjmp is broken on MinGW: https://sourceforge.net/p/mingw-w64/bugs/406/ */
-#if defined(__MINGW32__) && !defined(_UCRT)
-  #define vtn_setjmp __builtin_setjmp
-  #define vtn_longjmp __builtin_longjmp
+#if !DETECT_ARCH_AARCH64
+  #if defined(__MINGW32__) && !defined(_UCRT)
+    #define vtn_setjmp __builtin_setjmp
+    #define vtn_longjmp __builtin_longjmp
+  #else
+    #define vtn_setjmp setjmp
+    #define vtn_longjmp longjmp
+  #endif
 #else
-  #define vtn_setjmp setjmp
-  #define vtn_longjmp longjmp
+  #define vtn_setjmp(x) setjmp((unsigned long long *)(x))
+  #define vtn_longjmp(x, y) longjmp((unsigned long long *)(x), (y))
 #endif
 
 void vtn_log(struct vtn_builder *b, enum nir_spirv_debug_level level,
