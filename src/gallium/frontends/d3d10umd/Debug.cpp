@@ -133,8 +133,10 @@ AssertFail(const char *expr,
    yttrium_gdi_trace_errorf("%s:%u:%s: Assertion `%s' failed.\n",
                             file, line, function, expr);
    DebugPrintf("%s:%u:%s: Assertion `%s' failed.\n", file, line, function, expr);
-#if defined(__GNUC__)
+#if defined(__GNUC__) && !DETECT_ARCH_AARCH64
    __asm("int3");
+#elif defined(__GNUC__) && DETECT_ARCH_AARCH64
+   __asm("brk #0");
 #elif defined(_MSC_VER)
    __debugbreak();
 #else
