@@ -706,6 +706,7 @@ virtgpu_d3dkmt_resource_map_blob(struct virtgpu *gpu,
                                 uint32_t alloc_handle,
                                 uint64_t offset,
                                 uint64_t size,
+                                void *placed_addr,
                                 uint32_t *map_info,
                                 void **user_va)
 {
@@ -715,7 +716,7 @@ virtgpu_d3dkmt_resource_map_blob(struct virtgpu *gpu,
    esc.ResourceMapBlob.ResHandle = (D3DKMT_HANDLE)alloc_handle;
    esc.ResourceMapBlob.Offset = offset;
    esc.ResourceMapBlob.Size = size;
-   esc.ResourceMapBlob.UserVa = 0;
+   esc.ResourceMapBlob.UserVa = (ULONGLONG)(uintptr_t)placed_addr;
    esc.ResourceMapBlob.MapInfo = 0;
 
    if (!virtgpu_d3dkmt_escape(gpu, &esc))
@@ -914,18 +915,26 @@ virtgpu_unload_d3dkmt(struct virtgpu *gpu)
 }
 
 static void *
-virtgpu_d3dkmt_map(struct virtgpu *gpu, uint32_t alloc_handle, size_t size)
+virtgpu_d3dkmt_map(struct virtgpu *gpu,
+                   uint32_t alloc_handle,
+                   size_t size,
+                   void *placed_addr)
 {
    uint32_t map_info = 0;
    void *user_va = NULL;
    if (virtgpu_d3dkmt_resource_map_blob(gpu, alloc_handle, 0, size, &map_info,
-                                       &user_va)) {
+                                       placed_addr, &user_va)) {
       vn_log(gpu->instance,"virtgpu_d3dkmt_resource_map_blob failed");
       return NULL;
    }
 
    if (!user_va) {
       vn_log(gpu->instance, "ResourceMapBlob returned null user_va");
+      return NULL;
+   }
+   if (placed_addr && user_va != placed_addr) {
+      vn_log(gpu->instance, "ResourceMapBlob returned unexpected user_va");
+      virtgpu_d3dkmt_resource_unmap_blob(gpu, alloc_handle);
       return NULL;
    }
    return user_va;
@@ -1370,7 +1379,9 @@ virtgpu_bo_flush(struct vn_renderer *renderer,
 }
 
 static void *
-virtgpu_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
+virtgpu_bo_map(struct vn_renderer *renderer,
+               struct vn_renderer_bo *_bo,
+               void *placed_addr)
 {
    struct virtgpu *gpu = (struct virtgpu *)renderer;
    struct virtgpu_bo *bo = (struct virtgpu_bo *)_bo;
@@ -1379,7 +1390,8 @@ virtgpu_bo_map(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
    /* not thread-safe but is fine */
    if (!bo->base.mmap_ptr && mappable) {
       bo->base.mmap_ptr =
-         virtgpu_d3dkmt_map(gpu, bo->alloc_handle, bo->base.mmap_size);
+         virtgpu_d3dkmt_map(gpu, bo->alloc_handle, bo->base.mmap_size,
+                            placed_addr);
    }
 
    return bo->base.mmap_ptr;
@@ -1636,7 +1648,7 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
    if (!alloc_handle)
       return NULL;
 
-   void *ptr = virtgpu_d3dkmt_map(gpu, alloc_handle, alloc_size);
+   void *ptr = virtgpu_d3dkmt_map(gpu, alloc_handle, alloc_size, NULL);
    if (!ptr) {
       virtgpu_d3dkmt_gem_close(gpu, alloc_handle);
       return NULL;
