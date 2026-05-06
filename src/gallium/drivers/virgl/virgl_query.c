@@ -257,12 +257,13 @@ static bool virgl_get_query_result(struct pipe_context *ctx,
        * transfer until we get the result back.
        */
       while (host_state->query_state != VIRGL_QUERY_STATE_DONE) {
+         if (!wait)
+            return false;
+
          debug_printf("VIRGL: get_query_result is forced blocking\n");
 
          if (transfer) {
             pipe_buffer_unmap(ctx, transfer);
-            if (!wait)
-               return false;
          }
 
          host_state = pipe_buffer_map(ctx, &query->buf->b,
