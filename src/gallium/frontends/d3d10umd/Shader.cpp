@@ -54,7 +54,11 @@ GetPipeShaderResourceView(D3D10DDI_HSHADERRESOURCEVIEW hRenderTargetView)
    // Validate that view texture matches resource 
    // If it is not (resource rotated) then recreate view
    struct pipe_sampler_view *currentSurface = pShaderResourceView->handle;
+   if (!currentSurface) return NULL;
+
    Resource *res = pShaderResourceView->resource;
+   if (!res || !res->resource) return currentSurface;
+
    if (currentSurface->texture != res->resource) {
       struct pipe_context *pipe = currentSurface->context;
       struct pipe_sampler_view *newView = pipe->create_sampler_view(pipe, res->resource, currentSurface);
@@ -1225,6 +1229,9 @@ CreateShaderResourceView(
    memset(&desc, 0, sizeof desc);
    resource = CastPipeResource(pCreateSRView->hDrvResource);
    format = FormatTranslate(pCreateSRView->Format, false);
+   if (pCreateSRView->Format == DXGI_FORMAT_UNKNOWN && resource) {
+      format = resource->format;
+   }
 
    u_sampler_view_default_template(&desc,
                                    resource,
@@ -1307,6 +1314,9 @@ CreateShaderResourceView1(
    memset(&desc, 0, sizeof desc);
    resource = CastPipeResource(pCreateSRView->hDrvResource);
    format = FormatTranslate(pCreateSRView->Format, false);
+   if (pCreateSRView->Format == DXGI_FORMAT_UNKNOWN && resource) {
+      format = resource->format;
+   }
 
    u_sampler_view_default_template(&desc,
                                    resource,
