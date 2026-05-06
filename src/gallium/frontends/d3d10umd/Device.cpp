@@ -458,6 +458,25 @@ Flush(D3D10DDI_HDEVICE hDevice)  // IN
  * ----------------------------------------------------------------------
  */
 
+static bool
+is_format_supported_with_fallback(struct pipe_screen *screen,
+                                  enum pipe_format format,
+                                  enum pipe_texture_target target,
+                                  unsigned sample_count,
+                                  unsigned storage_sample_count,
+                                  unsigned bind)
+{
+   if (screen->is_format_supported(screen, format, target, sample_count,
+                                   storage_sample_count, bind))
+      return true;
+
+   enum pipe_format fallback = FormatFallback(format);
+   return fallback != PIPE_FORMAT_NONE &&
+          screen->is_format_supported(screen, fallback, target, sample_count,
+                                      storage_sample_count, bind);
+}
+
+
 void APIENTRY
 CheckFormatSupport(D3D10DDI_HDEVICE hDevice, // IN
                    DXGI_FORMAT Format,       // IN
@@ -484,26 +503,26 @@ CheckFormatSupport(D3D10DDI_HDEVICE hDevice, // IN
       return;
    }
 
-   if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 0, 0,
-                                   PIPE_BIND_RENDER_TARGET)) {
+   if (is_format_supported_with_fallback(screen, format, PIPE_TEXTURE_2D, 0, 0,
+                                         PIPE_BIND_RENDER_TARGET)) {
       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_RENDERTARGET;
       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_BLENDABLE;
 
 #if SUPPORT_MSAA
-      if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 4, 4,
-                                      PIPE_BIND_RENDER_TARGET)) {
+      if (is_format_supported_with_fallback(screen, format, PIPE_TEXTURE_2D,
+                                            4, 4, PIPE_BIND_RENDER_TARGET)) {
          *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET;
       }
 #endif
    }
 
-   if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 0, 0,
-                                   PIPE_BIND_SAMPLER_VIEW)) {
+   if (is_format_supported_with_fallback(screen, format, PIPE_TEXTURE_2D, 0, 0,
+                                         PIPE_BIND_SAMPLER_VIEW)) {
       *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_SHADER_SAMPLE;
 
 #if SUPPORT_MSAA
-      if (screen->is_format_supported(screen, format, PIPE_TEXTURE_2D, 4, 4,
-                                      PIPE_BIND_RENDER_TARGET)) {
+      if (is_format_supported_with_fallback(screen, format, PIPE_TEXTURE_2D,
+                                            4, 4, PIPE_BIND_RENDER_TARGET)) {
          *pFormatCaps |= D3D10_DDI_FORMAT_SUPPORT_MULTISAMPLE_LOAD;
       }
 #endif

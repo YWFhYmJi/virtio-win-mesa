@@ -306,6 +306,8 @@ CreateDepthStencilView(
    memset(&desc, 0, sizeof desc);
    pipe_resource_reference(&desc.texture, resource);
    desc.format = FormatTranslate(pCreateDepthStencilView->Format, true);
+   if (FormatFallback(desc.format) == resource->format)
+      desc.format = resource->format;
 
    switch (pCreateDepthStencilView->ResourceDimension) {
    case D3D10DDIRESOURCE_TEXTURE1D:

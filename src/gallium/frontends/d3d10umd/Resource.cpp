@@ -152,6 +152,38 @@ translate_texture_target( D3D10DDIRESOURCE_TYPE ResourceDimension,
 }
 
 
+static bool
+is_resource_format_supported(struct pipe_screen *screen,
+                             const struct pipe_resource *templat)
+{
+   return screen->is_format_supported(screen,
+                                      templat->format,
+                                      templat->target,
+                                      templat->nr_samples,
+                                      templat->nr_storage_samples,
+                                      templat->bind);
+}
+
+
+static bool
+try_resource_format_fallback(struct pipe_screen *screen,
+                             struct pipe_resource *templat)
+{
+   enum pipe_format fallback = FormatFallback(templat->format);
+   if (fallback == PIPE_FORMAT_NONE)
+      return false;
+
+   enum pipe_format original = templat->format;
+   templat->format = fallback;
+
+   if (is_resource_format_supported(screen, templat))
+      return true;
+
+   templat->format = original;
+   return false;
+}
+
+
 static void
 subResourceBox(struct pipe_resource *resource, // IN
                  UINT SubResource,  // IN
@@ -308,12 +340,8 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    }
 
    if (templat.target != PIPE_BUFFER) {
-      if (!screen->is_format_supported(screen,
-                                       templat.format,
-                                       templat.target,
-                                       templat.nr_samples,
-                                       templat.nr_storage_samples,
-                                       templat.bind)) {
+      if (!is_resource_format_supported(screen, &templat) &&
+          !try_resource_format_fallback(screen, &templat)) {
          debug_printf("%s: unsupported format %s\n",
                      __func__, util_format_name(templat.format));
          SetError(hDevice, E_OUTOFMEMORY);

@@ -276,6 +276,18 @@ FormatTranslate(DXGI_FORMAT Format, BOOL depth)
 }
 
 
+enum pipe_format
+FormatFallback(enum pipe_format Format)
+{
+   switch (Format) {
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+      return PIPE_FORMAT_S8_UINT_Z24_UNORM;
+   default:
+      return PIPE_FORMAT_NONE;
+   }
+}
+
+
 DXGI_FORMAT
 FormatDeTranslate(enum pipe_format Format)
 {
@@ -335,6 +347,8 @@ FormatDeTranslate(enum pipe_format Format)
    case PIPE_FORMAT_R32_SINT:
       return DXGI_FORMAT_R32_SINT;
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+      return DXGI_FORMAT_D24_UNORM_S8_UINT;
+   case PIPE_FORMAT_S8_UINT_Z24_UNORM:
       return DXGI_FORMAT_D24_UNORM_S8_UINT;
    case PIPE_FORMAT_R8G8_UNORM:
       return DXGI_FORMAT_R8G8_UNORM;

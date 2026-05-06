@@ -38,6 +38,9 @@
 enum pipe_format
 FormatTranslate(DXGI_FORMAT Format, BOOL depth);
 
+enum pipe_format
+FormatFallback(enum pipe_format Format);
+
 DXGI_FORMAT FormatDeTranslate(enum pipe_format Format);
 
 const char *
