@@ -395,6 +395,17 @@ ClearDepthStencilView(D3D10DDI_HDEVICE hDevice,                      // IN
       flags |= PIPE_CLEAR_STENCIL;
    }
 
+   const struct util_format_description *format_desc =
+      surface ? util_format_description(surface->format) : NULL;
+   if (format_desc) {
+      if (!util_format_has_depth(format_desc)) {
+         flags &= ~PIPE_CLEAR_DEPTH;
+      }
+      if (!util_format_has_stencil(format_desc)) {
+         flags &= ~PIPE_CLEAR_STENCIL;
+      }
+   }
+
    pipe->clear_depth_stencil(pipe,
                              surface,
                              flags,
