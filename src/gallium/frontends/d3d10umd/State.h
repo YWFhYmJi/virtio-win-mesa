@@ -399,6 +399,7 @@ struct Query
    struct pipe_query *handle;
    INT SeqNo;
    UINT GetDataCount;
+   bool Emulated;
 
    D3D10_DDI_QUERY_DATA_PIPELINE_STATISTICS Statistics;
 };

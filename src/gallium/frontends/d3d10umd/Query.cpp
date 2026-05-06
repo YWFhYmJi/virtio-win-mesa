@@ -85,6 +85,21 @@ TranslateQueryType(D3D10DDI_QUERY query)
 }
 
 
+static bool
+ShouldEmulateQuery(D3D10DDI_QUERY query)
+{
+   switch (query) {
+   case D3D10DDI_QUERY_TIMESTAMP:
+   case D3D10DDI_QUERY_TIMESTAMPDISJOINT:
+   case D3D10DDI_QUERY_PIPELINESTATS:
+   case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
+      return true;
+   default:
+      return false;
+   }
+}
+
+
 /*
  * ----------------------------------------------------------------------
  *
@@ -113,9 +128,10 @@ CreateQuery(D3D10DDI_HDEVICE hDevice,                          // IN
 
    pQuery->Type = pCreateQuery->Query;
    pQuery->Flags = pCreateQuery->MiscFlags;
+   pQuery->Emulated = ShouldEmulateQuery(pCreateQuery->Query);
 
    pQuery->pipe_type = TranslateQueryType(pCreateQuery->Query);
-   if (pQuery->pipe_type < PIPE_QUERY_TYPES) {
+   if (!pQuery->Emulated && pQuery->pipe_type < PIPE_QUERY_TYPES) {
       pQuery->handle = pipe->create_query(pipe, pQuery->pipe_type, 0);
    }
 }
@@ -243,15 +259,39 @@ QueryGetData(D3D10DDI_HDEVICE hDevice,                      // IN
       return;
    }
 
-   bool wait = !!(Flags & D3D10_DDI_GET_DATA_DO_NOT_FLUSH);
+   bool doNotFlush = !!(Flags & D3D10_DDI_GET_DATA_DO_NOT_FLUSH);
    union pipe_query_result result;
 
    memset(&result, 0, sizeof result);
 
    bool ret;
 
-   if (state) {
-      ret = pipe->get_query_result(pipe, state, wait, &result);
+   if (!pQuery->Emulated && !doNotFlush) {
+      pipe->flush(pipe, NULL, 0);
+   }
+
+   if (pQuery->Emulated) {
+      ret = true;
+      switch (pQuery->Type) {
+      case D3D10DDI_QUERY_TIMESTAMP:
+         result.u64 = (UINT64)pQuery->SeqNo * 1000000ull;
+         break;
+      case D3D10DDI_QUERY_TIMESTAMPDISJOINT:
+         result.timestamp_disjoint.frequency = 1000000000ull;
+         result.timestamp_disjoint.disjoint = false;
+         break;
+      case D3D10DDI_QUERY_PIPELINESTATS:
+         result.pipeline_statistics = {};
+         break;
+      case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
+         result.so_statistics.num_primitives_written = 0;
+         result.so_statistics.primitives_storage_needed = 0;
+         break;
+      default:
+         break;
+      }
+   } else if (state) {
+      ret = pipe->get_query_result(pipe, state, false, &result);
    } else {
       LOG_UNSUPPORTED(true);
       ret = true;
@@ -386,8 +426,7 @@ CheckPredicate(Device *pDevice)
    memset(&result, 0, sizeof result);
 
    bool ret;
-   ret = pipe->get_query_result(pipe, query, true, &result);
-   assert(ret == true);
+   ret = pipe->get_query_result(pipe, query, false, &result);
    if (!ret) {
       return true;
    }
