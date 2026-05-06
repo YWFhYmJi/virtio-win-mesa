@@ -350,7 +350,7 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    }
 
    pResource->resource = screen->resource_create(screen, &templat);
-   if (!pResource) {
+   if (!pResource->resource) {
       DebugPrintf("%s: failed to create resource\n", __func__);
       SetError(hDevice, E_OUTOFMEMORY);
       goto unlock;
