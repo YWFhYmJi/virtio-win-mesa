@@ -924,6 +924,75 @@ static uint32_t find_cbuf_handle (struct virgl_framebuffer_state *framebuffer,
    return 0;
 }
 
+static uint32_t find_zsbuf_handle (struct virgl_framebuffer_state *framebuffer,
+                                   struct pipe_surface *surface)
+{
+   struct pipe_framebuffer_state *pframebuffer = &framebuffer->base;
+
+   if (framebuffer->zsbuf_handle > 0 &&
+       pipe_surface_equal(surface, &pframebuffer->zsbuf))
+      return framebuffer->zsbuf_handle;
+
+   return 0;
+}
+
+static bool
+virgl_surface_clear_is_full(const struct pipe_surface *surface,
+                            unsigned dstx, unsigned dsty,
+                            unsigned width, unsigned height)
+{
+   return dstx == 0 && dsty == 0 &&
+          width == pipe_surface_width(surface) &&
+          height == pipe_surface_height(surface);
+}
+
+static void
+virgl_pack_clear_surface_depth_stencil(union pipe_color_union *color,
+                                       double depth, unsigned stencil)
+{
+   memset(color, 0, sizeof(*color));
+   memcpy(color->ui, &depth, sizeof(double));
+   /* The protocol describes this payload as depth/f64 + stencil/u32,
+    * while current virglrenderer reads stencil from ui[3].
+    */
+   color->ui[2] = stencil;
+   color->ui[3] = stencil;
+}
+
+static void
+virgl_clear_depth_stencil_framebuffer(struct pipe_context *ctx,
+                                      struct pipe_surface *dst,
+                                      unsigned clear_flags,
+                                      double depth,
+                                      unsigned stencil)
+{
+   struct virgl_context *vctx = virgl_context(ctx);
+   struct pipe_framebuffer_state saved = { 0 };
+   struct pipe_framebuffer_state fb = { 0 };
+   union pipe_color_union color = { 0 };
+   bool restore_framebuffer =
+      !pipe_surface_equal(dst, &vctx->framebuffer.base.zsbuf);
+
+   if (restore_framebuffer) {
+      util_copy_framebuffer_state(&saved, &vctx->framebuffer.base);
+
+      /* Full depth/stencil clears may target a surface that isn't bound.
+       * Bind it temporarily so VIRGL_CCMD_CLEAR can operate on it.
+       */
+      fb.width = pipe_surface_width(dst);
+      fb.height = pipe_surface_height(dst);
+      fb.zsbuf = *dst;
+      virgl_set_framebuffer_state(ctx, &fb);
+   }
+
+   virgl_clear(ctx, clear_flags, 0, 0, NULL, &color, depth, stencil);
+
+   if (restore_framebuffer) {
+      virgl_set_framebuffer_state(ctx, &saved);
+      util_unreference_framebuffer_state(&saved);
+   }
+}
+
 static void virgl_clear_render_target(struct pipe_context *ctx,
                                       struct pipe_surface *dst,
                                       const union pipe_color_union *color,
@@ -956,16 +1025,22 @@ static void virgl_clear_depth_stencil(struct pipe_context *ctx,
                                       bool render_condition_enabled)
 {
    struct virgl_context *vctx = virgl_context(ctx);
+   bool full_clear = virgl_surface_clear_is_full(dst, dstx, dsty,
+                                                width, height);
 
    union pipe_color_union color;
-   memcpy(color.ui, &depth, sizeof(double));
-   color.ui[3] = stencil;
+   if (full_clear) {
+      virgl_clear_depth_stencil_framebuffer(ctx, dst, clear_flags,
+                                           depth, stencil);
+   } else {
+      virgl_pack_clear_surface_depth_stencil(&color, depth, stencil);
 
-   uint32_t dst_handle = find_cbuf_handle (&vctx->framebuffer, dst);
-   if (dst_handle > 0)
-      virgl_encode_clear_surface(vctx, dst_handle, clear_flags, &color,
-                                 dstx, dsty, width, height,
-                                 render_condition_enabled);
+      uint32_t dst_handle = find_zsbuf_handle (&vctx->framebuffer, dst);
+      if (dst_handle > 0)
+         virgl_encode_clear_surface(vctx, dst_handle, clear_flags, &color,
+                                    dstx, dsty, width, height,
+                                    render_condition_enabled);
+   }
 
    /* Mark as dirty, since we are updating the host side resource
     * without going through the corresponding guest side resource, and
