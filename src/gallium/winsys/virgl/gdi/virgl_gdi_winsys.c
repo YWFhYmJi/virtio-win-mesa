@@ -783,7 +783,9 @@ virgl_gdi_cmd_buf_create(struct virgl_winsys *qws, uint32_t size)
    render.ResizeAllocationList = true;
    render.ResizePatchLocationList = true;
 
-   render.NewCommandBufferSize = size * 4 + 0x100;
+   uint64_t requested_size = (uint64_t)size * 4 + 0x100;
+   render.NewCommandBufferSize =
+      requested_size > UINT_MAX ? UINT_MAX : (UINT)requested_size;
    render.NewAllocationListSize = 1024;
    render.NewPatchLocationListSize = 1024;
    Status = cbuf->ctx->render(cbuf->ctx, &render);
