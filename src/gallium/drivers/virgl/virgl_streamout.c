@@ -26,6 +26,16 @@
 #include "virgl_encode.h"
 #include "virtio-gpu/virgl_protocol.h"
 #include "virgl_resource.h"
+#include "virgl_screen.h"
+
+static void
+virgl_so_mark_res_write(struct virgl_context *vctx, struct virgl_resource *res)
+{
+   struct virgl_winsys *vws = virgl_screen(vctx->base.screen)->vws;
+
+   if (res && vws->mark_res_write)
+      vws->mark_res_write(vws, vctx->cbuf, res->hw_res);
+}
 
 static struct pipe_stream_output_target *virgl_create_so_target(
    struct pipe_context *ctx,
@@ -53,6 +63,7 @@ static struct pipe_stream_output_target *virgl_create_so_target(
    util_range_add(&res->b, &res->valid_buffer_range, buffer_offset,
                   buffer_offset + buffer_size);
    virgl_resource_dirty(res, 0);
+   virgl_so_mark_res_write(vctx, res);
 
    virgl_encoder_create_so_target(vctx, handle, res, buffer_offset, buffer_size);
    return &t->base;
@@ -85,6 +96,7 @@ static void virgl_set_so_targets(struct pipe_context *ctx,
          pipe_resource_reference(&vctx->so_targets[i].base.buffer, targets[i]->buffer);
 
          vws->emit_res(vws, vctx->cbuf, res->hw_res, false);
+         virgl_so_mark_res_write(vctx, res);
       } else {
          pipe_resource_reference(&vctx->so_targets[i].base.buffer, NULL);
       }

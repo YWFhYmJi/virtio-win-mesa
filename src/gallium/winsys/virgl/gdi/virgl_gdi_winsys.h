@@ -97,6 +97,7 @@ struct virgl_gdi_cmd_buf {
    int max_alloc;
    int d3d_list_size;
    struct virgl_hw_res **res_bo;
+   uint8_t *res_write;
 
    UINT driver_length;
 };

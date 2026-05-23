@@ -659,6 +659,17 @@ virgl_gdi_cmd_buf_grow_res_list(struct virgl_gdi_cmd_buf *cbuf,
    cbuf->res_bo = new_res_bo;
    memset(&cbuf->res_bo[cbuf->max_alloc], 0,
           (new_size - cbuf->max_alloc) * sizeof(*cbuf->res_bo));
+
+   uint8_t *new_res_write = REALLOC(
+      cbuf->res_write, cbuf->max_alloc * sizeof(*cbuf->res_write),
+      new_size * sizeof(*cbuf->res_write));
+   if (!new_res_write)
+      return false;
+
+   cbuf->res_write = new_res_write;
+   memset(&cbuf->res_write[cbuf->max_alloc], 0,
+          (new_size - cbuf->max_alloc) * sizeof(*cbuf->res_write));
+
    cbuf->max_alloc = new_size;
    return true;
 }
@@ -672,6 +683,7 @@ virgl_gdi_cmd_buf_build_alloc_lists(struct virgl_gdi_cmd_buf *cbuf)
       memset(&cbuf->ctx->pAllocationList[i], 0,
              sizeof(D3DDDI_ALLOCATIONLIST));
       cbuf->ctx->pAllocationList[i].hAllocation = res->hAllocation;
+      cbuf->ctx->pAllocationList[i].WriteOperation = cbuf->res_write[i] != 0;
 
       memset(&cbuf->ctx->pPatchLocationList[i], 0,
              sizeof(D3DDDI_PATCHLOCATIONLIST));
@@ -680,39 +692,54 @@ virgl_gdi_cmd_buf_build_alloc_lists(struct virgl_gdi_cmd_buf *cbuf)
 }
 
 static void
+virgl_gdi_cmd_buf_add_res(struct virgl_winsys *qws,
+                          struct virgl_gdi_cmd_buf *cbuf,
+                          struct virgl_hw_res *res, bool write_operation)
+{
+   struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
+   for (int i = 0; i < cbuf->alloc_count; i++) {
+      if (cbuf->res_bo[i] == res) {
+         cbuf->res_write[i] |= write_operation;
+         return;
+      }
+   }
+
+   if (cbuf->alloc_count >= cbuf->max_alloc) {
+      unsigned new_size = cbuf->max_alloc + 256;
+      if (!virgl_gdi_cmd_buf_grow_res_list(cbuf, new_size)) {
+         assert(cbuf->alloc_count < cbuf->max_alloc);
+         return;
+      }
+   }
+   assert(cbuf->alloc_count < cbuf->max_alloc);
+
+   cbuf->res_bo[cbuf->alloc_count] = NULL;
+   virgl_gdi_resource_reference(&qdws->base,
+                                &cbuf->res_bo[cbuf->alloc_count], res);
+   cbuf->res_write[cbuf->alloc_count] = write_operation;
+
+   p_atomic_inc(&res->num_cs_references);
+
+   cbuf->alloc_count++;
+}
+
+static void
 virgl_gdi_emit_res(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
                    struct virgl_hw_res *res, bool write_buf)
 {
-   struct virgl_gdi_winsys *qdws = virgl_gdi_winsys(qws);
    struct virgl_gdi_cmd_buf *cbuf = virgl_gdi_cmd_buf(_cbuf);
-   boolean already_in_list = false;
-   for (int i = 0; i < cbuf->alloc_count; i++) {
-      if (cbuf->res_bo[i] == res) {
-         already_in_list = true;
-         break;
-      }
-   }
 
    if (write_buf)
       cbuf->base.buf[cbuf->base.cdw++] = res->res_handle;
-   if (!already_in_list) {
-      if (cbuf->alloc_count >= cbuf->max_alloc) {
-         unsigned new_size = cbuf->max_alloc + 256;
-         if (!virgl_gdi_cmd_buf_grow_res_list(cbuf, new_size)) {
-            assert(cbuf->alloc_count < cbuf->max_alloc);
-            return;
-         }
-      }
-      assert(cbuf->alloc_count < cbuf->max_alloc);
 
-      cbuf->res_bo[cbuf->alloc_count] = NULL;
-      virgl_gdi_resource_reference(&qdws->base,
-                                   &cbuf->res_bo[cbuf->alloc_count], res);
+   virgl_gdi_cmd_buf_add_res(qws, cbuf, res, false);
+}
 
-      p_atomic_inc(&res->num_cs_references);
-
-      cbuf->alloc_count++;
-   }
+static void
+virgl_gdi_mark_res_write(struct virgl_winsys *qws, struct virgl_cmd_buf *_cbuf,
+                         struct virgl_hw_res *res)
+{
+   virgl_gdi_cmd_buf_add_res(qws, virgl_gdi_cmd_buf(_cbuf), res, true);
 }
 
 static bool
@@ -797,6 +824,15 @@ virgl_gdi_cmd_buf_create(struct virgl_winsys *qws, uint32_t size)
    cbuf->d3d_list_size = actual;
    cbuf->max_alloc = actual;
    cbuf->res_bo = CALLOC(cbuf->max_alloc, sizeof(struct virgl_hw_res *));
+   cbuf->res_write = CALLOC(cbuf->max_alloc, sizeof(*cbuf->res_write));
+   if (!cbuf->res_bo || !cbuf->res_write) {
+      _debug_printf("Failed to allocate GDI cmdbuf resource lists\n");
+      FREE(cbuf->res_bo);
+      FREE(cbuf->res_write);
+      cbuf->ctx->destroy(cbuf->ctx);
+      FREE(cbuf);
+      return NULL;
+   }
 
    cbuf->base.buf = (uint32_t *)
       ((uint8_t *)cbuf->ctx->pCommandBuffer + sizeof(VIOGPU_COMMAND_HDR));
@@ -814,6 +850,8 @@ virgl_gdi_cmd_buf_destroy(struct virgl_cmd_buf *_cbuf)
    }
 
    cbuf->ctx->destroy(cbuf->ctx);
+   FREE(cbuf->res_bo);
+   FREE(cbuf->res_write);
    FREE(cbuf);
 }
 
@@ -1185,6 +1223,7 @@ virgl_gdi_winsys_create(struct gdikmt_device *device)
    qdws->base.submit_cmd = virgl_gdi_winsys_submit_cmd;
 
    qdws->base.emit_res = virgl_gdi_emit_res;
+   qdws->base.mark_res_write = virgl_gdi_mark_res_write;
    qdws->base.res_is_referenced = virgl_gdi_res_is_ref;
 
    qdws->base.fence_wait = virgl_gdi_fence_wait;

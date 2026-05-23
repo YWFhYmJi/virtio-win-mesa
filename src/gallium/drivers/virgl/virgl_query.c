@@ -29,6 +29,15 @@
 #include "virgl_resource.h"
 #include "virgl_screen.h"
 
+static void
+virgl_query_mark_res_write(struct virgl_context *vctx, struct virgl_resource *res)
+{
+   struct virgl_winsys *vws = virgl_screen(vctx->base.screen)->vws;
+
+   if (res && vws->mark_res_write)
+      vws->mark_res_write(vws, vctx->cbuf, res->hw_res);
+}
+
 struct virgl_query {
    enum pipe_query_type type;
 
@@ -157,6 +166,7 @@ static struct pipe_query *virgl_create_query(struct pipe_context *ctx,
    util_range_add(&query->buf->b, &query->buf->valid_buffer_range, 0,
                   sizeof(struct virgl_host_query_state));
    virgl_resource_dirty(query->buf, 0);
+   virgl_query_mark_res_write(vctx, query->buf);
 
    virgl_encoder_create_query(vctx, query->handle,
          pipe_to_virgl_query(query_type), index, query->buf, 0);
@@ -215,6 +225,7 @@ static bool virgl_end_query(struct pipe_context *ctx,
 
    /* start polling now */
    virgl_encoder_get_query_result(vctx, query->handle, 0);
+   virgl_query_mark_res_write(vctx, query->buf);
    vs->vws->emit_res(vs->vws, vctx->cbuf, query->buf->hw_res, false);
 
    return true;
@@ -319,6 +330,7 @@ virgl_get_query_result_resource(struct pipe_context *ctx,
    struct virgl_resource *qbo = (struct virgl_resource *)resource;
 
    virgl_resource_dirty(qbo, 0);
+   virgl_query_mark_res_write(vctx, qbo);
    virgl_encode_get_query_result_qbo(vctx, query->handle, qbo, (flags & PIPE_QUERY_WAIT), result_type, offset, index);
 }
 

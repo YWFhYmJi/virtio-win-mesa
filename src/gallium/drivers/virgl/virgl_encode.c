@@ -38,6 +38,15 @@
 #include "virgl_screen.h"
 #include "virgl_video.h"
 
+static void
+virgl_encode_mark_res_write(struct virgl_context *ctx, struct virgl_resource *res)
+{
+   struct virgl_winsys *vws = virgl_screen(ctx->base.screen)->vws;
+
+   if (res && vws->mark_res_write)
+      vws->mark_res_write(vws, ctx->cbuf, res->hw_res);
+}
+
 #define VIRGL_ENCODE_MAX_DWORDS MIN2(VIRGL_MAX_CMDBUF_DWORDS, VIRGL_CMD0_MAX_DWORDS)
 
 #define CONV_FORMAT(f) [PIPE_FORMAT_##f] = VIRGL_FORMAT_##f,
@@ -1108,6 +1117,8 @@ static void virgl_encoder_transfer3d_common(struct virgl_screen *vs,
     * this transfer targets, which is saved in xfer->hw_res.
     */
    vs->vws->emit_res(vs->vws, buf, xfer->hw_res, true);
+   if ((transfer->usage & PIPE_MAP_WRITE) && vs->vws->mark_res_write)
+      vs->vws->mark_res_write(vs->vws, buf, xfer->hw_res);
    virgl_encoder_write_dword(buf, transfer->level);
    virgl_encoder_write_dword(buf, transfer->usage);
    virgl_encoder_write_dword(buf, stride);
@@ -1532,6 +1543,7 @@ int virgl_encode_set_shader_buffers(struct virgl_context *ctx,
          util_range_add(&res->b, &res->valid_buffer_range, buffers[i].buffer_offset,
                buffers[i].buffer_offset + buffers[i].buffer_size);
          virgl_resource_dirty(res, 0);
+         virgl_encode_mark_res_write(ctx, res);
       } else {
          virgl_encoder_write_dword(ctx->cbuf, 0);
          virgl_encoder_write_dword(ctx->cbuf, 0);
@@ -1559,6 +1571,7 @@ int virgl_encode_set_hw_atomic_buffers(struct virgl_context *ctx,
          util_range_add(&res->b, &res->valid_buffer_range, buffers[i].buffer_offset,
                buffers[i].buffer_offset + buffers[i].buffer_size);
          virgl_resource_dirty(res, 0);
+         virgl_encode_mark_res_write(ctx, res);
       } else {
          virgl_encoder_write_dword(ctx->cbuf, 0);
          virgl_encoder_write_dword(ctx->cbuf, 0);
@@ -1592,6 +1605,8 @@ int virgl_encode_set_shader_images(struct virgl_context *ctx,
                   images[i].u.buf.offset + images[i].u.buf.size);
          }
          virgl_resource_dirty(res, images[i].u.tex.level);
+         if (images[i].access != PIPE_IMAGE_ACCESS_READ)
+            virgl_encode_mark_res_write(ctx, res);
       } else {
          virgl_encoder_write_dword(ctx->cbuf, 0);
          virgl_encoder_write_dword(ctx->cbuf, 0);

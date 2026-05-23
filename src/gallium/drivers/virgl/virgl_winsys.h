@@ -114,6 +114,7 @@ struct virgl_winsys {
    void (*cmd_buf_destroy)(struct virgl_cmd_buf *buf);
 
    void (*emit_res)(struct virgl_winsys *vws, struct virgl_cmd_buf *buf, struct virgl_hw_res *res, bool write_buffer);
+   void (*mark_res_write)(struct virgl_winsys *vws, struct virgl_cmd_buf *buf, struct virgl_hw_res *res);
    int (*submit_cmd)(struct virgl_winsys *vws, struct virgl_cmd_buf *buf,
                      struct pipe_fence_handle **fence);
 
