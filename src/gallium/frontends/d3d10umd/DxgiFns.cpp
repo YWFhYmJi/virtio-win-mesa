@@ -234,7 +234,59 @@ _RotateResourceIdentities(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *RotateResourc
 HRESULT APIENTRY
 _Blt(DXGI_DDI_ARG_BLT *Blt)
 {
-   LOG_UNSUPPORTED_ENTRYPOINT();
+   LOG_ENTRYPOINT();
+
+   Device *device = CastDevice(Blt->hDevice);
+   Resource *dst = CastResource(Blt->hDstResource);
+   Resource *src = CastResource(Blt->hSrcResource);
+
+   if (!device || !device->pipe || !dst || !src || !dst->resource ||
+       !src->resource) {
+      return E_INVALIDARG;
+   }
+
+   struct pipe_context *pipe = device->pipe;
+   struct pipe_resource *dst_resource = dst->resource;
+   struct pipe_resource *src_resource = src->resource;
+
+   unsigned dst_level = Blt->DstSubresource % (dst_resource->last_level + 1);
+   unsigned dst_layer = Blt->DstSubresource / (dst_resource->last_level + 1);
+   unsigned src_level = Blt->SrcSubresource % (src_resource->last_level + 1);
+   unsigned src_layer = Blt->SrcSubresource / (src_resource->last_level + 1);
+
+   struct pipe_box src_box = {};
+   src_box.x = 0;
+   src_box.y = 0;
+   src_box.z = src_layer;
+   src_box.width = Blt->DstRight > Blt->DstLeft ?
+      Blt->DstRight - Blt->DstLeft : src_resource->width0;
+   src_box.height = Blt->DstBottom > Blt->DstTop ?
+      Blt->DstBottom - Blt->DstTop : src_resource->height0;
+   src_box.depth = 1;
+
+   pipe->resource_copy_region(pipe,
+                              dst_resource,
+                              dst_level,
+                              Blt->DstLeft,
+                              Blt->DstTop,
+                              dst_layer,
+                              src_resource,
+                              src_level,
+                              &src_box);
+
+   if (Blt->Flags.Present) {
+      pipe->flush(pipe, NULL, 0);
+      if (device->screen->flush_frontbuffer) {
+         device->screen->flush_frontbuffer(device->screen,
+                                           pipe,
+                                           dst_resource,
+                                           dst_level,
+                                           dst_layer,
+                                           NULL,
+                                           0,
+                                           NULL);
+      }
+   }
 
    return S_OK;
 }
