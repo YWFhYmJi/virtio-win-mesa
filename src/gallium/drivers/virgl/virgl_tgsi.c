@@ -263,61 +263,6 @@ virgl_tgsi_rewrite_src_for_input_temp(struct virgl_input_temp *temp, struct tgsi
    }
 }
 
-static bool
-virgl_tgsi_needs_vectorized_comparison(enum tgsi_opcode opcode)
-{
-   switch (opcode) {
-   case TGSI_OPCODE_SEQ:
-   case TGSI_OPCODE_SGE:
-   case TGSI_OPCODE_SGT:
-   case TGSI_OPCODE_SLE:
-   case TGSI_OPCODE_SLT:
-   case TGSI_OPCODE_SNE:
-   case TGSI_OPCODE_FSEQ:
-   case TGSI_OPCODE_FSGE:
-   case TGSI_OPCODE_FSLT:
-   case TGSI_OPCODE_FSNE:
-   case TGSI_OPCODE_ISGE:
-   case TGSI_OPCODE_ISLT:
-   case TGSI_OPCODE_USEQ:
-   case TGSI_OPCODE_USGE:
-   case TGSI_OPCODE_USLT:
-   case TGSI_OPCODE_USNE:
-      return true;
-   default:
-      return false;
-   }
-}
-
-static void
-virgl_tgsi_vectorize_comparison_sources(struct tgsi_transform_context *ctx,
-                                        struct tgsi_full_instruction *inst,
-                                        unsigned first_temp)
-{
-   if (inst->Instruction.NumSrcRegs < 2)
-      return;
-
-   for (unsigned i = 0; i < 2; i++) {
-      struct tgsi_full_instruction temp_inst = tgsi_default_full_instruction();
-      temp_inst.Instruction.Opcode = TGSI_OPCODE_MOV;
-      temp_inst.Instruction.NumDstRegs = 1;
-      temp_inst.Dst[0].Register.File = TGSI_FILE_TEMPORARY;
-      temp_inst.Dst[0].Register.Index = first_temp + i;
-      temp_inst.Dst[0].Register.WriteMask = TGSI_WRITEMASK_XYZW;
-      temp_inst.Instruction.NumSrcRegs = 1;
-      memcpy(&temp_inst.Src[0], &inst->Src[i], sizeof(temp_inst.Src[0]));
-      ctx->emit_instruction(ctx, &temp_inst);
-
-      memset(&inst->Src[i], 0, sizeof(inst->Src[i]));
-      inst->Src[i].Register.File = TGSI_FILE_TEMPORARY;
-      inst->Src[i].Register.Index = first_temp + i;
-      inst->Src[i].Register.SwizzleX = TGSI_SWIZZLE_X;
-      inst->Src[i].Register.SwizzleY = TGSI_SWIZZLE_Y;
-      inst->Src[i].Register.SwizzleZ = TGSI_SWIZZLE_Z;
-      inst->Src[i].Register.SwizzleW = TGSI_SWIZZLE_W;
-   }
-}
-
 static void
 virgl_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
              struct tgsi_full_instruction *inst)
@@ -440,10 +385,6 @@ virgl_tgsi_transform_instruction(struct tgsi_transform_context *ctx,
          inst->Src[i].Register.SwizzleZ = TGSI_SWIZZLE_Z;
          inst->Src[i].Register.SwizzleW = TGSI_SWIZZLE_W;
       }
-   }
-
-   if (virgl_tgsi_needs_vectorized_comparison(inst->Instruction.Opcode)) {
-      virgl_tgsi_vectorize_comparison_sources(ctx, inst, vtctx->src_temp + 1);
    }
 
    /* virglrenderer doesn't resolve non-float output write properly,
