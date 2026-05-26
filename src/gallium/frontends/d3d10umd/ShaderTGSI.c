@@ -121,7 +121,7 @@ static struct dx10_opcode_xlate opcode_xlate[D3D10_SB_NUM_OPCODES] = {
    {D3D10_SB_OPCODE_MAX,                              OF_FLOAT, TGSI_OPCODE_MAX},
    {D3D10_SB_OPCODE_CUSTOMDATA,                       OF_FLOAT, TGSI_EXPAND},
    {D3D10_SB_OPCODE_MOV,                              OF_UINT,  TGSI_OPCODE_MOV},
-   {D3D10_SB_OPCODE_MOVC,                             OF_UINT,  TGSI_EXPAND},
+   {D3D10_SB_OPCODE_MOVC,                             OF_UINT,  TGSI_OPCODE_UCMP},
    {D3D10_SB_OPCODE_MUL,                              OF_FLOAT, TGSI_OPCODE_MUL},
    {D3D10_SB_OPCODE_NE,                               OF_FLOAT, TGSI_OPCODE_FSNE},
    {D3D10_SB_OPCODE_NOP,                              OF_FLOAT, TGSI_OPCODE_NOP},
@@ -616,16 +616,13 @@ dcl_ps_sgv_input(struct Shader_xlate *sx,
    if (dcl_siv_name == D3D10_SB_NAME_IS_FRONT_FACE) {
       /* We need to map gallium's front_face to the one expected
        * by D3D10 */
-      struct ureg_dst front_face = ureg_DECL_temporary(ureg);
       struct ureg_dst tmp = ureg_DECL_temporary(ureg);
 
       tmp = ureg_writemask(tmp, TGSI_WRITEMASK_X);
 
-      ureg_MOV(ureg, front_face, reg);
-      ureg_FSGE(ureg, tmp, ureg_src(front_face),
-                ureg_imm4f(ureg, 0.0f, 0.0f, 0.0f, 0.0f));
+      ureg_CMP(ureg, tmp, reg,
+               ureg_imm1i(ureg, 0), ureg_imm1i(ureg, -1));
 
-      ureg_release_temporary(ureg, front_face);
       reg = ureg_scalar(ureg_src(tmp), TGSI_SWIZZLE_X);
    }
 
@@ -1266,71 +1263,6 @@ expand_unary_to_scalarf(struct ureg_program *ureg, unary_ureg_func func,
    ureg_release_temporary(ureg, tmp);
 }
 
-static struct ureg_src
-ureg_imm4f_splat(struct ureg_program *ureg, float value)
-{
-   return ureg_imm4f(ureg, value, value, value, value);
-}
-
-static struct ureg_src
-ureg_imm4i_splat(struct ureg_program *ureg, int value)
-{
-   return ureg_imm4i(ureg, value, value, value, value);
-}
-
-static struct ureg_src
-ureg_imm4u_splat(struct ureg_program *ureg, unsigned value)
-{
-   return ureg_imm4u(ureg, value, value, value, value);
-}
-
-static void
-emit_bitwise_movc(struct ureg_program *ureg,
-                  struct ureg_dst dst,
-                  struct ureg_src condition,
-                  struct ureg_src if_true,
-                  struct ureg_src if_false)
-{
-   struct ureg_dst condition_tmp = ureg_DECL_temporary(ureg);
-   struct ureg_dst true_tmp = ureg_DECL_temporary(ureg);
-   struct ureg_dst false_tmp = ureg_DECL_temporary(ureg);
-   struct ureg_dst mask = ureg_DECL_temporary(ureg);
-   struct ureg_dst inverse_mask = ureg_DECL_temporary(ureg);
-   struct ureg_dst masked_true = ureg_DECL_temporary(ureg);
-   struct ureg_dst masked_false = ureg_DECL_temporary(ureg);
-
-   ureg_MOV(ureg, condition_tmp, condition);
-   ureg_MOV(ureg, true_tmp, if_true);
-   ureg_MOV(ureg, false_tmp, if_false);
-
-   ureg_USNE(ureg, mask, ureg_src(condition_tmp), ureg_imm4u_splat(ureg, 0));
-   ureg_NOT(ureg, inverse_mask, ureg_src(mask));
-   ureg_AND(ureg, masked_true, ureg_src(mask), ureg_src(true_tmp));
-   ureg_AND(ureg, masked_false, ureg_src(inverse_mask), ureg_src(false_tmp));
-   ureg_OR(ureg, dst, ureg_src(masked_true), ureg_src(masked_false));
-
-   ureg_release_temporary(ureg, condition_tmp);
-   ureg_release_temporary(ureg, true_tmp);
-   ureg_release_temporary(ureg, false_tmp);
-   ureg_release_temporary(ureg, mask);
-   ureg_release_temporary(ureg, inverse_mask);
-   ureg_release_temporary(ureg, masked_true);
-   ureg_release_temporary(ureg, masked_false);
-}
-
-static void
-expand_movc(struct ureg_program *ureg,
-            struct Shader_xlate *sx,
-            struct Shader_opcode *opcode)
-{
-   emit_bitwise_movc(ureg,
-                     translate_dst_operand(sx, &opcode->dst[0],
-                                           opcode->saturate),
-                     translate_src_operand(sx, &opcode->src[0], OF_UINT),
-                     translate_src_operand(sx, &opcode->src[1], OF_UINT),
-                     translate_src_operand(sx, &opcode->src[2], OF_UINT));
-}
-
 const struct tgsi_token *
 Shader_tgsi_translate(const unsigned *code,
                       unsigned *output_mapping)
@@ -1408,9 +1340,6 @@ Shader_tgsi_translate(const unsigned *code,
       case D3D10_SB_OPCODE_LOG:
          expand_unary_to_scalarf(ureg, ureg_LG2, &sx, &opcode);
          break;
-      case D3D10_SB_OPCODE_MOVC:
-         expand_movc(ureg, &sx, &opcode);
-         break;
       case D3D10_SB_OPCODE_IMUL:
          if (opcode.dst[0].base.type != D3D10_SB_OPERAND_TYPE_NULL) {
             ureg_IMUL_HI(ureg,
@@ -1441,25 +1370,21 @@ Shader_tgsi_translate(const unsigned *code,
           * x86 sse). Hence only need to clamp too positive values.
           * Note that it is impossible to clamp using a float, since 2^31 - 1
           * is not exactly representable with a float.
-         */
+          */
          struct ureg_dst too_large = ureg_DECL_temporary(ureg);
          struct ureg_dst tmp = ureg_DECL_temporary(ureg);
-         struct ureg_dst src_vec = ureg_DECL_temporary(ureg);
-         ureg_MOV(ureg, src_vec,
-                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
          ureg_FSGE(ureg, too_large,
-                   ureg_src(src_vec),
-                   ureg_imm4f_splat(ureg, 2147483648.0f));
-         ureg_F2I(ureg, tmp, ureg_src(src_vec));
-         emit_bitwise_movc(ureg,
-                           translate_dst_operand(&sx, &opcode.dst[0],
-                                                 opcode.saturate),
-                           ureg_src(too_large),
-                           ureg_imm4i_splat(ureg, 0x7fffffff),
-                           ureg_src(tmp));
+                   translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+                   ureg_imm1f(ureg, 2147483648.0f));
+         ureg_F2I(ureg, tmp,
+                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+         ureg_UCMP(ureg,
+                   translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
+                   ureg_src(too_large),
+                   ureg_imm1i(ureg, 0x7fffffff),
+                   ureg_src(tmp));
          ureg_release_temporary(ureg, too_large);
          ureg_release_temporary(ureg, tmp);
-         ureg_release_temporary(ureg, src_vec);
       }
          break;
 
@@ -1469,32 +1394,28 @@ Shader_tgsi_translate(const unsigned *code,
           * Note that it is impossible to clamp using a float against the upper
           * limit, since 2^32 - 1 is not exactly representable with a float,
           * but the clamp against 0.0 certainly works just fine.
-         */
+          */
          struct ureg_dst too_large = ureg_DECL_temporary(ureg);
          struct ureg_dst tmp = ureg_DECL_temporary(ureg);
-         struct ureg_dst src_vec = ureg_DECL_temporary(ureg);
-         ureg_MOV(ureg, src_vec,
-                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
          ureg_FSGE(ureg, too_large,
-                   ureg_src(src_vec),
-                   ureg_imm4f_splat(ureg, 4294967296.0f));
+                   translate_src_operand(&sx, &opcode.src[0], OF_FLOAT),
+                   ureg_imm1f(ureg, 4294967296.0f));
          /* clamp negative values + NaN to zero.
           * (Could be done slightly more efficient in llvmpipe due to
           * MAX NaN behavior handling.)
           */
          ureg_MAX(ureg, tmp,
-                  ureg_imm4f_splat(ureg, 0.0f),
-                  ureg_src(src_vec));
-         ureg_F2U(ureg, tmp, ureg_src(tmp));
-         emit_bitwise_movc(ureg,
-                           translate_dst_operand(&sx, &opcode.dst[0],
-                                                 opcode.saturate),
-                           ureg_src(too_large),
-                           ureg_imm4u_splat(ureg, 0xffffffff),
-                           ureg_src(tmp));
+                  ureg_imm1f(ureg, 0.0f),
+                  translate_src_operand(&sx, &opcode.src[0], OF_FLOAT));
+         ureg_F2U(ureg, tmp,
+                  ureg_src(tmp));
+         ureg_UCMP(ureg,
+                   translate_dst_operand(&sx, &opcode.dst[0], opcode.saturate),
+                   ureg_src(too_large),
+                   ureg_imm1u(ureg, 0xffffffff),
+                   ureg_src(tmp));
          ureg_release_temporary(ureg, too_large);
          ureg_release_temporary(ureg, tmp);
-         ureg_release_temporary(ureg, src_vec);
       }
          break;
 
