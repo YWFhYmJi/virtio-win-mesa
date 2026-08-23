@@ -786,13 +786,19 @@ if d3d_drivers_path == ''
   d3d_drivers_path = join_paths(get_option('prefix'), get_option('libdir'), 'd3d')
 endif
 
+with_gallium_yttrium = get_option('gallium-yttrium')
+if with_gallium_yttrium and not with_platform_windows
+  error('Yttrium support requires the Windows platform.')
+endif
+
 with_gallium_st_d3d10umd =  get_option('gallium-d3d10umd')
 if with_gallium_st_d3d10umd
   if not [
            with_gallium_swrast,
            with_gallium_virgl,
+           with_gallium_yttrium,
          ].contains(true)
-    error('The d3d10umd state tracker requires gallium softpipe/llvmpipe or virgl.')
+    error('The d3d10umd state tracker requires gallium softpipe/llvmpipe, virgl, or Yttrium.')
   endif
   if with_gallium_softpipe and with_gallium_virgl
     warning('The d3d10umd state trackes is built with both softpipe/llvmpipe and virgl, only virgl will be used.')
@@ -2549,6 +2555,7 @@ summary(llvm_summary, section: 'LLVM', bool_yn: true, list_sep: ' ')
 gallium_summary = {'Enabled': with_gallium}
 if with_gallium
   gallium_summary += {'Drivers': gallium_drivers}
+  gallium_summary += {'Yttrium': with_gallium_yttrium}
   gallium_summary += {'Platforms': _platforms}
 
   gallium_frontends = ['mesa']

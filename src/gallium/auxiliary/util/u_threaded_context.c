@@ -549,7 +549,7 @@ static void
 tc_batch_flush(struct threaded_context *tc, bool full_copy)
 {
    struct tc_batch *next = &tc->batch_slots[tc->next];
-   unsigned next_id = (tc->next + 1) % TC_MAX_BATCHES;
+   unsigned next_id = (tc->next + 1) % tc->num_batch_slots;
 
 #if !defined(NDEBUG)
    assert(!next->tc_set_vertex_elements_for_call_pending);
@@ -600,7 +600,12 @@ tc_add_sized_call(struct threaded_context *tc, enum tc_call_id id,
    assert(num_slots <= TC_SLOTS_PER_BATCH - 1);
    tc_debug_check(tc);
 
-   if (unlikely(next->num_total_slots + num_slots + resv_slots > TC_SLOTS_PER_BATCH - 1)) {
+   unsigned batch_size_slots = tc->batch_size_slots;
+   if (num_slots + resv_slots > batch_size_slots - 1)
+      batch_size_slots = TC_SLOTS_PER_BATCH;
+
+   if (unlikely(next->num_total_slots + num_slots + resv_slots >
+                batch_size_slots - 1)) {
       /* copy existing renderpass info during flush */
       tc_batch_flush(tc, full_copy);
       tc->seen_fb_state = false;
@@ -678,12 +683,12 @@ tc_enlarge_last_mergeable_call(struct threaded_context *tc, unsigned desired_num
 
    unsigned added_slots = desired_num_slots - call->num_slots;
 
-   if (unlikely(batch->num_total_slots + added_slots > TC_SLOTS_PER_BATCH - 1))
+   if (unlikely(batch->num_total_slots + added_slots >
+                tc->batch_size_slots - 1))
       return false;
 
    batch->num_total_slots += added_slots;
    call->num_slots += added_slots;
-
    return true;
 }
 
@@ -1682,26 +1687,73 @@ tc_call_set_constant_buffer(struct pipe_context *pipe, void *call)
 }
 
 static void
+tc_queue_constant_buffer_unbind(struct threaded_context *tc,
+                                mesa_shader_stage shader, uint index)
+{
+   struct tc_constant_buffer_base *p =
+      tc_add_call(tc, TC_CALL_set_constant_buffer, tc_constant_buffer_base);
+   p->shader = shader;
+   p->index = index;
+   p->is_null = true;
+   tc_unbind_buffer(&tc->const_buffers[shader][index]);
+}
+
+static void
 tc_set_constant_buffer(struct pipe_context *_pipe,
                        mesa_shader_stage shader, uint index,
                        const struct pipe_constant_buffer *cb)
 {
    struct threaded_context *tc = threaded_context(_pipe);
+   struct pipe_resource *releasebuf = NULL;
 
    if (unlikely(!cb || (!cb->buffer && !cb->user_buffer))) {
-      struct tc_constant_buffer_base *p =
-         tc_add_call(tc, TC_CALL_set_constant_buffer, tc_constant_buffer_base);
-      p->shader = shader;
-      p->index = index;
-      p->is_null = true;
-      tc_unbind_buffer(&tc->const_buffers[shader][index]);
+      tc_queue_constant_buffer_unbind(tc, shader, index);
       return;
    }
 
-   /* frontend must handle this */
-   assert(!cb->user_buffer);
    if (cb->user_buffer) {
-      UNREACHABLE("tc: unhandled frontend cbuf0 user buffer!");
+      /* This must happen before adding the bind call because allocating or
+       * mapping an upload buffer can enqueue calls and flush the batch.
+       */
+      if (!tc->options.upload_user_constant_buffers) {
+         assert(!cb->user_buffer);
+         UNREACHABLE("tc: unhandled frontend cbuf0 user buffer!");
+         return;
+      }
+
+      struct pipe_resource *buffer = NULL;
+      unsigned offset;
+
+      if (unlikely(!cb->buffer_size)) {
+         tc_queue_constant_buffer_unbind(tc, shader, index);
+         return;
+      }
+
+      u_upload_data(tc->base.const_uploader, 0, cb->buffer_size,
+                    tc->ubo_alignment, cb->user_buffer,
+                    &offset, &buffer, &releasebuf);
+      if (unlikely(!buffer)) {
+         /* Never leave the worker's previous constants bound after an upload
+          * failure.  The pipe API can't report this allocation failure to the
+          * frontend, so an explicit unbind is the conservative state.
+          */
+         tc_queue_constant_buffer_unbind(tc, shader, index);
+         return;
+      }
+
+      struct tc_constant_buffer *p =
+         tc_add_call(tc, TC_CALL_set_constant_buffer, tc_constant_buffer);
+      p->base.shader = shader;
+      p->base.index = index;
+      p->base.is_null = false;
+      p->cb.user_buffer = NULL;
+      p->cb.buffer_offset = offset;
+      p->cb.buffer_size = cb->buffer_size;
+      p->cb.buffer = buffer;
+
+      tc_bind_buffer(&tc->const_buffers[shader][index],
+                     &tc->buffer_lists[tc->next_buf_list], buffer);
+      pipe_resource_release(_pipe, releasebuf);
       return;
    }
    struct pipe_resource *buffer = cb->buffer;
@@ -2593,6 +2645,18 @@ tc_invalidate_buffer(struct threaded_context *tc,
    if (!new_buf)
       return false;
 
+   /* resource_create can return a usable buffer which is nevertheless not
+    * eligible for storage replacement.  In particular, a driver may have
+    * failed to allocate the private metadata needed by its queued replacement
+    * callback and marked the resource conservative/shared.  Reject it before
+    * changing latest, bindings, or buffer IDs; the queued callback cannot
+    * roll those frontend changes back.
+    */
+   if (threaded_resource(new_buf)->is_shared) {
+      pipe_resource_reference(&new_buf, NULL);
+      return false;
+   }
+
    /* Replace the "latest" pointer. */
    if (tbuf->latest != &tbuf->b)
       pipe_resource_reference(&tbuf->latest, NULL);
@@ -2789,6 +2853,16 @@ tc_buffer_map(struct pipe_context *_pipe,
       }
    }
 
+   bool pending_staging_upload_intersects = false;
+   if (usage & PIPE_MAP_UNSYNCHRONIZED) {
+      simple_mtx_lock(&tres->pending_staging_uploads_range.write_mutex);
+      pending_staging_upload_intersects =
+         p_atomic_read(&tres->pending_staging_uploads) &&
+         util_ranges_intersect(&tres->pending_staging_uploads_range,
+                               box->x, box->x + box->width);
+      simple_mtx_unlock(&tres->pending_staging_uploads_range.write_mutex);
+   }
+
    /* Do a staging transfer within the threaded context. The driver should
     * only get resource_copy_region.
     */
@@ -2815,16 +2889,22 @@ tc_buffer_map(struct pipe_context *_pipe,
       ttrans->cpu_storage_mapped = false;
       *transfer = &ttrans->b;
 
-      p_atomic_inc(&tres->pending_staging_uploads);
-      util_range_add(resource, &tres->pending_staging_uploads_range,
-                     box->x, box->x + box->width);
+      simple_mtx_lock(&tres->pending_staging_uploads_range.write_mutex);
+      const unsigned previous_pending =
+         p_atomic_fetch_add(&tres->pending_staging_uploads, 1);
+      if (!previous_pending)
+         util_range_set_empty(&tres->pending_staging_uploads_range);
+      tres->pending_staging_uploads_range.start =
+         MIN2(box->x, tres->pending_staging_uploads_range.start);
+      tres->pending_staging_uploads_range.end =
+         MAX2(box->x + box->width,
+              tres->pending_staging_uploads_range.end);
+      simple_mtx_unlock(&tres->pending_staging_uploads_range.write_mutex);
 
       return map + (box->x % tc->map_buffer_alignment);
    }
 
-   if (usage & PIPE_MAP_UNSYNCHRONIZED &&
-       p_atomic_read(&tres->pending_staging_uploads) &&
-       util_ranges_intersect(&tres->pending_staging_uploads_range, box->x, box->x + box->width)) {
+   if (pending_staging_upload_intersects) {
       /* Write conflict detected between a staging transfer and the direct mapping we're
        * going to do. Resolve the conflict by ignoring UNSYNCHRONIZED so the direct mapping
        * will have to wait for the staging transfer completion.
@@ -3168,6 +3248,13 @@ tc_buffer_subdata(struct pipe_context *_pipe,
 {
    struct threaded_context *tc = threaded_context(_pipe);
    struct threaded_resource *tres = threaded_resource(resource);
+   const unsigned max_copy_bytes =
+      (tc->batch_size_slots - 1) * sizeof(struct tc_call_base) -
+      sizeof(struct tc_buffer_subdata);
+   const unsigned copy_limit =
+      MIN2(MAX2(TC_MAX_SUBDATA_BYTES,
+                tc->options.buffer_subdata_copy_limit),
+           max_copy_bytes);
 
    if (!size)
       return;
@@ -3185,7 +3272,7 @@ tc_buffer_subdata(struct pipe_context *_pipe,
     */
    if (usage & (PIPE_MAP_UNSYNCHRONIZED |
                 PIPE_MAP_DISCARD_WHOLE_RESOURCE) ||
-       size > TC_MAX_SUBDATA_BYTES ||
+       size > copy_limit ||
        tres->cpu_storage) {
       struct pipe_transfer *transfer;
       struct pipe_box box;
@@ -3282,15 +3369,19 @@ tc_texture_subdata(struct pipe_context *_pipe,
 {
    struct threaded_context *tc = threaded_context(_pipe);
    uint64_t size;
+   uint32_t block_rows;
+   uint32_t block_slices;
    uint32_t last_row_stride;
 
    assert(box->height >= 1);
    assert(box->depth >= 1);
 
-   last_row_stride = box->width * util_format_get_blocksize(resource->format);
+   block_rows = util_format_get_nblocksy(resource->format, box->height);
+   block_slices = util_format_get_nblocksz(resource->format, box->depth);
+   last_row_stride = util_format_get_stride(resource->format, box->width);
 
-   size = (box->depth - 1) * layer_stride +
-          (box->height - 1) * (uint64_t)stride +
+   size = (block_slices - 1) * layer_stride +
+          (block_rows - 1) * (uint64_t)stride +
           last_row_stride;
    if (!size)
       return;
@@ -3742,7 +3833,11 @@ tc_call_draw_single_drawid(struct pipe_context *pipe, void *call)
    draw.count = info->info.max_index;
    draw.index_bias = info->index_bias;
 
-   info->info.index_bounds_valid = false;
+   info->info.index_bounds_valid = info->index_bounds_valid;
+   if (info->index_bounds_valid) {
+      info->info.min_index = info->min_index;
+      info->info.max_index = info->max_index;
+   }
    info->info.has_user_indices = false;
 
    pipe->draw_vbo(pipe, &info->info, info_drawid->drawid_offset, NULL, &draw, 1);
@@ -3780,6 +3875,10 @@ is_next_call_a_mergeable_draw(struct tc_draw_single *first,
                               struct tc_draw_single *next)
 {
    if (next->base.call_id != TC_CALL_draw_single)
+      return false;
+
+   if (first->no_merge || next->no_merge ||
+       first->index_bounds_valid || next->index_bounds_valid)
       return false;
 
    STATIC_ASSERT(offsetof(struct pipe_draw_info, min_index) ==
@@ -3841,7 +3940,11 @@ tc_call_draw_single(struct pipe_context *pipe, void *call)
    draw.count = first->info.max_index;
    draw.index_bias = first->index_bias;
 
-   first->info.index_bounds_valid = false;
+   first->info.index_bounds_valid = first->index_bounds_valid;
+   if (first->index_bounds_valid) {
+      first->info.min_index = first->min_index;
+      first->info.max_index = first->max_index;
+   }
    first->info.has_user_indices = false;
 
    pipe->draw_vbo(pipe, &first->info, 0, NULL, &draw, 1);
@@ -3903,6 +4006,11 @@ tc_draw_single(struct pipe_context *_pipe, const struct pipe_draw_info *info,
    struct threaded_context *tc = threaded_context(_pipe);
    struct tc_draw_single *p =
       tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+   p->no_merge = tc->options.disable_draw_merging;
+   p->index_bounds_valid =
+      tc->options.preserve_index_bounds && info->index_bounds_valid;
+   p->min_index = info->min_index;
+   p->max_index = info->max_index;
 
    if (info->index_size) {
       tc_add_to_buffer_list(&tc->buffer_lists[tc->next_buf_list], info->index.resource);
@@ -3927,6 +4035,11 @@ tc_draw_single_draw_id(struct pipe_context *_pipe,
    struct threaded_context *tc = threaded_context(_pipe);
    struct tc_draw_single *p =
       &tc_add_call(tc, TC_CALL_draw_single_drawid, tc_draw_single_drawid)->base;
+   p->no_merge = tc->options.disable_draw_merging;
+   p->index_bounds_valid =
+      tc->options.preserve_index_bounds && info->index_bounds_valid;
+   p->min_index = info->min_index;
+   p->max_index = info->max_index;
 
    if (info->index_size) {
       tc_add_to_buffer_list(&tc->buffer_lists[tc->next_buf_list], info->index.resource);
@@ -3971,6 +4084,11 @@ tc_draw_user_indices_single(struct pipe_context *_pipe,
 
    struct tc_draw_single *p =
       tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+   p->no_merge = tc->options.disable_draw_merging;
+   p->index_bounds_valid =
+      tc->options.preserve_index_bounds && info->index_bounds_valid;
+   p->min_index = info->min_index;
+   p->max_index = info->max_index;
    memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
    p->info.index.resource = buffer;
    /* u_threaded_context stores start/count in min/max_index for single draws. */
@@ -4012,6 +4130,11 @@ tc_draw_user_indices_single_draw_id(struct pipe_context *_pipe,
 
    struct tc_draw_single *p =
       &tc_add_call(tc, TC_CALL_draw_single_drawid, tc_draw_single_drawid)->base;
+   p->no_merge = tc->options.disable_draw_merging;
+   p->index_bounds_valid =
+      tc->options.preserve_index_bounds && info->index_bounds_valid;
+   p->min_index = info->min_index;
+   p->max_index = info->max_index;
    memcpy(&p->info, info, DRAW_INFO_SIZE_WITHOUT_INDEXBUF_AND_MIN_MAX_INDEX);
    p->info.index.resource = buffer;
    ((struct tc_draw_single_drawid*)p)->drawid_offset = drawid_offset;
@@ -4043,10 +4166,10 @@ tc_draw_multi(struct pipe_context *_pipe, const struct pipe_draw_info *info,
    while (num_draws) {
       struct tc_batch *next = &tc->batch_slots[tc->next];
 
-      int nb_slots_left = TC_SLOTS_PER_BATCH - 1 - next->num_total_slots;
+      int nb_slots_left = tc->batch_size_slots - 1 - next->num_total_slots;
       /* If there isn't enough place for one draw, try to fill the next one */
       if (nb_slots_left < SLOTS_FOR_ONE_DRAW)
-         nb_slots_left = TC_SLOTS_PER_BATCH - 1;
+         nb_slots_left = tc->batch_size_slots - 1;
       const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
 
       /* How many draws can we fit in the current batch */
@@ -4107,10 +4230,10 @@ tc_draw_user_indices_multi(struct pipe_context *_pipe,
    while (num_draws) {
       struct tc_batch *next = &tc->batch_slots[tc->next];
 
-      int nb_slots_left = TC_SLOTS_PER_BATCH - 1 - next->num_total_slots;
+      int nb_slots_left = tc->batch_size_slots - 1 - next->num_total_slots;
       /* If there isn't enough place for one draw, try to fill the next one */
       if (nb_slots_left < SLOTS_FOR_ONE_DRAW)
-         nb_slots_left = TC_SLOTS_PER_BATCH - 1;
+         nb_slots_left = tc->batch_size_slots - 1;
       const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
 
       /* How many draws can we fit in the current batch */
@@ -4184,7 +4307,7 @@ tc_draw_indirect(struct pipe_context *_pipe, const struct pipe_draw_info *info,
       tc_add_to_buffer_list(next, indirect->count_from_stream_output->buffer);
 
    memcpy(&p->indirect, indirect, sizeof(*indirect));
-   p->draw.start = draws[0].start;
+   p->draw.start = draws ? draws[0].start : 0;
 }
 
 /* Dispatch table for tc_draw_vbo:
@@ -4248,6 +4371,10 @@ tc_add_draw_single_call(struct pipe_context *_pipe,
 
    struct tc_draw_single *p =
       tc_add_call(tc, TC_CALL_draw_single, tc_draw_single);
+   p->no_merge = tc->options.disable_draw_merging;
+   p->index_bounds_valid = false;
+   p->min_index = 0;
+   p->max_index = 0;
 
    if (index_bo)
       tc_add_to_buffer_list(&tc->buffer_lists[tc->next_buf_list], index_bo);
@@ -4390,10 +4517,10 @@ tc_draw_vertex_state(struct pipe_context *_pipe,
    while (num_draws) {
       struct tc_batch *next = &tc->batch_slots[tc->next];
 
-      int nb_slots_left = TC_SLOTS_PER_BATCH - 1 - next->num_total_slots;
+      int nb_slots_left = tc->batch_size_slots - 1 - next->num_total_slots;
       /* If there isn't enough place for one draw, try to fill the next one */
       if (nb_slots_left < slots_for_one_draw)
-         nb_slots_left = TC_SLOTS_PER_BATCH - 1;
+         nb_slots_left = tc->batch_size_slots - 1;
       const int size_left_bytes = nb_slots_left * sizeof(struct tc_call_base);
 
       /* How many draws can we fit in the current batch */
@@ -5541,12 +5668,19 @@ threaded_context_create(struct pipe_context *pipe,
       goto fail;
 
    tc->use_forced_staging_uploads = true;
+   tc->num_batch_slots = tc->options.batch_slots ?
+      CLAMP(tc->options.batch_slots, 3, TC_MAX_BATCHES) :
+      TC_DEFAULT_BATCHES;
+   tc->batch_size_slots = tc->options.batch_size_slots ?
+      CLAMP(tc->options.batch_size_slots, 64, TC_SLOTS_PER_BATCH) :
+      TC_SLOTS_PER_BATCH;
 
    /* The queue size is the number of batches "waiting". Batches are removed
     * from the queue before being executed, so keep one tc_batch slot for that
     * execution. Also, keep one unused slot for an unflushed batch.
     */
-   if (!util_queue_init(&tc->queue, "gdrv", TC_MAX_BATCHES - 2, 1, 0, NULL))
+   if (!util_queue_init(&tc->queue, "gdrv", tc->num_batch_slots - 2,
+                        1, 0, NULL))
       goto fail;
 
    tc->last_completed = -1;

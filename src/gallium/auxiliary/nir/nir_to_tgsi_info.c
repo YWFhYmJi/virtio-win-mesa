@@ -99,14 +99,54 @@ static void gather_usage_helper(const nir_deref_instr **deref_ptr,
       usage_mask[location + 1] |= (mask >> 4) & 0xf;
 }
 
-static void gather_usage(const nir_deref_instr *deref,
+static void
+nir_tgsi_get_varying_semantic(const nir_shader *nir,
+                              gl_varying_slot location,
+                              bool need_texcoord,
+                              unsigned *semantic_name,
+                              unsigned *semantic_index)
+{
+   if (location == VARYING_SLOT_CULL_DIST0 ||
+       location == VARYING_SLOT_CULL_DIST1) {
+      unsigned index =
+         nir->info.clip_distance_array_size +
+         (location - VARYING_SLOT_CULL_DIST0) * 4;
+      *semantic_name = TGSI_SEMANTIC_CLIPDIST;
+      *semantic_index = index / 4;
+      return;
+   }
+
+   tgsi_get_gl_varying_semantic(location, need_texcoord,
+                                semantic_name, semantic_index);
+}
+
+static unsigned
+nir_tgsi_get_varying_location_frac(const nir_shader *nir,
+                                   const nir_variable *var,
+                                   unsigned slot_offset)
+{
+   gl_varying_slot location = var->data.location + slot_offset;
+
+   if (location == VARYING_SLOT_CULL_DIST0 ||
+       location == VARYING_SLOT_CULL_DIST1) {
+      return (nir->info.clip_distance_array_size +
+              (location - VARYING_SLOT_CULL_DIST0) * 4 +
+              var->data.location_frac) % 4;
+   }
+
+   return var->data.location_frac;
+}
+
+static void gather_usage(const nir_shader *nir,
+                         const nir_deref_instr *deref,
                          uint8_t mask,
                          uint8_t *usage_mask)
 {
    nir_deref_path path;
    nir_deref_path_init(&path, (nir_deref_instr *)deref, NULL);
 
-   unsigned location_frac = path.path[0]->var->data.location_frac;
+   unsigned location_frac =
+      nir_tgsi_get_varying_location_frac(nir, path.path[0]->var, 0);
    if (glsl_type_is_64bit(deref->type)) {
       uint8_t new_mask = 0;
       for (unsigned i = 0; i < 4; i++) {
@@ -136,7 +176,7 @@ static void gather_intrinsic_load_deref_info(const nir_shader *nir,
    assert(var && var->data.mode == nir_var_shader_in);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
-      gather_usage(deref, nir_def_components_read(&instr->def),
+      gather_usage(nir, deref, nir_def_components_read(&instr->def),
                    info->input_usage_mask);
 
    switch (nir->info.stage) {
@@ -146,8 +186,8 @@ static void gather_intrinsic_load_deref_info(const nir_shader *nir,
    }
    default: {
       unsigned semantic_name, semantic_index;
-      tgsi_get_gl_varying_semantic(var->data.location, need_texcoord,
-                                   &semantic_name, &semantic_index);
+      nir_tgsi_get_varying_semantic(nir, var->data.location, need_texcoord,
+                                    &semantic_name, &semantic_index);
 
       if (semantic_name == TGSI_SEMANTIC_FACE) {
          info->uses_frontface = true;
@@ -357,8 +397,9 @@ void nir_tgsi_scan_shader(const struct nir_shader *nir,
 
          processed_inputs |= ((uint64_t)1 << i);
 
-         tgsi_get_gl_varying_semantic(variable->data.location + j, need_texcoord,
-                                      &semantic_name, &semantic_index);
+         nir_tgsi_get_varying_semantic(nir, variable->data.location + j,
+                                       need_texcoord,
+                                       &semantic_name, &semantic_index);
 
          info->input_semantic_name[i] = semantic_name;
          info->input_semantic_index[i] = semantic_index;
@@ -449,8 +490,9 @@ void nir_tgsi_scan_shader(const struct nir_shader *nir,
                semantic_index++;
             }
          } else {
-            tgsi_get_gl_varying_semantic(variable->data.location + k, need_texcoord,
-                                         &semantic_name, &semantic_index);
+            nir_tgsi_get_varying_semantic(nir, variable->data.location + k,
+                                          need_texcoord,
+                                          &semantic_name, &semantic_index);
          }
 
          unsigned num_components = 4;
@@ -458,7 +500,8 @@ void nir_tgsi_scan_shader(const struct nir_shader *nir,
          if (vector_elements)
             num_components = vector_elements;
 
-         unsigned component = variable->data.location_frac;
+         unsigned component =
+            nir_tgsi_get_varying_location_frac(nir, variable, k);
          if (glsl_type_is_64bit(glsl_without_array(variable->type))) {
             if (glsl_type_is_dual_slot(glsl_without_array(variable->type)) && k % 2) {
                num_components = (num_components * 2) - 4;
@@ -602,8 +645,8 @@ void nir_tgsi_scan_shader(const struct nir_shader *nir,
                                       BITFIELD64_MASK(location));
          unsigned semantic_name, semantic_index;
 
-         tgsi_get_gl_varying_semantic(location, need_texcoord,
-                                      &semantic_name, &semantic_index);
+         nir_tgsi_get_varying_semantic(nir, location, need_texcoord,
+                                       &semantic_name, &semantic_index);
 
          info->output_semantic_name[i] = semantic_name;
          info->output_semantic_index[i] = semantic_index;

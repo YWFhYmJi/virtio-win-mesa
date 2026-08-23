@@ -4,6 +4,11 @@
 files_vulkan_wsi = files('wsi_common.c')
 links_vulkan_wsi = []
 platform_deps = []
+wsi_c_args = []
+
+if with_gallium_yttrium
+  wsi_c_args += '-DHAVE_YTTRIUM'
+endif
 
 if dep_libdrm.found()
   files_vulkan_wsi += files('wsi_common_drm.c')
@@ -62,6 +67,8 @@ libvulkan_wsi = static_library(
     idep_vulkan_runtime_headers, idep_xmlconfig, idep_mesautil, platform_deps,
     idep_blake3
   ],
+  c_args : wsi_c_args,
+  cpp_args : wsi_c_args,
   link_with: links_vulkan_wsi,
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,

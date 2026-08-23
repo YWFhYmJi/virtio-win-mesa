@@ -35,6 +35,14 @@
 
 #include "DriverIncludes.h"
 
+struct Device;
+struct Resource;
+struct pipe_constant_buffer;
+
+bool PreparePublishedConstantBuffer(
+   Device *device, Resource *resource, unsigned resource_offset,
+   unsigned buffer_size, struct pipe_constant_buffer *cb);
+
 SIZE_T APIENTRY CalcPrivateResourceSize(
    D3D10DDI_HDEVICE hDevice,
    __in const D3D10DDIARG_CREATERESOURCE *pCreateResource);
@@ -44,6 +52,21 @@ void APIENTRY CreateResource(
    __in const D3D10DDIARG_CREATERESOURCE *pCreateResource,
    D3D10DDI_HRESOURCE hResource,
    D3D10DDI_HRTRESOURCE hRTResource);
+
+SIZE_T APIENTRY CalcPrivateResourceSize11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATERESOURCE *pCreateResource);
+
+void APIENTRY CreateResource11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATERESOURCE *pCreateResource,
+   D3D10DDI_HRESOURCE hResource,
+   D3D10DDI_HRTRESOURCE hRTResource);
+
+void APIENTRY SetResourceMinLOD(
+   D3D10DDI_HDEVICE hDevice,
+   D3D10DDI_HRESOURCE hResource,
+   FLOAT MinLOD);
 
 SIZE_T APIENTRY CalcPrivateOpenedResourceSize(
    D3D10DDI_HDEVICE hDevice,
@@ -56,6 +79,8 @@ void APIENTRY OpenResource(
    D3D10DDI_HRTRESOURCE hRTResource);
 
 void APIENTRY DestroyResource(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource);
+
+void DestroyDeviceResourceDiagnostics(D3D10DDI_HDEVICE hDevice);
 
 void APIENTRY ResourceMap(D3D10DDI_HDEVICE hDevice, D3D10DDI_HRESOURCE hResource,
                  UINT SubResource, D3D10_DDI_MAP DDIMap, UINT Flags,

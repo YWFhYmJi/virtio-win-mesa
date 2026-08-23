@@ -418,6 +418,10 @@ get_blit_type(const struct wsi_device *wsi,
          container_of(params, const struct wsi_dxgi_image_params, base);
       return wsi_dxgi_image_needs_blit(wsi, dxgi_params, device);
    }
+#if defined(HAVE_YTTRIUM)
+   case WSI_IMAGE_TYPE_DXGI_SHARED:
+      return WSI_SWAPCHAIN_NO_BLIT;
+#endif
 #endif
 #if defined(VK_USE_PLATFORM_METAL_EXT)
    case WSI_IMAGE_TYPE_METAL: {
@@ -467,6 +471,14 @@ configure_image(const struct wsi_swapchain *chain,
          container_of(params, const struct wsi_dxgi_image_params, base);
       return wsi_dxgi_configure_image(chain, pCreateInfo, dxgi_params, info);
    }
+#if defined(HAVE_YTTRIUM)
+   case WSI_IMAGE_TYPE_DXGI_SHARED: {
+      const struct wsi_dxgi_shared_image_params *shared_params =
+         container_of(params, const struct wsi_dxgi_shared_image_params, base);
+      return wsi_dxgi_shared_configure_image(chain, pCreateInfo, shared_params,
+                                             info);
+   }
+#endif
 #endif
 #if defined(VK_USE_PLATFORM_METAL_EXT)
    case WSI_IMAGE_TYPE_METAL: {

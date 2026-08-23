@@ -35,6 +35,10 @@
 
 #include "DriverIncludes.h"
 
+struct Device;
+
+void UpdateFramebufferForcedSampleCount(Device *pDevice);
+
 SIZE_T APIENTRY CalcPrivateRenderTargetViewSize(
    D3D10DDI_HDEVICE hDevice,
    __in const D3D10DDIARG_CREATERENDERTARGETVIEW *pCreateRenderTargetView);
@@ -52,6 +56,13 @@ void APIENTRY ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,
                            D3D10DDI_HRENDERTARGETVIEW hRenderTargetView,
                            FLOAT pColorRGBA[4]);
 
+void APIENTRY ClearView(D3D10DDI_HDEVICE hDevice,
+                        D3D11DDI_HANDLETYPE ViewType,
+                        void *hView,
+                        const FLOAT Color[4],
+                        const D3D10_DDI_RECT *pRects,
+                        UINT NumRects);
+
 SIZE_T APIENTRY CalcPrivateDepthStencilViewSize(
    D3D10DDI_HDEVICE hDevice,
    __in const D3D10DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView);
@@ -59,6 +70,16 @@ SIZE_T APIENTRY CalcPrivateDepthStencilViewSize(
 void APIENTRY CreateDepthStencilView(
    D3D10DDI_HDEVICE hDevice,
    __in const D3D10DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView,
+   D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,
+   D3D10DDI_HRTDEPTHSTENCILVIEW hRTDepthStencilView);
+
+SIZE_T APIENTRY CalcPrivateDepthStencilViewSize11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView);
+
+void APIENTRY CreateDepthStencilView11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView,
    D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,
    D3D10DDI_HRTDEPTHSTENCILVIEW hRTDepthStencilView);
 
@@ -85,6 +106,11 @@ void APIENTRY CreateBlendState1(D3D10DDI_HDEVICE hDevice,
                       D3D10DDI_HBLENDSTATE hBlendState,
                       D3D10DDI_HRTBLENDSTATE hRTBlendState);
 
+void APIENTRY CreateBlendState11_1Impl(D3D10DDI_HDEVICE hDevice,
+                      __in const D3D11_1_DDI_BLEND_DESC *pBlendDesc,
+                      D3D10DDI_HBLENDSTATE hBlendState,
+                      D3D10DDI_HRTBLENDSTATE hRTBlendState);
+
 void APIENTRY DestroyBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hBlendState);
 
 void APIENTRY SetBlendState(D3D10DDI_HDEVICE hDevice, D3D10DDI_HBLENDSTATE hState,
@@ -94,6 +120,14 @@ void APIENTRY SetRenderTargets(
    D3D10DDI_HDEVICE hDevice,
    __in_ecount (NumViews) const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView,
    UINT RTargets, UINT ClearTargets, D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView);
+
+void APIENTRY SetRenderTargets11(
+   D3D10DDI_HDEVICE hDevice,
+   __in_ecount (NumRTVs) const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView,
+   UINT RTargets, UINT ClearTargets, D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,
+   __in_ecount (NumUAVs) const D3D11DDI_HUNORDEREDACCESSVIEW *phUnorderedAccessView,
+   __in_ecount (NumUAVs) const UINT *pUAVInitialCounts,
+   UINT UAVStartSlot, UINT NumUAVs, UINT UAVRangeStart, UINT UAVRangeSize);
 
 SIZE_T APIENTRY CalcPrivateDepthStencilStateSize(
    D3D10DDI_HDEVICE hDevice,

@@ -111,6 +111,17 @@ void APIENTRY CreateGeometryShaderWithStreamOutput(
    D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRTShader,
    __in const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures);
 
+SIZE_T APIENTRY CalcPrivateGeometryShaderWithStreamOutput11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *pCreateGeometryShaderWithStreamOutput,
+   __in const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures);
+
+void APIENTRY CreateGeometryShaderWithStreamOutput11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *pCreateGeometryShaderWithStreamOutput,
+   D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRTShader,
+   __in const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures);
+
 void APIENTRY SoSetTargets(D3D10DDI_HDEVICE hDevice, UINT SOTargets, UINT ClearTargets,
                   __in_ecount (SOTargets) const D3D10DDI_HRESOURCE *phResource,
                   __in_ecount (SOTargets) const UINT *pOffsets);
@@ -120,6 +131,8 @@ void APIENTRY CreatePixelShader(D3D10DDI_HDEVICE hDevice,
                        D3D10DDI_HSHADER hShader, D3D10DDI_HRTSHADER hRTShader,
                        __in const D3D10DDIARG_STAGE_IO_SIGNATURES *pSignatures);
 void APIENTRY PsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
+bool RunPixelShaderEmulation(Device *pDevice);
+bool RunVertexShaderEmulation(Device *pDevice, unsigned vertex_count);
 
 void APIENTRY PsSetShaderResources(
    D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
@@ -131,9 +144,114 @@ void APIENTRY PsSetConstantBuffers(D3D10DDI_HDEVICE hDevice, UINT StartBuffer, U
 void APIENTRY PsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
                    __in_ecount (NumSamplers) const D3D10DDI_HSAMPLER *phSamplers);
 
+SIZE_T APIENTRY CalcPrivateTessellationShaderSize(
+   D3D10DDI_HDEVICE hDevice,
+   __in_ecount (pShaderCode[1]) const UINT *pCode,
+   __in const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures);
+
+void APIENTRY CreateHullShader(
+   D3D10DDI_HDEVICE hDevice,
+   __in_ecount (pShaderCode[1]) const UINT *pCode,
+   D3D10DDI_HSHADER hShader,
+   D3D10DDI_HRTSHADER hRTShader,
+   __in const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures);
+
+void APIENTRY CreateDomainShader(
+   D3D10DDI_HDEVICE hDevice,
+   __in_ecount (pShaderCode[1]) const UINT *pCode,
+   D3D10DDI_HSHADER hShader,
+   D3D10DDI_HRTSHADER hRTShader,
+   __in const D3D11DDIARG_TESSELLATION_IO_SIGNATURES *pSignatures);
+
+void APIENTRY HsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
+void APIENTRY DsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
+
+void APIENTRY HsSetShaderResources(
+   D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
+   __in_ecount (NumViews) const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews);
+
+void APIENTRY DsSetShaderResources(
+   D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
+   __in_ecount (NumViews) const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews);
+
+void APIENTRY HsSetConstantBuffers(D3D10DDI_HDEVICE hDevice, UINT StartBuffer, UINT NumBuffers,
+                          __in_ecount (NumBuffers) const D3D10DDI_HRESOURCE *phBuffers);
+
+void APIENTRY DsSetConstantBuffers(D3D10DDI_HDEVICE hDevice, UINT StartBuffer, UINT NumBuffers,
+                          __in_ecount (NumBuffers) const D3D10DDI_HRESOURCE *phBuffers);
+
+void APIENTRY HsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
+                   __in_ecount (NumSamplers) const D3D10DDI_HSAMPLER *phSamplers);
+
+void APIENTRY DsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
+                   __in_ecount (NumSamplers) const D3D10DDI_HSAMPLER *phSamplers);
+
+void APIENTRY SetShaderWithIfaces(
+   D3D10DDI_HDEVICE hDevice,
+   D3D10DDI_HSHADER hShader,
+   UINT NumClassInstances,
+   __in_ecount (NumClassInstances) const UINT *pIfaces,
+   __in_ecount (NumClassInstances) const D3D11DDIARG_POINTERDATA *pPointerData);
+
+void APIENTRY CreateComputeShader(
+   D3D10DDI_HDEVICE hDevice,
+   __in_ecount (pShaderCode[1]) const UINT *pCode,
+   D3D10DDI_HSHADER hShader,
+   D3D10DDI_HRTSHADER hRTShader);
+
+void APIENTRY CsSetShader(D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADER hShader);
+
+void APIENTRY CsSetShaderResources(
+   D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumViews,
+   __in_ecount (NumViews) const D3D10DDI_HSHADERRESOURCEVIEW *phShaderResourceViews);
+
+void APIENTRY CsSetConstantBuffers(D3D10DDI_HDEVICE hDevice, UINT StartBuffer, UINT NumBuffers,
+                          __in_ecount (NumBuffers) const D3D10DDI_HRESOURCE *phBuffers);
+
+void
+SetConstantBuffersRange(mesa_shader_stage shader_type,
+                        D3D10DDI_HDEVICE hDevice,
+                        UINT StartBuffer,
+                        UINT NumBuffers,
+                        const D3D10DDI_HRESOURCE *phBuffers,
+                        const UINT *pFirstConstant,
+                        const UINT *pNumConstants);
+
+void
+UpdateBufferInfoConstants(Device *pDevice, mesa_shader_stage shader_type);
+
+void
+UpdateBufferInfoUavConstants(Device *pDevice,
+                             mesa_shader_stage shader_type,
+                             unsigned first_slot,
+                             unsigned num_slots);
+
+void
+UpdateBufferInfoSampleConstants(Device *pDevice,
+                                mesa_shader_stage shader_type);
+
+void APIENTRY CsSetSamplers(D3D10DDI_HDEVICE hDevice, UINT Offset, UINT NumSamplers,
+                   __in_ecount (NumSamplers) const D3D10DDI_HSAMPLER *phSamplers);
+
+void APIENTRY Dispatch(D3D10DDI_HDEVICE hDevice,
+                       UINT ThreadGroupCountX,
+                       UINT ThreadGroupCountY,
+                       UINT ThreadGroupCountZ);
+
+void APIENTRY DispatchIndirect(D3D10DDI_HDEVICE hDevice,
+                               D3D10DDI_HRESOURCE hBufferForArgs,
+                               UINT AlignedByteOffsetForArgs);
+
+void APIENTRY CopyStructureCount(D3D10DDI_HDEVICE hDevice,
+                                 D3D10DDI_HRESOURCE hDstBuffer,
+                                 UINT DstAlignedByteOffset,
+                                 D3D11DDI_HUNORDEREDACCESSVIEW hSrcView);
+
 void APIENTRY ShaderResourceViewReadAfterWriteHazard(
    D3D10DDI_HDEVICE hDevice, D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView,
    D3D10DDI_HRESOURCE hResource);
+
+void RefreshBoundShaderResourceViews(Device *pDevice);
 
 SIZE_T APIENTRY CalcPrivateShaderResourceViewSize(
    D3D10DDI_HDEVICE hDevice,
@@ -155,8 +273,49 @@ void APIENTRY CreateShaderResourceView1(
    D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView,
    D3D10DDI_HRTSHADERRESOURCEVIEW hRTShaderResourceView);
 
+SIZE_T APIENTRY CalcPrivateShaderResourceViewSize11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pCreateShaderResourceView);
+
+void APIENTRY CreateShaderResourceView11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATESHADERRESOURCEVIEW *pCreateShaderResourceView,
+   D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView,
+   D3D10DDI_HRTSHADERRESOURCEVIEW hRTShaderResourceView);
+
 void APIENTRY DestroyShaderResourceView(D3D10DDI_HDEVICE hDevice,
                                D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView);
+
+SIZE_T APIENTRY CalcPrivateUnorderedAccessViewSize(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *pCreateUAView);
+
+void APIENTRY CreateUnorderedAccessView(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *pCreateUAView,
+   D3D11DDI_HUNORDEREDACCESSVIEW hUnorderedAccessView,
+   D3D11DDI_HRTUNORDEREDACCESSVIEW hRTUnorderedAccessView);
+
+void APIENTRY DestroyUnorderedAccessView(
+   D3D10DDI_HDEVICE hDevice,
+   D3D11DDI_HUNORDEREDACCESSVIEW hUnorderedAccessView);
+
+void APIENTRY ClearUnorderedAccessViewUint(
+   D3D10DDI_HDEVICE hDevice,
+   D3D11DDI_HUNORDEREDACCESSVIEW hUnorderedAccessView,
+   const UINT Values[4]);
+
+void APIENTRY ClearUnorderedAccessViewFloat(
+   D3D10DDI_HDEVICE hDevice,
+   D3D11DDI_HUNORDEREDACCESSVIEW hUnorderedAccessView,
+   const FLOAT Values[4]);
+
+void APIENTRY CsSetUnorderedAccessViews(
+   D3D10DDI_HDEVICE hDevice,
+   UINT StartSlot,
+   UINT NumViews,
+   __in_ecount (NumViews) const D3D11DDI_HUNORDEREDACCESSVIEW *phUnorderedAccessView,
+   __in_ecount (NumViews) const UINT *pUAVInitialCounts);
 
 void APIENTRY GenMips(D3D10DDI_HDEVICE hDevice,
              D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView);

@@ -4645,6 +4645,7 @@ emit_deref_array(struct ntv_context *ctx, nir_deref_instr *deref)
       }
       /* array<uint> */
       FALLTHROUGH;
+   case nir_var_mem_push_const:
    case nir_var_shader_temp:
    case nir_var_function_temp:
    case nir_var_shader_in:
@@ -5034,6 +5035,10 @@ nir_to_spirv(struct nir_shader *s, const struct ntv_info *sinfo)
    _mesa_hash_table_init(&ctx.image_types, ctx.mem_ctx, _mesa_hash_pointer, _mesa_key_pointer_equal);
 
    spirv_builder_emit_cap(&ctx.builder, SpvCapabilityShader);
+   if (s->info.clip_distance_array_size)
+      spirv_builder_emit_cap(&ctx.builder, SpvCapabilityClipDistance);
+   if (s->info.cull_distance_array_size)
+      spirv_builder_emit_cap(&ctx.builder, SpvCapabilityCullDistance);
 
    switch (s->info.stage) {
    case MESA_SHADER_FRAGMENT:
@@ -5126,6 +5131,8 @@ nir_to_spirv(struct nir_shader *s, const struct ntv_info *sinfo)
    }
 
    if (ctx.sinfo->have_vulkan_memory_model) {
+      spirv_builder_emit_extension(&ctx.builder,
+                                   "SPV_KHR_vulkan_memory_model");
       spirv_builder_emit_cap(&ctx.builder, SpvCapabilityVulkanMemoryModel);
       spirv_builder_emit_cap(&ctx.builder, SpvCapabilityVulkanMemoryModelDeviceScope);
       spirv_builder_emit_mem_model(&ctx.builder, model,

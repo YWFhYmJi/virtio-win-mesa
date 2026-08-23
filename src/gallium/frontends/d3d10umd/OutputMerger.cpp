@@ -32,6 +32,7 @@
 
 
 #include "OutputMerger.h"
+#include "Shader.h"
 #include "State.h"
 
 #include "Debug.h"
@@ -39,7 +40,24 @@
 
 #include "util/u_framebuffer.h"
 #include "util/format/u_format.h"
+#include "util/blend.h"
+#include "util/u_debug.h"
+#include "util/u_math.h"
 
+#include <stdlib.h>
+#include <string.h>
+
+extern "C" void
+yttrium_gdi_resource_debug_log(struct pipe_resource *resource,
+                               const char *label);
+
+/*
+ * debug_get_bool_option() calls getenv() every time, and this knob is read
+ * from GetPipeRenderTargetView(), which runs per render target per
+ * SetRenderTargets and on every clear.  It showed up in the profile as a
+ * per-draw walk of the environment block to re-answer a constant.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(rt_trace, "D3D10UMD_DEBUG_RT_TRACE", false)
 
 static inline struct pipe_surface *
 GetPipeRenderTargetView(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
@@ -52,9 +70,229 @@ GetPipeRenderTargetView(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
    struct pipe_surface *currentSurface = &pRenderTargetView->surface;
    Resource *res = pRenderTargetView->resource;
    if (currentSurface->texture != res->resource) {
+      if (debug_get_option_rt_trace()) {
+         debug_printf("d3d10umd: rtv update view=%p old=%p new=%p resource=%p\n",
+                      pRenderTargetView,
+                      currentSurface->texture,
+                      res->resource,
+                      res);
+         yttrium_gdi_resource_debug_log(res->resource, "RTV update");
+      }
       pipe_resource_reference(&currentSurface->texture, res->resource);
    }
    return &pRenderTargetView->surface;
+}
+
+static bool
+IsYttriumScreen(struct pipe_screen *screen)
+{
+   if (!screen || !screen->get_name)
+      return false;
+
+   const char *name = screen->get_name(screen);
+   return name && strcmp(name, "yttrium") == 0;
+}
+
+static unsigned
+GetForcedSampleCount(Device *pDevice)
+{
+   RasterizerState *rasterizer =
+      pDevice ? pDevice->rasterizer_state : NULL;
+
+   if (!rasterizer || rasterizer->forced_sample_count <= 1)
+      return 0;
+
+   return rasterizer->forced_sample_count;
+}
+
+static void
+ApplyForcedSampleCount(struct pipe_surface *surface,
+                       unsigned forced_sample_count)
+{
+   if (!surface || !surface->texture)
+      return;
+
+   surface->nr_samples =
+      forced_sample_count && surface->texture->nr_samples <= 1 ?
+      forced_sample_count : 0;
+}
+
+void
+UpdateFramebufferForcedSampleCount(Device *pDevice)
+{
+   if (!pDevice)
+      return;
+
+   const unsigned forced_sample_count = GetForcedSampleCount(pDevice);
+
+   for (unsigned i = 0; i < pDevice->fb.nr_cbufs; ++i)
+      ApplyForcedSampleCount(&pDevice->fb.cbufs[i], forced_sample_count);
+   ApplyForcedSampleCount(&pDevice->fb.zsbuf, forced_sample_count);
+
+   pDevice->fb.samples = forced_sample_count ? forced_sample_count : 1;
+}
+
+static void
+ConvertClearColor(enum pipe_format format,
+                  const FLOAT color[4],
+                  union pipe_color_union *clear_color)
+{
+   /*
+    * DX10 always uses float clear color but gallium does not.
+    * Conversion should just be ordinary conversion. Actual clamping will
+    * be done later but need to make sure values exceeding int/uint range
+    * are handled correctly.
+    */
+   if (util_format_is_pure_integer(format)) {
+      if (util_format_is_pure_sint(format)) {
+         unsigned i;
+         int min_int32 = 0x80000000;
+         int max_int32 = 0x7fffffff;
+         for (i = 0; i < 4; i++) {
+            float value = color[i];
+            if (util_is_nan(value)) {
+               clear_color->i[i] = 0;
+            } else if (value <= (float)min_int32) {
+               clear_color->i[i] = min_int32;
+            } else if (value >= (float)max_int32) {
+               clear_color->i[i] = max_int32;
+            } else {
+               clear_color->i[i] = value;
+            }
+         }
+      } else {
+         assert(util_format_is_pure_uint(format));
+         unsigned i;
+         unsigned max_uint32 = 0xffffffffU;
+         for (i = 0; i < 4; i++) {
+            float value = color[i];
+            if (!(value >= 0.0f)) {
+               clear_color->ui[i] = 0;
+            } else if (value >= (float)max_uint32) {
+               clear_color->ui[i] = max_uint32;
+            } else {
+               clear_color->ui[i] = value;
+            }
+         }
+      }
+   } else {
+      clear_color->f[0] = color[0];
+      clear_color->f[1] = color[1];
+      clear_color->f[2] = color[2];
+      clear_color->f[3] = color[3];
+   }
+}
+
+static bool
+ClearRenderTargetViewRectUpload(struct pipe_context *pipe,
+                                struct pipe_surface *surface,
+                                const union pipe_color_union *clear_color,
+                                unsigned x,
+                                unsigned y,
+                                unsigned width,
+                                unsigned height)
+{
+   if (!pipe || !pipe->texture_subdata || !surface || !surface->texture ||
+       !clear_color || !width || !height)
+      return false;
+
+   const enum pipe_format format = surface->format;
+   const struct util_format_pack_description *pack =
+      util_format_pack_description(format);
+   if (!pack)
+      return false;
+
+   const bool pure_uint = util_format_is_pure_uint(format);
+   const bool pure_sint = util_format_is_pure_sint(format);
+   if ((pure_uint && !pack->pack_rgba_uint) ||
+       (pure_sint && !pack->pack_rgba_sint) ||
+       (!pure_uint && !pure_sint && !pack->pack_rgba_float))
+      return false;
+
+   const unsigned stride = util_format_get_stride(format, width);
+   const uintptr_t layer_stride =
+      (uintptr_t)util_format_get_2d_size(format, stride, height);
+   const unsigned first_layer = surface->first_layer;
+   const unsigned layer_count =
+      surface->last_layer >= surface->first_layer ?
+      surface->last_layer - surface->first_layer + 1 : 1;
+
+   if (!stride || !layer_stride || layer_stride > SIZE_MAX / layer_count)
+      return false;
+
+   uint8_t *data = (uint8_t *)malloc((size_t)layer_stride * layer_count);
+   if (!data)
+      return false;
+
+   uint8_t *row = (uint8_t *)malloc(stride);
+   void *src = NULL;
+   if (!row)
+      goto fail;
+
+   if (pure_uint) {
+      uint32_t *rgba = (uint32_t *)malloc(width * 4 * sizeof(*rgba));
+      if (!rgba)
+         goto fail;
+      for (unsigned i = 0; i < width; ++i) {
+         rgba[i * 4 + 0] = clear_color->ui[0];
+         rgba[i * 4 + 1] = clear_color->ui[1];
+         rgba[i * 4 + 2] = clear_color->ui[2];
+         rgba[i * 4 + 3] = clear_color->ui[3];
+      }
+      pack->pack_rgba_uint(row, 0, rgba, 0, width, 1);
+      src = rgba;
+   } else if (pure_sint) {
+      int32_t *rgba = (int32_t *)malloc(width * 4 * sizeof(*rgba));
+      if (!rgba)
+         goto fail;
+      for (unsigned i = 0; i < width; ++i) {
+         rgba[i * 4 + 0] = clear_color->i[0];
+         rgba[i * 4 + 1] = clear_color->i[1];
+         rgba[i * 4 + 2] = clear_color->i[2];
+         rgba[i * 4 + 3] = clear_color->i[3];
+      }
+      pack->pack_rgba_sint(row, 0, rgba, 0, width, 1);
+      src = rgba;
+   } else {
+      float *rgba = (float *)malloc(width * 4 * sizeof(*rgba));
+      if (!rgba)
+         goto fail;
+      for (unsigned i = 0; i < width; ++i) {
+         rgba[i * 4 + 0] = clear_color->f[0];
+         rgba[i * 4 + 1] = clear_color->f[1];
+         rgba[i * 4 + 2] = clear_color->f[2];
+         rgba[i * 4 + 3] = clear_color->f[3];
+      }
+      pack->pack_rgba_float(row, 0, rgba, 0, width, 1);
+      src = rgba;
+   }
+
+   for (unsigned layer = 0; layer < layer_count; ++layer) {
+      uint8_t *layer_data = data + (size_t)layer_stride * layer;
+      for (unsigned row_index = 0; row_index < height; ++row_index)
+         memcpy(layer_data + (size_t)stride * row_index, row, stride);
+   }
+
+   struct pipe_box box;
+   box.x = x;
+   box.y = y;
+   box.z = first_layer;
+   box.width = width;
+   box.height = height;
+   box.depth = layer_count;
+   pipe->texture_subdata(pipe, surface->texture, surface->level, 0, &box,
+                         data, stride, layer_stride);
+
+   free(src);
+   free(row);
+   free(data);
+   return true;
+
+fail:
+   free(src);
+   free(row);
+   free(data);
+   return false;
 }
 
 /*
@@ -103,6 +341,17 @@ CreateRenderTargetView(
    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
    pRTView->resource = CastResource(pCreateRenderTargetView->hDrvResource);
 
+   if (debug_get_option_rt_trace()) {
+      debug_printf("d3d10umd: CreateRenderTargetView view=%p hDrvResource=%p resource=%p pipe=%p format=%u dim=%u\n",
+                   pRTView,
+                   (void *)pCreateRenderTargetView->hDrvResource.pDrvPrivate,
+                   pRTView->resource,
+                   resource,
+                   pCreateRenderTargetView->Format,
+                   pCreateRenderTargetView->ResourceDimension);
+      yttrium_gdi_resource_debug_log(resource, "CreateRenderTargetView");
+   }
+
    struct pipe_surface desc;
 
    memset(&desc, 0, sizeof desc);
@@ -111,9 +360,10 @@ CreateRenderTargetView(
 
    switch (pCreateRenderTargetView->ResourceDimension) {
    case D3D10DDIRESOURCE_BUFFER:
-      LOG_UNSUPPORTED("Render target view into buffer!");
-      SetError(hDevice, E_NOTIMPL);
-      return;
+      desc.level = 0;
+      desc.first_layer = 0;
+      desc.last_layer = 0;
+      break;
    case D3D10DDIRESOURCE_TEXTURE1D:
       ASSERT(pCreateRenderTargetView->Tex1D.ArraySize != (UINT)-1);
       desc.level = pCreateRenderTargetView->Tex1D.MipSlice;
@@ -131,8 +381,14 @@ CreateRenderTargetView(
    case D3D10DDIRESOURCE_TEXTURE3D:
       desc.level = pCreateRenderTargetView->Tex3D.MipSlice;
       desc.first_layer = pCreateRenderTargetView->Tex3D.FirstW;
-      desc.last_layer = pCreateRenderTargetView->Tex3D.WSize - 1 +
-                                 desc.first_layer;
+      if (pCreateRenderTargetView->Tex3D.WSize == (UINT)-1) {
+         const unsigned depth = resource ?
+            u_minify(resource->depth0, desc.level) : 1;
+         desc.last_layer = depth - 1;
+      } else {
+         desc.last_layer = pCreateRenderTargetView->Tex3D.WSize - 1 +
+                                    desc.first_layer;
+      }
       break;
    case D3D10DDIRESOURCE_TEXTURECUBE:
       ASSERT(pCreateRenderTargetView->TexCube.ArraySize != (UINT)-1);
@@ -147,6 +403,14 @@ CreateRenderTargetView(
    }
 
    pRTView->surface = desc;
+   ResourceEvent(RESOURCE_EVENT_RTV_CREATE,
+                 (uint64_t)hRTRenderTargetView.handle,
+                 pRTView,
+                 pRTView->surface.texture,
+                 PipeResourceRefCount(pRTView->surface.texture),
+                 pCreateRenderTargetView->Format,
+                 pCreateRenderTargetView->ResourceDimension,
+                 (uint64_t)(uintptr_t)pRTView->resource);
 }
 
 
@@ -170,6 +434,13 @@ DestroyRenderTargetView(D3D10DDI_HDEVICE hDevice,                       // IN
 
    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
 
+   ResourceEvent(RESOURCE_EVENT_RTV_DESTROY,
+                 0,
+                 pRTView,
+                 pRTView ? pRTView->surface.texture : NULL,
+                 pRTView ? PipeResourceRefCount(pRTView->surface.texture) : 0,
+                 0, 0,
+                 (uint64_t)(uintptr_t)(pRTView ? pRTView->resource : NULL));
    pipe_resource_reference(&pRTView->surface.texture, NULL);
 }
 
@@ -196,56 +467,7 @@ ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,                      // IN
    struct pipe_surface *surface = GetPipeRenderTargetView(hRenderTargetView);
    union pipe_color_union clear_color;
 
-   /*
-    * DX10 always uses float clear color but gallium does not.
-    * Conversion should just be ordinary conversion. Actual clamping will
-    * be done later but need to make sure values exceeding int/uint range
-    * are handled correctly.
-    */
-   if (util_format_is_pure_integer(surface->format)) {
-      if (util_format_is_pure_sint(surface->format)) {
-         unsigned i;
-         /* If only MIN_INT/UINT32 in c++ code would work... */
-         int min_int32 = 0x80000000;
-         int max_int32 = 0x7fffffff;
-         for (i = 0; i < 4; i++) {
-            float value = pColorRGBA[i];
-            /* This is an expanded clamp to handle NaN and integer conversion. */
-            if (util_is_nan(value)) {
-               clear_color.i[i] = 0;
-            } else if (value <= (float)min_int32) {
-               clear_color.i[i] = min_int32;
-            } else if (value >= (float)max_int32) {
-               clear_color.i[i] = max_int32;
-            } else {
-               clear_color.i[i] = value;
-            }
-         }
-      }
-      else {
-         assert(util_format_is_pure_uint(surface->format));
-         unsigned i;
-         unsigned max_uint32 = 0xffffffffU;
-         for (i = 0; i < 4; i++) {
-            float value = pColorRGBA[i];
-            /* This is an expanded clamp to handle NaN and integer conversion. */
-            if (!(value >= 0.0f)) {
-               /* Handles NaN. */
-               clear_color.ui[i] = 0;
-            } else if (value >= (float)max_uint32) {
-               clear_color.ui[i] = max_uint32;
-            } else {
-               clear_color.ui[i] = value;
-            }
-         }
-      }
-   }
-   else {
-      clear_color.f[0] = pColorRGBA[0];
-      clear_color.f[1] = pColorRGBA[1];
-      clear_color.f[2] = pColorRGBA[2];
-      clear_color.f[3] = pColorRGBA[3];
-   }
+   ConvertClearColor(surface->format, pColorRGBA, &clear_color);
 
    pipe->clear_render_target(pipe,
                              surface,
@@ -254,6 +476,67 @@ ClearRenderTargetView(D3D10DDI_HDEVICE hDevice,                      // IN
                              pipe_surface_width(surface),
                              pipe_surface_height(surface),
                              true);
+}
+
+void APIENTRY
+ClearView(D3D10DDI_HDEVICE hDevice,
+          D3D11DDI_HANDLETYPE ViewType,
+          void *hView,
+          const FLOAT Color[4],
+          const D3D10_DDI_RECT *pRects,
+          UINT NumRects)
+{
+   LOG_ENTRYPOINT();
+
+   if (ViewType != D3D10DDI_HT_RENDERTARGETVIEW || !hView || !Color)
+      return;
+
+   D3D10DDI_HRENDERTARGETVIEW hRenderTargetView;
+   hRenderTargetView.pDrvPrivate = hView;
+
+   struct pipe_context *pipe = CastPipeContext(hDevice);
+   struct pipe_surface *surface = GetPipeRenderTargetView(hRenderTargetView);
+   if (!pipe || !surface)
+      return;
+
+   union pipe_color_union clear_color;
+   ConvertClearColor(surface->format, Color, &clear_color);
+
+   unsigned surface_width = pipe_surface_width(surface);
+   unsigned surface_height = pipe_surface_height(surface);
+   const bool yttrium = IsYttriumScreen(pipe->screen);
+   if (!pRects || !NumRects) {
+      pipe->clear_render_target(pipe, surface, &clear_color, 0, 0,
+                                surface_width, surface_height, true);
+      return;
+   }
+
+   for (UINT i = 0; i < NumRects; ++i) {
+      int left = MAX2(pRects[i].left, 0);
+      int top = MAX2(pRects[i].top, 0);
+      int right = MIN2(pRects[i].right, (int)surface_width);
+      int bottom = MIN2(pRects[i].bottom, (int)surface_height);
+
+      if (right <= left || bottom <= top)
+         continue;
+
+      unsigned width = (unsigned)(right - left);
+      unsigned height = (unsigned)(bottom - top);
+      if (yttrium) {
+         pipe->clear_render_target(pipe, surface, &clear_color,
+                                   (unsigned)left, (unsigned)top,
+                                   width, height, true);
+         continue;
+      }
+
+      if (!ClearRenderTargetViewRectUpload(pipe, surface, &clear_color,
+                                           (unsigned)left, (unsigned)top,
+                                           width, height)) {
+         pipe->clear_render_target(pipe, surface, &clear_color,
+                                   (unsigned)left, (unsigned)top,
+                                   width, height, true);
+      }
+   }
 }
 
 
@@ -274,6 +557,14 @@ SIZE_T APIENTRY
 CalcPrivateDepthStencilViewSize(
    D3D10DDI_HDEVICE hDevice,                                               // IN
    __in const D3D10DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView) // IN
+{
+   return sizeof(DepthStencilView);
+}
+
+SIZE_T APIENTRY
+CalcPrivateDepthStencilViewSize11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView)
 {
    return sizeof(DepthStencilView);
 }
@@ -337,6 +628,44 @@ CreateDepthStencilView(
    }
 
    pDSView->surface = desc;
+   ResourceEvent(RESOURCE_EVENT_DSV_CREATE,
+                 (uint64_t)hRTDepthStencilView.handle,
+                 pDSView,
+                 pDSView->surface.texture,
+                 PipeResourceRefCount(pDSView->surface.texture),
+                 pCreateDepthStencilView->Format,
+                 pCreateDepthStencilView->ResourceDimension,
+                 0);
+}
+
+void APIENTRY
+CreateDepthStencilView11(
+   D3D10DDI_HDEVICE hDevice,
+   __in const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *pCreateDepthStencilView,
+   D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,
+   D3D10DDI_HRTDEPTHSTENCILVIEW hRTDepthStencilView)
+{
+   D3D10DDIARG_CREATEDEPTHSTENCILVIEW create10 = {};
+
+   create10.hDrvResource = pCreateDepthStencilView->hDrvResource;
+   create10.Format = pCreateDepthStencilView->Format;
+   create10.ResourceDimension = pCreateDepthStencilView->ResourceDimension;
+   switch (pCreateDepthStencilView->ResourceDimension) {
+   case D3D10DDIRESOURCE_TEXTURE1D:
+      create10.Tex1D = pCreateDepthStencilView->Tex1D;
+      break;
+   case D3D10DDIRESOURCE_TEXTURE2D:
+      create10.Tex2D = pCreateDepthStencilView->Tex2D;
+      break;
+   case D3D10DDIRESOURCE_TEXTURECUBE:
+      create10.TexCube = pCreateDepthStencilView->TexCube;
+      break;
+   default:
+      break;
+   }
+
+   CreateDepthStencilView(hDevice, &create10, hDepthStencilView,
+                          hRTDepthStencilView);
 }
 
 
@@ -360,6 +689,12 @@ DestroyDepthStencilView(D3D10DDI_HDEVICE hDevice,                       // IN
 
    DepthStencilView *pDSView = CastDepthStencilView(hDepthStencilView);
 
+   ResourceEvent(RESOURCE_EVENT_DSV_DESTROY,
+                 0,
+                 pDSView,
+                 pDSView ? pDSView->surface.texture : NULL,
+                 pDSView ? PipeResourceRefCount(pDSView->surface.texture) : 0,
+                 0, 0, 0);
    pipe_resource_reference(&pDSView->surface.texture, NULL);
 }
 
@@ -559,6 +894,48 @@ translateBlend(Device *pDevice,
    }
 }
 
+static unsigned
+translateLogicOp(D3D11_1_DDI_LOGIC_OP logic_op)
+{
+   switch (logic_op) {
+   case D3D11_1_DDI_LOGIC_OP_CLEAR:
+      return PIPE_LOGICOP_CLEAR;
+   case D3D11_1_DDI_LOGIC_OP_SET:
+      return PIPE_LOGICOP_SET;
+   case D3D11_1_DDI_LOGIC_OP_COPY:
+      return PIPE_LOGICOP_COPY;
+   case D3D11_1_DDI_LOGIC_OP_COPY_INVERTED:
+      return PIPE_LOGICOP_COPY_INVERTED;
+   case D3D11_1_DDI_LOGIC_OP_NOOP:
+      return PIPE_LOGICOP_NOOP;
+   case D3D11_1_DDI_LOGIC_OP_INVERT:
+      return PIPE_LOGICOP_INVERT;
+   case D3D11_1_DDI_LOGIC_OP_AND:
+      return PIPE_LOGICOP_AND;
+   case D3D11_1_DDI_LOGIC_OP_NAND:
+      return PIPE_LOGICOP_NAND;
+   case D3D11_1_DDI_LOGIC_OP_OR:
+      return PIPE_LOGICOP_OR;
+   case D3D11_1_DDI_LOGIC_OP_NOR:
+      return PIPE_LOGICOP_NOR;
+   case D3D11_1_DDI_LOGIC_OP_XOR:
+      return PIPE_LOGICOP_XOR;
+   case D3D11_1_DDI_LOGIC_OP_EQUIV:
+      return PIPE_LOGICOP_EQUIV;
+   case D3D11_1_DDI_LOGIC_OP_AND_REVERSE:
+      return PIPE_LOGICOP_AND_REVERSE;
+   case D3D11_1_DDI_LOGIC_OP_AND_INVERTED:
+      return PIPE_LOGICOP_AND_INVERTED;
+   case D3D11_1_DDI_LOGIC_OP_OR_REVERSE:
+      return PIPE_LOGICOP_OR_REVERSE;
+   case D3D11_1_DDI_LOGIC_OP_OR_INVERTED:
+      return PIPE_LOGICOP_OR_INVERTED;
+   default:
+      assert(0);
+      return PIPE_LOGICOP_COPY;
+   }
+}
+
 
 /*
  * ----------------------------------------------------------------------
@@ -693,6 +1070,64 @@ CreateBlendState1(D3D10DDI_HDEVICE hDevice,                     // IN
    pBlendState->handle = pipe->create_blend_state(pipe, &state);
 }
 
+void APIENTRY
+CreateBlendState11_1Impl(D3D10DDI_HDEVICE hDevice,
+                         __in const D3D11_1_DDI_BLEND_DESC *pBlendDesc,
+                         D3D10DDI_HBLENDSTATE hBlendState,
+                         D3D10DDI_HRTBLENDSTATE hRTBlendState)
+{
+   LOG_ENTRYPOINT();
+
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
+   BlendState *pBlendState = CastBlendState(hBlendState);
+
+   struct pipe_blend_state state;
+   memset(&state, 0, sizeof state);
+
+   state.alpha_to_coverage = pBlendDesc->AlphaToCoverageEnable;
+   state.independent_blend_enable = pBlendDesc->IndependentBlendEnable;
+
+   for (unsigned i = 0;
+        i < MIN2(PIPE_MAX_COLOR_BUFS, D3D10_DDI_SIMULTANEOUS_RENDER_TARGET_COUNT);
+        ++i) {
+      const D3D11_1_DDI_RENDER_TARGET_BLEND_DESC *rt =
+         &pBlendDesc->RenderTarget[i];
+
+      if (rt->LogicOpEnable) {
+         state.logicop_enable = 1;
+         state.logicop_func = translateLogicOp(rt->LogicOp);
+      }
+
+      state.rt[i].blend_enable = rt->BlendEnable && !rt->LogicOpEnable;
+      state.rt[i].colormask = rt->RenderTargetWriteMask;
+
+      state.rt[i].rgb_func = translateBlendOp(rt->BlendOp);
+      if (rt->BlendOp == D3D10_DDI_BLEND_OP_MIN ||
+          rt->BlendOp == D3D10_DDI_BLEND_OP_MAX) {
+         state.rt[i].rgb_src_factor = PIPE_BLENDFACTOR_ONE;
+         state.rt[i].rgb_dst_factor = PIPE_BLENDFACTOR_ONE;
+      } else {
+         state.rt[i].rgb_src_factor = translateBlend(pDevice, rt->SrcBlend);
+         state.rt[i].rgb_dst_factor = translateBlend(pDevice, rt->DestBlend);
+      }
+
+      state.rt[i].alpha_func = translateBlendOp(rt->BlendOpAlpha);
+      if (rt->BlendOpAlpha == D3D10_DDI_BLEND_OP_MIN ||
+          rt->BlendOpAlpha == D3D10_DDI_BLEND_OP_MAX) {
+         state.rt[i].alpha_src_factor = PIPE_BLENDFACTOR_ONE;
+         state.rt[i].alpha_dst_factor = PIPE_BLENDFACTOR_ONE;
+      } else {
+         state.rt[i].alpha_src_factor =
+            translateBlend(pDevice, rt->SrcBlendAlpha);
+         state.rt[i].alpha_dst_factor =
+            translateBlend(pDevice, rt->DestBlendAlpha);
+      }
+   }
+
+   pBlendState->handle = pipe->create_blend_state(pipe, &state);
+}
+
 
 /*
  * ----------------------------------------------------------------------
@@ -764,13 +1199,39 @@ SetBlendState(D3D10DDI_HDEVICE hDevice,      // IN
  * ----------------------------------------------------------------------
  */
 
-void APIENTRY
-SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
-                 __in_ecount (NumViews)
-                  const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView, // IN
-                 UINT RTargets,                                         // IN
-                 UINT ClearTargets,                                     // IN
-                 D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView)          // IN
+static const mesa_shader_stage graphics_uav_stages[] = {
+   MESA_SHADER_VERTEX,
+   MESA_SHADER_GEOMETRY,
+   MESA_SHADER_FRAGMENT,
+};
+
+static void
+ClearGraphicsUnorderedAccessViews(Device *pDevice)
+{
+   for (unsigned i = 0; i < ARRAY_SIZE(graphics_uav_stages); i++) {
+      const mesa_shader_stage stage = graphics_uav_stages[i];
+
+      memset(pDevice->unordered_access_views[stage], 0,
+             sizeof(pDevice->unordered_access_views[stage]));
+      memset(pDevice->shader_images[stage], 0,
+             sizeof(pDevice->shader_images[stage]));
+
+      pDevice->pipe->set_shader_images(pDevice->pipe, stage,
+                                       0, 0, PIPE_MAX_SHADER_IMAGES, NULL);
+      UpdateBufferInfoUavConstants(pDevice, stage, 0,
+                                   PIPE_MAX_SHADER_IMAGES);
+      UpdateBufferInfoConstants(pDevice, stage);
+   }
+}
+
+static void
+SetRenderTargetsImpl(D3D10DDI_HDEVICE hDevice,                              // IN
+                     __in_ecount (NumViews)
+                     const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView,  // IN
+                     UINT RTargets,                                         // IN
+                     UINT ClearTargets,                                     // IN
+                     D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,          // IN
+                     bool clear_fragment_uavs)
 {
    LOG_ENTRYPOINT();
 
@@ -778,13 +1239,37 @@ SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
 
    struct pipe_context *pipe = pDevice->pipe;
 
+   if (clear_fragment_uavs)
+      ClearGraphicsUnorderedAccessViews(pDevice);
+
    pDevice->fb.nr_cbufs = 0;
 
    for (unsigned i = 0; i < RTargets; ++i) {
       struct pipe_surface *psurf = GetPipeRenderTargetView(phRenderTargetView[i]);
       pipe_resource_reference(&pDevice->fb.cbufs[i].texture,
                               psurf && psurf->texture ? psurf->texture : NULL);
+      ResourceEvent(RESOURCE_EVENT_SET_RENDER_TARGET,
+                    (uint64_t)(uintptr_t)(phRenderTargetView
+                                             ? phRenderTargetView[i].pDrvPrivate
+                                             : NULL),
+                    NULL,
+                    psurf ? psurf->texture : NULL,
+                    psurf ? PipeResourceRefCount(psurf->texture) : 0,
+                    i,
+                    RTargets,
+                    ClearTargets);
       if (psurf && psurf->texture) {
+         if (debug_get_option_rt_trace()) {
+            debug_printf("d3d10umd: SetRenderTargets[%u] view=%p surface_tex=%p rtv_resource=%p\n",
+                         i,
+                         phRenderTargetView[i].pDrvPrivate,
+                         psurf->texture,
+                         CastRenderTargetView(phRenderTargetView[i]) ?
+                            CastRenderTargetView(phRenderTargetView[i])->resource :
+                            NULL);
+            yttrium_gdi_resource_debug_log(psurf->texture,
+                                           "SetRenderTargets cbuf");
+         }
          pDevice->fb.nr_cbufs = i + 1;
          pDevice->fb.cbufs[i] = *psurf;
       }
@@ -796,6 +1281,12 @@ SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
 
    struct pipe_surface *zsbuf = CastPipeDepthStencilView(hDepthStencilView);
    pipe_resource_reference(&pDevice->fb.zsbuf.texture, zsbuf && zsbuf->texture ? zsbuf->texture : NULL);
+   ResourceEvent(RESOURCE_EVENT_SET_DEPTH_STENCIL,
+                 (uint64_t)(uintptr_t)hDepthStencilView.pDrvPrivate,
+                 NULL,
+                 zsbuf ? zsbuf->texture : NULL,
+                 zsbuf ? PipeResourceRefCount(zsbuf->texture) : 0,
+                 0, 0, 0);
    if(zsbuf && zsbuf->texture) {
       pDevice->fb.zsbuf = *zsbuf;
    }
@@ -806,10 +1297,90 @@ SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
     */
    unsigned width, height;
    util_framebuffer_min_size(&pDevice->fb, &width, &height);
+   if (!width && !height && pDevice->viewport_fb_width &&
+       pDevice->viewport_fb_height) {
+      width = pDevice->viewport_fb_width;
+      height = pDevice->viewport_fb_height;
+   }
    pDevice->fb.width = width;
    pDevice->fb.height = height;
 
+   UpdateFramebufferForcedSampleCount(pDevice);
    pipe->set_framebuffer_state(pipe, &pDevice->fb);
+   UpdateBufferInfoSampleConstants(pDevice, MESA_SHADER_FRAGMENT);
+   UpdateBufferInfoConstants(pDevice, MESA_SHADER_FRAGMENT);
+}
+
+void APIENTRY
+SetRenderTargets(D3D10DDI_HDEVICE hDevice,                              // IN
+                 __in_ecount (NumViews)
+                  const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView, // IN
+                 UINT RTargets,                                         // IN
+                 UINT ClearTargets,                                     // IN
+                 D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView)          // IN
+{
+   SetRenderTargetsImpl(hDevice, phRenderTargetView, RTargets, ClearTargets,
+                        hDepthStencilView, true);
+}
+
+void APIENTRY
+SetRenderTargets11(
+   D3D10DDI_HDEVICE hDevice,
+   __in_ecount (NumRTVs) const D3D10DDI_HRENDERTARGETVIEW *phRenderTargetView,
+   UINT RTargets, UINT ClearTargets, D3D10DDI_HDEPTHSTENCILVIEW hDepthStencilView,
+   __in_ecount (NumUAVs) const D3D11DDI_HUNORDEREDACCESSVIEW *phUnorderedAccessView,
+   __in_ecount (NumUAVs) const UINT *pUAVInitialCounts,
+   UINT UAVStartSlot, UINT NumUAVs, UINT UAVRangeStart, UINT UAVRangeSize)
+{
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
+
+   SetRenderTargetsImpl(hDevice, phRenderTargetView, RTargets, ClearTargets,
+                        hDepthStencilView, false);
+
+   if (!NumUAVs) {
+      ClearGraphicsUnorderedAccessViews(pDevice);
+      return;
+   }
+
+   assert(UAVStartSlot + NumUAVs <= PIPE_MAX_SHADER_IMAGES);
+   for (UINT i = 0; i < NumUAVs; i++) {
+      UnorderedAccessView *uav =
+         CastUnorderedAccessView(phUnorderedAccessView[i]);
+      if (uav) {
+         if (pUAVInitialCounts &&
+             pUAVInitialCounts[i] != ~0u &&
+             (uav->buffer_counter || uav->buffer_append))
+            uav->counter_value = pUAVInitialCounts[i];
+         for (unsigned stage_idx = 0;
+              stage_idx < ARRAY_SIZE(graphics_uav_stages);
+              stage_idx++) {
+            const mesa_shader_stage stage = graphics_uav_stages[stage_idx];
+            pDevice->unordered_access_views[stage][UAVStartSlot + i] =
+               uav;
+            pDevice->shader_images[stage][UAVStartSlot + i] =
+               uav->image;
+         }
+      } else {
+         for (unsigned stage_idx = 0;
+              stage_idx < ARRAY_SIZE(graphics_uav_stages);
+              stage_idx++) {
+            const mesa_shader_stage stage = graphics_uav_stages[stage_idx];
+            pDevice->unordered_access_views[stage][UAVStartSlot + i] =
+               NULL;
+            memset(&pDevice->shader_images[stage][UAVStartSlot + i],
+                   0, sizeof(pDevice->shader_images[stage][0]));
+         }
+      }
+   }
+
+   for (unsigned i = 0; i < ARRAY_SIZE(graphics_uav_stages); i++) {
+      const mesa_shader_stage stage = graphics_uav_stages[i];
+      pipe->set_shader_images(pipe, stage, UAVStartSlot, NumUAVs, 0,
+                              &pDevice->shader_images[stage][UAVStartSlot]);
+      UpdateBufferInfoUavConstants(pDevice, stage, UAVStartSlot, NumUAVs);
+      UpdateBufferInfoConstants(pDevice, stage);
+   }
 }
 
 
@@ -1019,8 +1590,10 @@ SetDepthStencilState(D3D10DDI_HDEVICE hDevice,           // IN
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
-   void *state = CastPipeDepthStencilState(hState);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
+   void *state = hState.pDrvPrivate ?
+      CastPipeDepthStencilState(hState) : pDevice->default_depth_stencil_state;
    struct pipe_stencil_ref psr;
 
    psr.ref_value[0] = StencilRef;

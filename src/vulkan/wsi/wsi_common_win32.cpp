@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "util/cnd_monotonic.h"
+#include "util/log.h"
 #include "util/timespec.h"
 #include "util/u_thread.h"
 #include "vk_format.h"
@@ -38,6 +39,9 @@
 
 #define D3D12_IGNORE_SDK_LAYERS
 #include <dxgi1_4.h>
+#if defined(HAVE_YTTRIUM)
+#include <d3d11.h>
+#endif
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
 
@@ -75,6 +79,11 @@ struct wsi_win32_image {
    struct {
       ID3D12Resource *swapchain_res;
    } dxgi;
+#if defined(HAVE_YTTRIUM)
+   struct {
+      ID3D11Texture2D *texture;
+   } d3d11;
+#endif
    struct {
       HDC dc;
       HBITMAP bmp;
@@ -96,11 +105,35 @@ struct wsi_win32_surface {
    IDCompositionTarget *target;
    IDCompositionVisual *visual;
    struct wsi_win32_swapchain *current_swapchain;
+
+#if defined(HAVE_YTTRIUM)
+   /* The DXGI_SHARED path binds its swapchain to the HWND, and DXGI allows
+    * only one of those per window.  vkCreateSwapchainKHR with an oldSwapchain
+    * -- what a resize does -- builds the new swapchain before the old one is
+    * destroyed, so the old binding has to be dropped here or CreateSwapChain
+    * fails with E_ACCESSDENIED.
+    */
+   struct wsi_win32_swapchain *shared_swapchain;
+#endif
+};
+
+enum wsi_win32_present_path {
+   WSI_WIN32_PRESENT_GDI,
+   WSI_WIN32_PRESENT_DXGI_D3D12,
+#if defined(HAVE_YTTRIUM)
+   WSI_WIN32_PRESENT_DXGI_SHARED,
+#endif
 };
 
 struct wsi_win32_swapchain {
    struct wsi_swapchain         base;
+#if defined(HAVE_YTTRIUM)
+   HMODULE                    d3d11_mod;
+   ID3D11Device              *d3d11_device;
+   ID3D11DeviceContext       *d3d11_context;
+#endif
    IDXGISwapChain3            *dxgi;
+   enum wsi_win32_present_path present_path;
    struct wsi_win32           *wsi;
    wsi_win32_surface          *surface;
    mtx_t                      acquire_mutex;
@@ -186,7 +219,12 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
 
    caps->minImageCount = 1;
 
-   if (!wsi_device->sw && wsi_device->win32.get_d3d12_command_queue) {
+   if (!wsi_device->sw &&
+       (wsi_device->win32.get_d3d12_command_queue
+#if defined(HAVE_YTTRIUM)
+        || wsi_device->win32.create_image_memory_from_win32_handle
+#endif
+       )) {
       /* DXGI doesn't support random presenting order (images need to
        * be presented in the order they were acquired), so we can't
        * expose more than two image per swapchain.
@@ -387,7 +425,12 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
 {
    const VkPresentModeKHR *array;
    size_t array_size;
-   if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
+   if (wsi_device->sw ||
+       (!wsi_device->win32.get_d3d12_command_queue
+#if defined(HAVE_YTTRIUM)
+        && !wsi_device->win32.create_image_memory_from_win32_handle
+#endif
+       )) {
       array = present_modes_gdi;
       array_size = ARRAY_SIZE(present_modes_gdi);
    } else {
@@ -494,6 +537,82 @@ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
                               &chain->base.alloc, &image->memory);
 }
 
+#if defined(HAVE_YTTRIUM)
+static DXGI_FORMAT
+wsi_dxgi_format_from_vk(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_B8G8R8A8_UNORM:
+   case VK_FORMAT_B8G8R8A8_SRGB:
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
+   case VK_FORMAT_R8G8B8A8_UNORM:
+   case VK_FORMAT_R8G8B8A8_SRGB:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+   default:
+      return DXGI_FORMAT_UNKNOWN;
+   }
+}
+
+static VkResult
+wsi_create_dxgi_shared_image_mem(const struct wsi_swapchain *drv_chain,
+                                 const struct wsi_image_info *info,
+                                 struct wsi_image *image)
+{
+   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)drv_chain;
+   const struct wsi_device *wsi = chain->base.wsi;
+   struct wsi_win32_image *win32_image =
+      container_of(image, struct wsi_win32_image, base);
+
+   if (!chain->d3d11_device ||
+       !wsi->win32.create_image_memory_from_win32_handle)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   const DXGI_FORMAT format = wsi_dxgi_format_from_vk(info->create.format);
+   if (format == DXGI_FORMAT_UNKNOWN)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   D3D11_TEXTURE2D_DESC desc = {};
+   desc.Width = info->create.extent.width;
+   desc.Height = info->create.extent.height;
+   desc.MipLevels = 1;
+   desc.ArraySize = 1;
+   desc.Format = format;
+   desc.SampleDesc.Count = 1;
+   desc.Usage = D3D11_USAGE_DEFAULT;
+   desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+   desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+   HRESULT hr = chain->d3d11_device->CreateTexture2D(
+      &desc, NULL, &win32_image->d3d11.texture);
+   if (FAILED(hr))
+      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+   IDXGIResource *resource = NULL;
+   hr = win32_image->d3d11.texture->QueryInterface(IID_PPV_ARGS(&resource));
+   if (FAILED(hr)) {
+      win32_image->d3d11.texture->Release();
+      win32_image->d3d11.texture = NULL;
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   HANDLE handle = NULL;
+   hr = resource->GetSharedHandle(&handle);
+   resource->Release();
+   if (FAILED(hr) || !handle) {
+      win32_image->d3d11.texture->Release();
+      win32_image->d3d11.texture = NULL;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   VkMemoryRequirements reqs;
+   wsi->GetImageMemoryRequirements(chain->base.device, image->image, &reqs);
+
+   return wsi->win32.create_image_memory_from_win32_handle(
+      chain->base.device, image->image, handle, reqs.size, &chain->base.alloc,
+      &image->memory);
+}
+#endif
+
 enum wsi_swapchain_blit_type
 wsi_dxgi_image_needs_blit(const struct wsi_device *wsi,
                           const struct wsi_dxgi_image_params *params,
@@ -528,6 +647,48 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
    return VK_SUCCESS;
 }
 
+#if defined(HAVE_YTTRIUM)
+VkResult
+wsi_dxgi_shared_configure_image(const struct wsi_swapchain *chain,
+                                const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                const struct wsi_dxgi_shared_image_params *params,
+                                struct wsi_image_info *info)
+{
+   assert(params->base.image_type == WSI_IMAGE_TYPE_DXGI_SHARED);
+
+   VkResult result = wsi_configure_image(chain, pCreateInfo, 0, info);
+   if (result != VK_SUCCESS)
+      return result;
+
+   info->create_mem = wsi_create_dxgi_shared_image_mem;
+
+   /* This image aliases the memory of the D3D11 texture created in
+    * wsi_create_dxgi_shared_image_mem, so the two must agree on the layout of
+    * that one allocation.  Vulkan only defines aliasing between images created
+    * with VK_IMAGE_CREATE_ALIAS_BIT and otherwise identical parameters, so
+    * match what yttrium uses for a PIPE_BIND_SHARED texture.
+    *
+    * Tiling must be LINEAR on both sides.  With OPTIMAL, each driver picks a
+    * swizzle variant from its own heuristics; RADV chose different ones for
+    * the two images even with identical format, extent, usage and flags, and
+    * the sizes matched exactly (589824 is both a linear 384x384x4 surface and
+    * nine 64KB tiles) so the disagreement was invisible in the memory
+    * requirements.  Only ~78% of the two surfaces overlapped, and the
+    * presented image was scrambled at tile granularity.
+    */
+   info->create.tiling = VK_IMAGE_TILING_LINEAR;
+   info->create.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT |
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   info->create.flags &= ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                           VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+   info->create.flags |= VK_IMAGE_CREATE_ALIAS_BIT;
+
+   return VK_SUCCESS;
+}
+#endif
+
 static VkResult
 wsi_win32_image_init(VkDevice device_h,
                      struct wsi_win32_swapchain *chain,
@@ -544,7 +705,7 @@ wsi_win32_image_init(VkDevice device_h,
    chain->wnd = win32_surface->hwnd;
    image->chain = chain;
 
-   if (chain->dxgi)
+   if (chain->present_path != WSI_WIN32_PRESENT_GDI)
       return VK_SUCCESS;
 
    chain->chain_dc = GetDC(chain->wnd);
@@ -580,6 +741,10 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
 {
    if (image->dxgi.swapchain_res)
       image->dxgi.swapchain_res->Release();
+#if defined(HAVE_YTTRIUM)
+   if (image->d3d11.texture)
+      image->d3d11.texture->Release();
+#endif
 
    if (image->sw.dc)
       DeleteDC(image->sw.dc);
@@ -602,9 +767,21 @@ wsi_win32_swapchain_destroy(struct wsi_swapchain *drv_chain,
 
    if (chain->surface->current_swapchain == chain)
       chain->surface->current_swapchain = NULL;
+#if defined(HAVE_YTTRIUM)
+   if (chain->surface->shared_swapchain == chain)
+      chain->surface->shared_swapchain = NULL;
+#endif
 
    if (chain->dxgi)
       chain->dxgi->Release();
+#if defined(HAVE_YTTRIUM)
+   if (chain->d3d11_context)
+      chain->d3d11_context->Release();
+   if (chain->d3d11_device)
+      chain->d3d11_device->Release();
+   if (chain->d3d11_mod)
+      FreeLibrary(chain->d3d11_mod);
+#endif
 
    wsi_swapchain_finish(&chain->base);
 
@@ -629,12 +806,12 @@ static void
 wsi_win32_set_image_idle(struct wsi_win32_swapchain *chain,
                          struct wsi_win32_image *image)
 {
-   if (!chain->dxgi)
+   if (chain->present_path != WSI_WIN32_PRESENT_DXGI_D3D12)
       mtx_lock(&chain->acquire_mutex);
 
    image->state = WSI_IMAGE_IDLE;
 
-   if (!chain->dxgi) {
+   if (chain->present_path != WSI_WIN32_PRESENT_DXGI_D3D12) {
       u_cnd_monotonic_broadcast(&chain->acquire_cond);
       mtx_unlock(&chain->acquire_mutex);
    }
@@ -725,7 +902,7 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
       return chain->status;
 
    /* acquire timeout has to be explicitly handled for sw wsi */
-   if (!chain->dxgi)
+   if (chain->present_path != WSI_WIN32_PRESENT_DXGI_D3D12)
       return wsi_win32_acquire_idle_cpu_image(chain, info, image_index);
 
    if (wsi_win32_find_idle_image(chain, image_index))
@@ -793,6 +970,73 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
    return VK_SUCCESS;
 }
 
+#if defined(HAVE_YTTRIUM)
+static VkResult
+wsi_win32_queue_present_dxgi_shared(struct wsi_win32_swapchain *chain,
+                                    struct wsi_win32_image *image,
+                                    uint32_t image_index,
+                                    const VkPresentRegionKHR *damage)
+{
+   if (!chain->dxgi || !chain->d3d11_context || !image->d3d11.texture)
+      return VK_ERROR_SURFACE_LOST_KHR;
+
+   /* The shared D3D11 context cannot consume Venus synchronization objects.
+    * Wait for the WSI submission which consumed the application's present
+    * semaphores before copying the Vulkan image through DXGI_SHARED.
+    */
+   VkResult result = chain->wsi->wsi->WaitForFences(
+      chain->base.device, 1, &chain->base.fences[image_index], true,
+      UINT64_MAX);
+   if (result != VK_SUCCESS)
+      return result;
+
+   uint32_t index = chain->dxgi->GetCurrentBackBufferIndex();
+   ID3D11Texture2D *buffer = NULL;
+   HRESULT hres = chain->dxgi->GetBuffer(index, IID_PPV_ARGS(&buffer));
+   if (FAILED(hres))
+      return VK_ERROR_OUT_OF_DATE_KHR;
+
+   chain->d3d11_context->CopyResource(buffer, image->d3d11.texture);
+   buffer->Release();
+
+   uint32_t rect_count = damage ? damage->rectangleCount : 0;
+   STACK_ARRAY(RECT, rects, rect_count);
+
+   for (uint32_t r = 0; r < rect_count; r++) {
+      rects[r].left = damage->pRectangles[r].offset.x;
+      rects[r].top = damage->pRectangles[r].offset.y;
+      rects[r].right = damage->pRectangles[r].offset.x +
+                       damage->pRectangles[r].extent.width;
+      rects[r].bottom = damage->pRectangles[r].offset.y +
+                        damage->pRectangles[r].extent.height;
+   }
+
+   DXGI_PRESENT_PARAMETERS params = {
+      rect_count,
+      rects,
+   };
+   UINT sync_interval =
+      chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ? 1 : 0;
+   UINT present_flags =
+      chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ?
+      DXGI_PRESENT_ALLOW_TEARING : 0;
+
+   hres = chain->dxgi->Present1(sync_interval, present_flags, &params);
+   switch (hres) {
+   case DXGI_ERROR_DEVICE_REMOVED: return VK_ERROR_DEVICE_LOST;
+   case E_OUTOFMEMORY: return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+   default:
+      if (FAILED(hres))
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      break;
+   }
+
+   wsi_win32_set_image_idle(chain, image);
+   chain->status = VK_SUCCESS;
+   return VK_SUCCESS;
+}
+#endif
+
 static VkResult
 wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
                         uint32_t image_index,
@@ -805,8 +1049,13 @@ wsi_win32_queue_present(struct wsi_swapchain *drv_chain,
 
    assert(image->state == WSI_IMAGE_DRAWING);
 
-   if (chain->dxgi)
+   if (chain->present_path == WSI_WIN32_PRESENT_DXGI_D3D12)
       return wsi_win32_queue_present_dxgi(chain, image, damage);
+#if defined(HAVE_YTTRIUM)
+   if (chain->present_path == WSI_WIN32_PRESENT_DXGI_SHARED)
+      return wsi_win32_queue_present_dxgi_shared(chain, image, image_index,
+                                                  damage);
+#endif
 
    char *ptr = (char *)image->base.cpu_map;
    char *dptr = (char *)image->sw.ppvBits;
@@ -898,14 +1147,106 @@ wsi_win32_surface_create_swapchain_dxgi(
    return VK_SUCCESS;
 }
 
+#if defined(HAVE_YTTRIUM)
 static VkResult
-wsi_win32_surface_create_swapchain(
+wsi_win32_surface_create_swapchain_dxgi_shared(
+   wsi_win32_surface *surface,
+   VkDevice device,
+   struct wsi_win32 *wsi,
+   const VkSwapchainCreateInfoKHR *create_info,
+   struct wsi_win32_swapchain *chain)
+{
+   chain->d3d11_mod = LoadLibraryA("d3d11.dll");
+   if (!chain->d3d11_mod)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   PFN_D3D11_CREATE_DEVICE create_device =
+      (PFN_D3D11_CREATE_DEVICE)GetProcAddress(chain->d3d11_mod,
+                                              "D3D11CreateDevice");
+   if (!create_device)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   static const D3D_FEATURE_LEVEL feature_levels[] = {
+      D3D_FEATURE_LEVEL_11_0,
+      D3D_FEATURE_LEVEL_10_0,
+   };
+
+   /* Pair the device with the adapter the swapchain factory will use, rather
+    * than whatever the default happens to be.
+    */
+   IDXGIAdapter1 *adapter = NULL;
+   HRESULT hr = wsi->dxgi.factory->EnumAdapters1(0, &adapter);
+   if (FAILED(hr) || !adapter) {
+      if (adapter)
+         adapter->Release();
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   hr = create_device(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                      D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                      feature_levels, ARRAY_SIZE(feature_levels),
+                      D3D11_SDK_VERSION, &chain->d3d11_device,
+                      NULL, &chain->d3d11_context);
+   adapter->Release();
+   if (FAILED(hr))
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   /* Release any swapchain still bound to this HWND before binding a new one.
+    * On a resize the previous VkSwapchainKHR is passed as oldSwapchain and is
+    * not destroyed until after this call, but DXGI permits only one
+    * HWND-bound swapchain and fails the second with E_ACCESSDENIED.  The
+    * retired chain is not presentable afterwards, which is what oldSwapchain
+    * means -- queue_present already returns an error once dxgi is NULL.
+    */
+   if (surface->shared_swapchain && surface->shared_swapchain != chain) {
+      struct wsi_win32_swapchain *prev = surface->shared_swapchain;
+      if (prev->dxgi) {
+         prev->dxgi->Release();
+         prev->dxgi = NULL;
+      }
+   }
+   surface->shared_swapchain = chain;
+
+   DXGI_SWAP_CHAIN_DESC desc = {};
+   desc.BufferCount = create_info->minImageCount;
+   desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+   desc.BufferDesc.Format = wsi_dxgi_format_from_vk(create_info->imageFormat);
+   desc.BufferDesc.Width = create_info->imageExtent.width;
+   desc.BufferDesc.Height = create_info->imageExtent.height;
+   desc.SampleDesc.Count = 1;
+   desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+   desc.Windowed = true;
+   desc.OutputWindow = surface->base.hwnd;
+   desc.Flags = chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ?
+      DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0u;
+
+   if (desc.BufferDesc.Format == DXGI_FORMAT_UNKNOWN)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   IDXGISwapChain *swapchain = NULL;
+   hr = wsi->dxgi.factory->CreateSwapChain(chain->d3d11_device, &desc,
+                                           &swapchain);
+   if (FAILED(hr))
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   hr = swapchain->QueryInterface(IID_PPV_ARGS(&chain->dxgi));
+   swapchain->Release();
+   if (FAILED(hr))
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   return VK_SUCCESS;
+}
+#endif
+
+static VkResult
+wsi_win32_surface_create_swapchain_internal(
    VkIcdSurfaceBase *icd_surface,
    VkDevice device,
    struct wsi_device *wsi_device,
    const VkSwapchainCreateInfoKHR *create_info,
    const VkAllocationCallbacks *allocator,
-   struct wsi_swapchain **swapchain_out)
+   struct wsi_swapchain **swapchain_out,
+   bool allow_dxgi_shared)
 {
    wsi_win32_surface *surface = (wsi_win32_surface *)icd_surface;
    struct wsi_win32 *wsi =
@@ -941,15 +1282,31 @@ wsi_win32_surface_create_swapchain(
    };
    dxgi_image_params.storage_image = (create_info->imageUsage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
 
+#if defined(HAVE_YTTRIUM)
+   struct wsi_dxgi_shared_image_params dxgi_shared_image_params = {
+      { WSI_IMAGE_TYPE_DXGI_SHARED },
+   };
+#endif
+
    struct wsi_cpu_image_params cpu_image_params = {
       { WSI_IMAGE_TYPE_CPU },
    };
 
-   bool supports_dxgi = wsi->dxgi.factory &&
-                        wsi->dxgi.dcomp &&
-                        wsi->wsi->win32.get_d3d12_command_queue;
-   struct wsi_base_image_params *image_params = supports_dxgi ?
-      &dxgi_image_params.base : &cpu_image_params.base;
+   bool supports_dxgi_d3d12 = wsi->dxgi.factory &&
+                              wsi->dxgi.dcomp &&
+                              wsi->wsi->win32.get_d3d12_command_queue;
+#if defined(HAVE_YTTRIUM)
+   bool supports_dxgi_shared =
+      allow_dxgi_shared &&
+      wsi->dxgi.factory &&
+      wsi->wsi->win32.create_image_memory_from_win32_handle;
+#endif
+   struct wsi_base_image_params *image_params =
+      supports_dxgi_d3d12 ? &dxgi_image_params.base :
+#if defined(HAVE_YTTRIUM)
+      supports_dxgi_shared ? &dxgi_shared_image_params.base :
+#endif
+      &cpu_image_params.base;
 
    VkResult result = wsi_swapchain_init(wsi_device, &chain->base, device,
                                         create_info, image_params,
@@ -975,9 +1332,20 @@ wsi_win32_surface_create_swapchain(
    chain->surface = surface;
 
    if (image_params->image_type == WSI_IMAGE_TYPE_DXGI) {
+      chain->present_path = WSI_WIN32_PRESENT_DXGI_D3D12;
       result = wsi_win32_surface_create_swapchain_dxgi(surface, device, wsi, create_info, chain);
       if (result != VK_SUCCESS)
          goto fail;
+#if defined(HAVE_YTTRIUM)
+   } else if (image_params->image_type == WSI_IMAGE_TYPE_DXGI_SHARED) {
+      chain->present_path = WSI_WIN32_PRESENT_DXGI_SHARED;
+      result = wsi_win32_surface_create_swapchain_dxgi_shared(
+         surface, device, wsi, create_info, chain);
+      if (result != VK_SUCCESS)
+         goto fail;
+#endif
+   } else {
+      chain->present_path = WSI_WIN32_PRESENT_GDI;
    }
 
    for (uint32_t image = 0; image < num_images; image++) {
@@ -995,13 +1363,39 @@ wsi_win32_surface_create_swapchain(
    return VK_SUCCESS;
 
 fail:
-   if (surface->visual) {
+#if defined(HAVE_YTTRIUM)
+   bool retry_cpu = image_params->image_type == WSI_IMAGE_TYPE_DXGI_SHARED;
+#else
+   bool retry_cpu = false;
+#endif
+   if (image_params->image_type == WSI_IMAGE_TYPE_DXGI && surface->visual) {
       surface->visual->SetContent(NULL);
       surface->current_swapchain = NULL;
       wsi->dxgi.dcomp->Commit();
    }
    wsi_win32_swapchain_destroy(&chain->base, allocator);
+   if (retry_cpu) {
+      mesa_logw("wsi/win32: DXGI_SHARED swapchain failed (VkResult %d), "
+                "falling back to the GDI cpu path", (int)result);
+      return wsi_win32_surface_create_swapchain_internal(
+         icd_surface, device, wsi_device, create_info, allocator,
+         swapchain_out, false);
+   }
    return result;
+}
+
+static VkResult
+wsi_win32_surface_create_swapchain(
+   VkIcdSurfaceBase *icd_surface,
+   VkDevice device,
+   struct wsi_device *wsi_device,
+   const VkSwapchainCreateInfoKHR *create_info,
+   const VkAllocationCallbacks *allocator,
+   struct wsi_swapchain **swapchain_out)
+{
+   return wsi_win32_surface_create_swapchain_internal(
+      icd_surface, device, wsi_device, create_info, allocator, swapchain_out,
+      true);
 }
 
 static IDXGIFactory4 *
@@ -1084,13 +1478,15 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
          result = VK_ERROR_INITIALIZATION_FAILED;
          goto fail;
       }
+      /* DirectComposition is only required by the DXGI_D3D12 present path
+       * (supports_dxgi_d3d12 below tests for it).  DXGI_SHARED and GDI do not
+       * use it, so a missing dcomp device must not tear down the whole win32
+       * WSI -- that would leave the ICD with no swapchain support at all.
+       */
       wsi->dxgi.dcomp = dcomp_get_device();
-      if (!wsi->dxgi.dcomp) {
-         wsi->dxgi.factory->Release();
-         vk_free(alloc, wsi);
-         result = VK_ERROR_INITIALIZATION_FAILED;
-         goto fail;
-      }
+      if (!wsi->dxgi.dcomp)
+         mesa_logw("wsi/win32: no DirectComposition device; "
+                   "the DXGI_D3D12 present path is unavailable");
    }
 
    wsi->base.get_support = wsi_win32_surface_get_support;

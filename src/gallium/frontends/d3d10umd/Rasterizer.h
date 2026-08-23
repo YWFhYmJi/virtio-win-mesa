@@ -35,6 +35,10 @@
 
 #include "DriverIncludes.h"
 
+struct Device;
+
+void ApplyRasterizerState(Device *pDevice);
+
 void APIENTRY SetViewports(
    D3D10DDI_HDEVICE hDevice, UINT NumViewports, UINT ClearViewports,
    __in_ecount (NumViewports) const D3D10_DDI_VIEWPORT *pViewports);

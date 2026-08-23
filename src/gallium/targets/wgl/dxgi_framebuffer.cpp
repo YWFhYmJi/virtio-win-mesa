@@ -24,6 +24,7 @@
 /* This file provides driver-agnoistic way to display wgl window over dxgi swapchain. */
 
 #include "pipe/p_screen.h"
+#include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "util/format/u_formats.h"
 #include "util/u_debug.h"
@@ -34,7 +35,9 @@
 #include "stw_pixelformat.h"
 #include "stw_winsys.h"
 
+#if !defined(HAVE_YTTRIUM)
 #include "frontend/winsys_handle.h"
+#endif
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -54,6 +57,10 @@ struct wgl_dxgi_framebuffer {
    struct stw_winsys_framebuffer base;
 
    struct pipe_screen *screen;
+#if defined(HAVE_YTTRIUM)
+   struct pipe_context *pipe;
+   struct pipe_context *present_pipe;
+#endif
    enum pipe_format pformat;
    HWND window;
 
@@ -63,7 +70,9 @@ struct wgl_dxgi_framebuffer {
    ComPtr<IDXGISwapChain> swapchain;
 
    D3D11_TEXTURE2D_DESC textureDesc;
+#if !defined(HAVE_YTTRIUM)
    ComPtr<ID3D11Texture2D> d3d11_textures[NUM_BUFFERS];
+#endif
    struct pipe_resource *textures[NUM_BUFFERS];
 };
 
@@ -73,11 +82,34 @@ wgl_dxgi_framebuffer(struct stw_winsys_framebuffer *fb)
    return (struct wgl_dxgi_framebuffer *)fb;
 }
 
+#if defined(HAVE_YTTRIUM)
+static void
+wgl_dxgi_framebuffer_flush_pipe(struct pipe_context *ctx)
+{
+   struct pipe_fence_handle *fence = NULL;
+
+   if (!ctx || !ctx->flush)
+      return;
+
+   ctx->flush(ctx, &fence, PIPE_FLUSH_HINT_FINISH);
+   if (fence) {
+      ctx->screen->fence_finish(ctx->screen, ctx, fence, OS_TIMEOUT_INFINITE);
+      ctx->screen->fence_reference(ctx->screen, &fence, NULL);
+   }
+}
+#endif
+
 static void
 wgl_dxgi_framebuffer_destroy(struct stw_winsys_framebuffer *_fb,
                               struct pipe_context *ctx)
 {
    struct wgl_dxgi_framebuffer *fb = wgl_dxgi_framebuffer(_fb);
+
+#if defined(HAVE_YTTRIUM)
+   /* Ensure all resources are flushed before tearing down the framebuffer. */
+   wgl_dxgi_framebuffer_flush_pipe(ctx);
+   wgl_dxgi_framebuffer_flush_pipe(fb->present_pipe);
+#else
    struct pipe_fence_handle *fence = NULL;
 
    if (ctx) {
@@ -89,21 +121,31 @@ wgl_dxgi_framebuffer_destroy(struct stw_winsys_framebuffer *_fb,
          ctx->screen->fence_reference(ctx->screen, &fence, NULL);
       }
    }
+#endif
 
    for (int i = 0; i < NUM_BUFFERS; ++i) {
       if (fb->textures[i]) {
          pipe_resource_reference(&fb->textures[i], NULL);
       }
+#if !defined(HAVE_YTTRIUM)
       if (fb->d3d11_textures[i]) {
          fb->d3d11_textures[i].Reset();
       }
+#endif
    }
+
+#if defined(HAVE_YTTRIUM)
+   if (fb->present_pipe) {
+      fb->present_pipe->destroy(fb->present_pipe);
+   }
+#endif
 
    fb->context.Reset();
    fb->swapchain.Reset();
    fb->device.Reset();
 
-   FreeLibrary(fb->d3d11);
+   if (fb->d3d11)
+      FreeLibrary(fb->d3d11);
 
    free(fb);
 }
@@ -153,16 +195,39 @@ wgl_dxgi_framebuffer_resize(struct stw_winsys_framebuffer *_fb,
    static const D3D_FEATURE_LEVEL FeatureLevels[] = {D3D_FEATURE_LEVEL_10_0};
 
    fb->pformat = templ->format;
+#if defined(HAVE_YTTRIUM)
+   fb->pipe = ctx;
+#endif
 
    if (!fb->swapchain) {
       PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN createDeviceAndSwapchain =
          (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(
             fb->d3d11, "D3D11CreateDeviceAndSwapChain");
 
+#if MESA_DEBUG
+      UINT create_flags = D3D11_CREATE_DEVICE_DEBUG;
+#else
+      UINT create_flags = 0;
+#endif
+
       HRESULT hr = createDeviceAndSwapchain(
-         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_DEBUG,
+         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
          FeatureLevels, _countof(FeatureLevels), D3D11_SDK_VERSION, &desc,
          &fb->swapchain, &fb->device, NULL, &fb->context);
+
+#if MESA_DEBUG
+      if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING) {
+         _debug_printf("WARNING: WGL DXGI framebuffer could not load the "
+                       "D3D11 debug layer (DXGI_ERROR_SDK_COMPONENT_MISSING); "
+                       "retrying device creation without "
+                       "D3D11_CREATE_DEVICE_DEBUG\n");
+         create_flags = 0;
+         hr = createDeviceAndSwapchain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, create_flags,
+            FeatureLevels, _countof(FeatureLevels), D3D11_SDK_VERSION, &desc,
+            &fb->swapchain, &fb->device, NULL, &fb->context);
+      }
+#endif
 
       if (FAILED(hr)) {
          _debug_printf("Failed to create framebuffer dxgi device: %x\n", hr);
@@ -178,16 +243,61 @@ wgl_dxgi_framebuffer_resize(struct stw_winsys_framebuffer *_fb,
 
    for (int i = 0; i < NUM_BUFFERS; ++i) {
       pipe_resource_reference(&fb->textures[i], NULL);
+#if !defined(HAVE_YTTRIUM)
       if (fb->d3d11_textures[i]) {
          fb->d3d11_textures[i].Reset();
       }
+#endif
    }
 
    ComPtr<ID3D11Texture2D> swapchainBuffer;
    fb->swapchain->GetBuffer(0, IID_D3D11Texture2D, &swapchainBuffer);
    swapchainBuffer->GetDesc(&fb->textureDesc);
+#if !defined(HAVE_YTTRIUM)
    fb->textureDesc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED;
+#endif
 }
+
+#if defined(HAVE_YTTRIUM)
+static bool
+wgl_dxgi_framebuffer_upload_present(struct wgl_dxgi_framebuffer *fb,
+                                    struct pipe_resource *res)
+{
+   struct pipe_context *pipe = fb->present_pipe;
+   if (!pipe)
+      pipe = fb->pipe;
+
+   if (!pipe || !res) {
+      debug_printf("Cannot present; no pipe resource\n");
+      return false;
+   }
+   if (!pipe->texture_map || !pipe->texture_unmap) {
+      debug_printf("Cannot present; pipe context has no texture transfer hooks\n");
+      return false;
+   }
+
+   struct pipe_box box;
+   memset(&box, 0, sizeof(box));
+   box.width = res->width0;
+   box.height = res->height0;
+   box.depth = 1;
+
+   struct pipe_transfer *transfer = NULL;
+   void *map = pipe->texture_map(pipe, res, 0, PIPE_MAP_READ, &box, &transfer);
+   if (!map || !transfer) {
+      debug_printf("Cannot present; failed to map pipe resource\n");
+      return false;
+   }
+
+   ComPtr<ID3D11Texture2D> buffer;
+   fb->swapchain->GetBuffer(0, IID_D3D11Texture2D, &buffer);
+   fb->context->UpdateSubresource(buffer.Get(), 0, NULL, map,
+                                  transfer->stride, 0);
+   pipe->texture_unmap(pipe, transfer);
+
+   return true;
+}
+#endif
 
 static bool
 wgl_dxgi_framebuffer_present(struct stw_winsys_framebuffer *_fb, int interval,
@@ -199,6 +309,10 @@ wgl_dxgi_framebuffer_present(struct stw_winsys_framebuffer *_fb, int interval,
       return false;
    }
 
+#if defined(HAVE_YTTRIUM)
+   if (!wgl_dxgi_framebuffer_upload_present(fb, res))
+      return false;
+#else
    ComPtr<ID3D11Texture2D> buffer;
    fb->swapchain->GetBuffer(0, IID_D3D11Texture2D, &buffer);
 
@@ -209,11 +323,31 @@ wgl_dxgi_framebuffer_present(struct stw_winsys_framebuffer *_fb, int interval,
 
       fb->context->CopyResource(buffer.Get(), fb->d3d11_textures[i].Get());
    }
+#endif
 
    return S_OK == fb->swapchain->Present(
                      interval < 1 ? 0 : interval,
                      interval < 1 ? DXGI_PRESENT_ALLOW_TEARING : 0);
 }
+
+#if defined(HAVE_YTTRIUM)
+static struct pipe_resource *
+wgl_dxgi_framebuffer_create_upload_resource(struct wgl_dxgi_framebuffer *fb)
+{
+   struct pipe_resource templ;
+   memset(&templ, 0, sizeof(templ));
+   templ.target = PIPE_TEXTURE_2D;
+   templ.format = fb->pformat;
+   templ.width0 = fb->textureDesc.Width;
+   templ.height0 = fb->textureDesc.Height;
+   templ.depth0 = 1;
+   templ.array_size = 1;
+   templ.last_level = 0;
+   templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+
+   return fb->screen->resource_create(fb->screen, &templ);
+}
+#endif
 
 static struct pipe_resource *
 wgl_dxgi_framebuffer_get_resource(struct stw_winsys_framebuffer *pframebuffer,
@@ -230,6 +364,12 @@ wgl_dxgi_framebuffer_get_resource(struct stw_winsys_framebuffer *pframebuffer,
       return fb->textures[index];
    }
 
+#if defined(HAVE_YTTRIUM)
+   fb->textures[index] = wgl_dxgi_framebuffer_create_upload_resource(fb);
+   if (fb->textures[index])
+      pipe_reference(NULL, &fb->textures[index]->reference);
+   return fb->textures[index];
+#else
    HRESULT hr = fb->device->CreateTexture2D(&fb->textureDesc, 0,
                                             &fb->d3d11_textures[index]);
    if (FAILED(hr)) {
@@ -257,6 +397,7 @@ wgl_dxgi_framebuffer_get_resource(struct stw_winsys_framebuffer *pframebuffer,
    if (texture)
       pipe_reference(NULL, &texture->reference);
    return texture;
+#endif
 }
 
 extern "C" {
@@ -282,6 +423,16 @@ wgl_create_dxgi_framebuffer(struct pipe_screen *screen, HWND hWnd,
       return NULL;
 
    fb->d3d11 = LoadLibraryA("d3d11.dll");
+
+#if defined(HAVE_YTTRIUM)
+   fb->present_pipe = screen->context_create(screen, NULL, 0);
+   if (!fb->present_pipe) {
+      if (fb->d3d11)
+         FreeLibrary(fb->d3d11);
+      free(fb);
+      return NULL;
+   }
+#endif
 
    fb->window = hWnd;
    fb->screen = screen;

@@ -428,7 +428,15 @@ stw_st_flush(struct st_context *st,
    args.stwfb = stwfb;
    args.flags = flags;
 
-   if (flags & ST_FLUSH_END_OF_FRAME && !stwfb->fb->winsys_framebuffer)
+   const bool kopper_drawable =
+      stw_dev->zink && stw_dev->screen->resource_create_drawable;
+
+   /* Kopper orders presentation with the Vulkan semaphore produced by the
+    * frame submission.  Waiting for GPU completion here unnecessarily makes
+    * every Zink SwapBuffers synchronous.
+    */
+   if (flags & ST_FLUSH_END_OF_FRAME &&
+       !stwfb->fb->winsys_framebuffer && !kopper_drawable)
       flags |= ST_FLUSH_WAIT;
 
    if (flags & ST_FLUSH_WAIT)

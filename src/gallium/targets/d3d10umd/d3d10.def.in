@@ -1,4 +1,5 @@
 ; stdcall calling convention have @number suffix on 32 bits architecture for gcc
+OpenAdapter@4
 OpenAdapter10@4
 OpenAdapter10_2@4
 D3DKMTAcquireKeyedMutex@4

@@ -1,0 +1,19 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Ake Rehnman <ake.rehnman@gmail.com>
+ * SPDX-License-Identifier: MPL-2.0
+ */
+
+#include "yttrium_venus2.h"
+#include "yttrium_venus_backend.h"
+
+#define YTTRIUM_VENUS_BACKEND_NAME "venus2"
+#define YTTRIUM_VENUS_BACKEND_SYM(name) yttrium_venus2_##name
+#define YTTRIUM_VENUS_BACKEND_HAS_CLEAR_DISPLAY_RECT 1
+#define YTTRIUM_VENUS_BACKEND_HAS_FRAMEBUFFER_COLOR_SAMPLE_COUNTS 1
+#define YTTRIUM_VENUS_BACKEND_HAS_SAMPLED_TEXTURE_FORMAT_CAPS 1
+#include "yttrium_venus_backend_adapter.h"
+#undef YTTRIUM_VENUS_BACKEND_HAS_SAMPLED_TEXTURE_FORMAT_CAPS
+#undef YTTRIUM_VENUS_BACKEND_HAS_FRAMEBUFFER_COLOR_SAMPLE_COUNTS
+#undef YTTRIUM_VENUS_BACKEND_HAS_CLEAR_DISPLAY_RECT
+#undef YTTRIUM_VENUS_BACKEND_SYM
+#undef YTTRIUM_VENUS_BACKEND_NAME

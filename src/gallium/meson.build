@@ -44,6 +44,11 @@ if with_platform_windows
 else
   libwsgdi = null_dep
 endif
+if with_platform_windows and with_gallium_st_d3d10umd and with_gallium_yttrium
+  subdir('winsys/yttrium/gdi')
+else
+  winsys_yttrium_gdi = declare_dependency()
+endif
 subdir('winsys/sw/wrapper')
 if with_platform_haiku
   subdir('winsys/sw/hgl')

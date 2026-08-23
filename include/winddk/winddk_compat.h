@@ -134,7 +134,7 @@
 #define __drv_maxIRQL(x) /**/
 #endif
 
-#ifdef __MINGW32__
+#if defined(__MINGW32__) && !defined(__GNUC__)
 #define __inline static __inline__
 #endif
 

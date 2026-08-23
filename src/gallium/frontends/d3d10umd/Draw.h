@@ -47,6 +47,14 @@ void APIENTRY DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice, UINT IndexCountPerI
                           UINT InstanceCount, UINT StartIndexLocation,
                           INT BaseVertexLocation, UINT StartInstanceLocation);
 
+void APIENTRY DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hDevice,
+                                           D3D10DDI_HRESOURCE hBufferForArgs,
+                                           UINT AlignedByteOffsetForArgs);
+
+void APIENTRY DrawInstancedIndirect(D3D10DDI_HDEVICE hDevice,
+                                    D3D10DDI_HRESOURCE hBufferForArgs,
+                                    UINT AlignedByteOffsetForArgs);
+
 void APIENTRY DrawAuto(D3D10DDI_HDEVICE hDevice);
 
 #endif

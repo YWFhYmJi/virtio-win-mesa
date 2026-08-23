@@ -47,6 +47,20 @@ following once:
 
 See also <https://docs.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order>
 
+## Yttrium configuration
+
+Yttrium options read through `yttrium_gdi_debug_get_option()` first consult the
+process environment and then `C:\ProgramData\Yttrium\yttrium.ini`.  An
+environment value therefore overrides the matching INI value for that process.
+The INI file is loaded once in each process; changing it does not reconfigure an
+already running application.
+
+`D3D10UMD_YTTRIUM_DRAW_ARENA_BAR` is disabled by default.  When enabled, the
+transient vertex and index arenas first prefer host-visible, coherent,
+device-local memory and retain the compatible-memory fallback.  The option may
+be set either in the process environment or in `yttrium.ini`; use a process
+environment override for isolated comparisons.
+
 ## Building with MSVC
 
 Install Windows SDK 10.0.26100.0 and Windows DDK 10.0.26100.0 with MSVC and use it, other version of Windows SDK/DDK

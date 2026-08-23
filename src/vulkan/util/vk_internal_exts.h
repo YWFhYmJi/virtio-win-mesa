@@ -63,6 +63,14 @@ struct wsi_memory_allocate_info {
     bool dma_buf_sync_file;
 };
 
+#if defined(HAVE_YTTRIUM)
+struct wsi_memory_win32_handle_import_info {
+    VkStructureType sType;
+    const void *pNext;
+    void *handle;
+};
+#endif
+
 /* To be chained into VkSurfaceCapabilities2KHR */
 struct wsi_surface_supported_counters {
    VkStructureType sType;
@@ -79,6 +87,10 @@ struct wsi_surface_supported_counters {
    (VkStructureType)1000001002
 #define VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA \
    (VkStructureType)1000001003
+#if defined(HAVE_YTTRIUM)
+#define VK_STRUCTURE_TYPE_WSI_MEMORY_WIN32_HANDLE_IMPORT_INFO_MESA \
+   (VkStructureType)1000001004
+#endif
 #define VK_STRUCTURE_TYPE_WSI_SURFACE_SUPPORTED_COUNTERS_MESA \
    (VkStructureType)1000001005
 
@@ -86,6 +98,10 @@ struct wsi_surface_supported_counters {
    struct wsi_image_create_info
 #define VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA_cast \
    struct wsi_memory_allocate_info
+#if defined(HAVE_YTTRIUM)
+#define VK_STRUCTURE_TYPE_WSI_MEMORY_WIN32_HANDLE_IMPORT_INFO_MESA_cast \
+   struct wsi_memory_win32_handle_import_info
+#endif
 #define VK_STRUCTURE_TYPE_WSI_SURFACE_SUPPORTED_COUNTERS_MESA_cast \
    struct wsi_surface_supported_counters
 

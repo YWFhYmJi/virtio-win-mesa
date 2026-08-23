@@ -33,6 +33,8 @@
 #include "Debug.h"
 #include "ShaderParse.h"
 
+#include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+
 #include "util/u_memory.h"
 
 
@@ -56,6 +58,11 @@ Shader_parse_init(struct Shader_parser *parser,
 #define OP_TEST_BOOLEAN (1 << 2) /* test boolean in opcode specific control */
 #define OP_DCL (1 << 3) /* custom opcode specific control */
 #define OP_RESINFO_RET_TYPE (1 << 4) /* return type for resinfo */
+#define OP_IGNORE_CONTROL (1 << 5) /* opcode-specific bits are handled elsewhere */
+
+#ifndef D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL
+#define D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL 0x2
+#endif
 
 struct dx10_opcode_info {
    D3D10_SB_OPCODE_TYPE type;
@@ -177,10 +184,156 @@ opcode_info[D3D10_SB_NUM_OPCODES] = {
    {_(D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP),               0, 0, OP_DCL},
    {_(D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS),                 0, 0, OP_DCL},
    {_(D3D10_SB_OPCODE_RESERVED0),                        0, 0, OP_NOT_DONE},
-   {_(D3D10_1_SB_OPCODE_LOD),                            0, 0, OP_NOT_DONE},
-   {_(D3D10_1_SB_OPCODE_GATHER4),                        0, 0, OP_NOT_DONE},
-   {_(D3D10_1_SB_OPCODE_SAMPLE_POS),                     0, 0, OP_NOT_DONE},
-   {_(D3D10_1_SB_OPCODE_SAMPLE_INFO),                    0, 0, OP_NOT_DONE}
+   {_(D3D10_1_SB_OPCODE_LOD),                            1, 3, 0},
+   {_(D3D10_1_SB_OPCODE_GATHER4),                        1, 3, 0},
+   {_(D3D10_1_SB_OPCODE_SAMPLE_POS),                     1, 2, 0},
+   {_(D3D10_1_SB_OPCODE_SAMPLE_INFO),                    1, 1, OP_IGNORE_CONTROL},
+   [D3D11_SB_OPCODE_EMIT_STREAM] = {
+      _(D3D11_SB_OPCODE_EMIT_STREAM),                    0, 0, 0},
+   [D3D11_SB_OPCODE_CUT_STREAM] = {
+      _(D3D11_SB_OPCODE_CUT_STREAM),                     0, 0, 0},
+   [D3D11_SB_OPCODE_EMITTHENCUT_STREAM] = {
+      _(D3D11_SB_OPCODE_EMITTHENCUT_STREAM),             0, 0, 0},
+   [D3D11_SB_OPCODE_DCL_STREAM] = {
+      _(D3D11_SB_OPCODE_DCL_STREAM),                     0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_HS_DECLS] = {
+      _(DX11_SM5_OPCODE_HS_DECLS),                        0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_HS_CONTROL_POINT_PHASE] = {
+      _(DX11_SM5_OPCODE_HS_CONTROL_POINT_PHASE),          0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_HS_FORK_PHASE] = {
+      _(DX11_SM5_OPCODE_HS_FORK_PHASE),                   0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_HS_JOIN_PHASE] = {
+      _(DX11_SM5_OPCODE_HS_JOIN_PHASE),                   0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT] = {
+      _(DX11_SM5_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT),   0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT] = {
+      _(DX11_SM5_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT),  0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_TESS_DOMAIN] = {
+      _(DX11_SM5_OPCODE_DCL_TESS_DOMAIN),                 0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_TESS_PARTITIONING] = {
+      _(DX11_SM5_OPCODE_DCL_TESS_PARTITIONING),           0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE] = {
+      _(DX11_SM5_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE),       0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_HS_MAX_TESSFACTOR] = {
+      _(DX11_SM5_OPCODE_DCL_HS_MAX_TESSFACTOR),           0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT] = {
+      _(DX11_SM5_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT), 0, 0, OP_DCL},
+   [DX11_SM5_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT] = {
+      _(DX11_SM5_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT), 0, 0, OP_DCL},
+   [D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED] = {
+      _(D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED), 1, 0, OP_DCL},
+   [D3D11_SB_OPCODE_LD_UAV_TYPED] = {
+      _(D3D11_SB_OPCODE_LD_UAV_TYPED),                  1, 2, 0},
+   [D3D11_SB_OPCODE_STORE_UAV_TYPED] = {
+      _(D3D11_SB_OPCODE_STORE_UAV_TYPED),               1, 2, 0},
+   [D3D11_SB_OPCODE_GATHER4_C] = {
+      _(D3D11_SB_OPCODE_GATHER4_C),                     1, 4, 0},
+   [D3D11_SB_OPCODE_GATHER4_PO] = {
+      _(D3D11_SB_OPCODE_GATHER4_PO),                    1, 4, 0},
+   [D3D11_SB_OPCODE_GATHER4_PO_C] = {
+      _(D3D11_SB_OPCODE_GATHER4_PO_C),                  1, 5, 0},
+   [DX10_SM5_OPCODE_DCL_THREAD_GROUP] = {
+      _(DX10_SM5_OPCODE_DCL_THREAD_GROUP),              0, 0, OP_DCL},
+   [DX10_SM5_OPCODE_DCL_UAV_RAW] = {
+      _(DX10_SM5_OPCODE_DCL_UAV_RAW),                   1, 0, OP_DCL},
+   [DX10_SM5_OPCODE_DCL_UAV_STRUCTURED] = {
+      _(DX10_SM5_OPCODE_DCL_UAV_STRUCTURED),            1, 0, OP_DCL},
+   [DX10_SM5_OPCODE_DCL_TGSM_RAW] = {
+      _(DX10_SM5_OPCODE_DCL_TGSM_RAW),                  1, 0, OP_DCL},
+   [DX10_SM5_OPCODE_DCL_TGSM_STRUCTURED] = {
+      _(DX10_SM5_OPCODE_DCL_TGSM_STRUCTURED),           1, 0, OP_DCL},
+   [DX10_SM5_OPCODE_DCL_RESOURCE_RAW] = {
+      _(DX10_SM5_OPCODE_DCL_RESOURCE_RAW),              1, 0, OP_DCL},
+   [DX10_SM5_OPCODE_DCL_RESOURCE_STRUCTURED] = {
+      _(DX10_SM5_OPCODE_DCL_RESOURCE_STRUCTURED),       1, 0, OP_DCL},
+   [DX10_SM5_OPCODE_LD_RAW] = {
+      _(DX10_SM5_OPCODE_LD_RAW),                        1, 2, 0},
+   [DX10_SM5_OPCODE_STORE_RAW] = {
+      _(DX10_SM5_OPCODE_STORE_RAW),                     1, 2, 0},
+   [DX10_SM5_OPCODE_LD_STRUCTURED] = {
+      _(DX10_SM5_OPCODE_LD_STRUCTURED),                 1, 3, 0},
+   [DX10_SM5_OPCODE_STORE_STRUCTURED] = {
+      _(DX10_SM5_OPCODE_STORE_STRUCTURED),              1, 3, 0},
+   [DX10_SM5_OPCODE_ATOMIC_AND] = {
+      _(DX10_SM5_OPCODE_ATOMIC_AND),                    1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_OR] = {
+      _(DX10_SM5_OPCODE_ATOMIC_OR),                     1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_XOR] = {
+      _(DX10_SM5_OPCODE_ATOMIC_XOR),                    1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_CMP_STORE] = {
+      _(DX10_SM5_OPCODE_ATOMIC_CMP_STORE),              1, 3, 0},
+   [DX10_SM5_OPCODE_ATOMIC_IADD] = {
+      _(DX10_SM5_OPCODE_ATOMIC_IADD),                   1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_IMAX] = {
+      _(DX10_SM5_OPCODE_ATOMIC_IMAX),                   1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_IMIN] = {
+      _(DX10_SM5_OPCODE_ATOMIC_IMIN),                   1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_UMAX] = {
+      _(DX10_SM5_OPCODE_ATOMIC_UMAX),                   1, 2, 0},
+   [DX10_SM5_OPCODE_ATOMIC_UMIN] = {
+      _(DX10_SM5_OPCODE_ATOMIC_UMIN),                   1, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_ALLOC] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_ALLOC),              2, 0, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_CONSUME),            2, 0, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_IADD] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_IADD),               2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_AND] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_AND),                2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_OR] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_OR),                 2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_XOR] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_XOR),                2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_EXCH] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_EXCH),               2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_CMP_EXCH] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_CMP_EXCH),           2, 3, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_IMAX] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_IMAX),               2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_IMIN] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_IMIN),               2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_UMAX] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_UMAX),               2, 2, 0},
+   [DX10_SM5_OPCODE_IMM_ATOMIC_UMIN] = {
+      _(DX10_SM5_OPCODE_IMM_ATOMIC_UMIN),               2, 2, 0},
+   [DX10_SM5_OPCODE_SYNC] = {
+      _(DX10_SM5_OPCODE_SYNC),                          0, 0, OP_IGNORE_CONTROL},
+   [DX10_SM5_OPCODE_BUFINFO] = {
+      _(DX10_SM5_OPCODE_BUFINFO),                       1, 1, 0},
+   [DX10_SM5_OPCODE_DERIV_RTX_COARSE] = {
+      _(DX10_SM5_OPCODE_DERIV_RTX_COARSE),             1, 1, OP_SATURATE},
+   [DX10_SM5_OPCODE_DERIV_RTX_FINE] = {
+      _(DX10_SM5_OPCODE_DERIV_RTX_FINE),               1, 1, OP_SATURATE},
+   [DX10_SM5_OPCODE_DERIV_RTY_COARSE] = {
+      _(DX10_SM5_OPCODE_DERIV_RTY_COARSE),             1, 1, OP_SATURATE},
+   [DX10_SM5_OPCODE_DERIV_RTY_FINE] = {
+      _(DX10_SM5_OPCODE_DERIV_RTY_FINE),               1, 1, OP_SATURATE},
+   [DX10_SM5_OPCODE_RCP] = {
+      _(DX10_SM5_OPCODE_RCP),                          1, 1, OP_SATURATE},
+   [DX10_SM5_OPCODE_F32TOF16] = {
+      _(DX10_SM5_OPCODE_F32TOF16),                       1, 1, 0},
+   [DX10_SM5_OPCODE_F16TOF32] = {
+      _(DX10_SM5_OPCODE_F16TOF32),                       1, 1, 0},
+   [DX10_SM5_OPCODE_COUNTBITS] = {
+      _(DX10_SM5_OPCODE_COUNTBITS),                      1, 1, 0},
+   [DX10_SM5_OPCODE_FIRSTBIT_HI] = {
+      _(DX10_SM5_OPCODE_FIRSTBIT_HI),                    1, 1, 0},
+   [DX10_SM5_OPCODE_FIRSTBIT_LO] = {
+      _(DX10_SM5_OPCODE_FIRSTBIT_LO),                    1, 1, 0},
+   [DX10_SM5_OPCODE_FIRSTBIT_SHI] = {
+      _(DX10_SM5_OPCODE_FIRSTBIT_SHI),                   1, 1, 0},
+   [DX10_SM5_OPCODE_UBFE] = {
+      _(DX10_SM5_OPCODE_UBFE),                           1, 3, 0},
+   [DX10_SM5_OPCODE_IBFE] = {
+      _(DX10_SM5_OPCODE_IBFE),                           1, 3, 0},
+   [DX10_SM5_OPCODE_BFI] = {
+      _(DX10_SM5_OPCODE_BFI),                            1, 4, 0},
+   [DX10_SM5_OPCODE_BFREV] = {
+      _(DX10_SM5_OPCODE_BFREV),                          1, 1, 0},
+   [DX10_SM5_OPCODE_SWAPC] = {
+      _(DX10_SM5_OPCODE_SWAPC),                          2, 3, 0},
+   [D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT] = {
+      _(D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT),          0, 0, OP_DCL}
 };
 
 #undef _
@@ -281,6 +434,19 @@ parse_operand_index(const unsigned **curr,
    }
 }
 
+static void
+parse_stream_operand(const unsigned **curr,
+                     struct Shader_opcode *opcode)
+{
+   struct Shader_operand stream;
+
+   parse_operand(curr, &stream);
+   assert(stream.index_dim == 1);
+   parse_operand_index(curr, &stream);
+
+   opcode->specific.stream = stream.index[0].imm;
+}
+
 bool
 Shader_parse_opcode(struct Shader_parser *parser,
                          struct Shader_opcode *opcode)
@@ -330,6 +496,7 @@ Shader_parse_opcode(struct Shader_parser *parser,
    /* Opcode specific. */
    switch (opcode->type) {
    case D3D10_SB_OPCODE_DCL_RESOURCE:
+   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
       opcode->specific.dcl_resource_dimension = DECODE_D3D10_SB_RESOURCE_DIMENSION(*curr);
       break;
    case D3D10_SB_OPCODE_DCL_SAMPLER:
@@ -346,7 +513,32 @@ Shader_parse_opcode(struct Shader_parser *parser,
       opcode->specific.dcl_in_ps_interp = DECODE_D3D10_SB_INPUT_INTERPOLATION_MODE(*curr);
       break;
    case D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS:
-      opcode->specific.global_flags.refactoring_allowed = DECODE_D3D10_SB_GLOBAL_FLAGS(*curr) ? 1 : 0;
+      opcode->specific.global_flags.refactoring_allowed =
+         (DECODE_D3D10_SB_GLOBAL_FLAGS(*curr) &
+          D3D10_SB_GLOBAL_FLAG_REFACTORING_ALLOWED) ? 1 : 0;
+      opcode->specific.global_flags.force_early_depth_stencil =
+         (DECODE_D3D10_SB_GLOBAL_FLAGS(*curr) &
+          D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL) ? 1 : 0;
+      break;
+   case DX10_SM5_OPCODE_DCL_THREAD_GROUP:
+      opcode->specific.dcl_thread_group.x = curr[1];
+      opcode->specific.dcl_thread_group.y = curr[2];
+      opcode->specific.dcl_thread_group.z = curr[3];
+      break;
+   case DX11_SM5_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT:
+      opcode->specific.dcl_input_control_point_count = (*curr >> 11) & 0x3f;
+      break;
+   case DX11_SM5_OPCODE_DCL_OUTPUT_CONTROL_POINT_COUNT:
+      opcode->specific.dcl_output_control_point_count = (*curr >> 11) & 0x3f;
+      break;
+   case DX11_SM5_OPCODE_DCL_TESS_DOMAIN:
+      opcode->specific.dcl_tess_domain = (*curr >> 11) & 0x3;
+      break;
+   case DX11_SM5_OPCODE_DCL_TESS_PARTITIONING:
+      opcode->specific.dcl_tess_partitioning = (*curr >> 11) & 0x7;
+      break;
+   case DX11_SM5_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE:
+      opcode->specific.dcl_tess_output_primitive = (*curr >> 11) & 0x7;
       break;
    default:
       /* Parse opcode-specific control bits */
@@ -361,6 +553,8 @@ Shader_parse_opcode(struct Shader_parser *parser,
       } else if (info->flags & OP_RESINFO_RET_TYPE) {
          opcode->specific.resinfo_ret_type =
             DECODE_D3D10_SB_RESINFO_INSTRUCTION_RETURN_TYPE(*curr);
+      } else if (info->flags & OP_IGNORE_CONTROL) {
+         /* no-op */
       } else {
          /* Warn if there are bits set in the opcode-specific controls (bits 23:11 inclusive)*/
          if (*curr & ((1 << 24) - (1 << 11))) {
@@ -373,7 +567,14 @@ Shader_parse_opcode(struct Shader_parser *parser,
 
    /* Opcode length in DWORDs. */
    length = DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(*curr);
-   assert(curr + length <= parser->code + parser->header.size);
+   if (curr + length > parser->code + parser->header.size) {
+      yttrium_gdi_trace_warnf("yttrium: shader parse instruction length out of bounds opcode=%s type=%u offset=%u length=%u shader_size=%u\n",
+                              info->name, opcode->type,
+                              (unsigned)(curr - parser->code), length,
+                              parser->header.size);
+      assert(0);
+      return false;
+   }
 
    /* Opcode specific fields in token0. */
    switch (opcode->type) {
@@ -389,10 +590,12 @@ Shader_parse_opcode(struct Shader_parser *parser,
 
    curr++;
 
-   if (opcode_is_extended) {
+   while (opcode_is_extended) {
       /* NOTE: DECODE_IS_D3D10_SB_OPCODE_DOUBLE_EXTENDED is broken.
        */
-      assert(!((*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >> D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT));
+      opcode_is_extended =
+         (*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >>
+         D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT;
 
       switch (DECODE_D3D10_SB_EXTENDED_OPCODE_TYPE(*curr)) {
       case D3D10_SB_EXTENDED_OPCODE_EMPTY:
@@ -402,6 +605,9 @@ Shader_parse_opcode(struct Shader_parser *parser,
          opcode->imm_texel_offset.v = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_V, *curr);
          opcode->imm_texel_offset.w = DECODE_IMMEDIATE_D3D10_SB_ADDRESS_OFFSET(D3D10_SB_IMMEDIATE_ADDRESS_OFFSET_W, *curr);
          break;
+      case D3D11_SB_EXTENDED_OPCODE_RESOURCE_DIM:
+      case D3D11_SB_EXTENDED_OPCODE_RESOURCE_RETURN_TYPE:
+         break;
       default:
          assert(0);
       }
@@ -410,14 +616,13 @@ Shader_parse_opcode(struct Shader_parser *parser,
    }
 
    if (info->flags & OP_NOT_DONE) {
-      /* XXX: Need to figure out the number of operands for this opcode.
-       *      Should be okay to continue execution -- we have enough info
-       *      to skip to the next instruction.
-       */
-      LOG_UNSUPPORTED(true);
-      opcode->num_dst = 0;
-      opcode->num_src = 0;
-      goto skip;
+      yttrium_gdi_trace_warnf("yttrium: shader parse unsupported opcode opcode=%s type=%u offset=%u length=%u\n",
+                              info->name ? info->name : "(null)",
+                              opcode->type,
+                              (unsigned)(parser->curr - parser->code),
+                              length);
+      assert(0);
+      return false;
    }
 
    opcode->num_dst = info->num_dst;
@@ -425,9 +630,10 @@ Shader_parse_opcode(struct Shader_parser *parser,
 
    /* Destination operands. */
    for (i = 0; i < info->num_dst; i++) {
+      bool extended;
       D3D10_SB_OPERAND_NUM_COMPONENTS num_components;
 
-      assert(!DECODE_IS_D3D10_SB_OPERAND_EXTENDED(*curr));
+      extended = DECODE_IS_D3D10_SB_OPERAND_EXTENDED(*curr);
 
       num_components = DECODE_D3D10_SB_OPERAND_NUM_COMPONENTS(*curr);
       if (num_components == D3D10_SB_OPERAND_4_COMPONENT) {
@@ -445,6 +651,24 @@ Shader_parse_opcode(struct Shader_parser *parser,
       }
 
       parse_operand(&curr, &opcode->dst[i].base);
+
+      if (extended) {
+         /* NOTE: DECODE_IS_D3D10_SB_OPERAND_DOUBLE_EXTENDED is broken.
+          */
+         assert(!((*curr & D3D10_SB_OPERAND_DOUBLE_EXTENDED_MASK) >> D3D10_SB_OPERAND_DOUBLE_EXTENDED_SHIFT));
+
+         switch (DECODE_D3D10_SB_EXTENDED_OPERAND_TYPE(*curr)) {
+         case D3D10_SB_EXTENDED_OPERAND_EMPTY:
+         case D3D10_SB_EXTENDED_OPERAND_MODIFIER:
+            break;
+
+         default:
+            assert(0);
+         }
+
+         curr++;
+      }
+
       parse_operand_index(&curr, &opcode->dst[i].base);
    }
 
@@ -529,6 +753,14 @@ Shader_parse_opcode(struct Shader_parser *parser,
       parse_operand_index(&curr, &opcode->src[i].base);
 
       if (opcode->src[i].base.type == D3D10_SB_OPERAND_TYPE_IMMEDIATE32) {
+         if (opcode->type == D3D10_1_SB_OPCODE_SAMPLE_POS && i == 1) {
+            opcode->src[i].imm[0].u32 =
+               opcode->src[i].imm[1].u32 =
+               opcode->src[i].imm[2].u32 =
+               opcode->src[i].imm[3].u32 = *curr++;
+            continue;
+         }
+
          switch (num_components) {
          case D3D10_SB_OPERAND_1_COMPONENT:
             opcode->src[i].imm[0].u32 =
@@ -555,6 +787,7 @@ Shader_parse_opcode(struct Shader_parser *parser,
    /* Opcode specific trailing operands. */
    switch (opcode->type) {
    case D3D10_SB_OPCODE_DCL_RESOURCE:
+   case D3D11_SB_OPCODE_DCL_UNORDERED_ACCESS_VIEW_TYPED:
       opcode->dcl_resource_ret_type[0] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 0);
       opcode->dcl_resource_ret_type[1] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 1);
       opcode->dcl_resource_ret_type[2] = DECODE_D3D10_SB_RESOURCE_RETURN_TYPE(*curr, 2);
@@ -563,6 +796,10 @@ Shader_parse_opcode(struct Shader_parser *parser,
       break;
    case D3D10_SB_OPCODE_DCL_MAX_OUTPUT_VERTEX_COUNT:
       opcode->specific.dcl_max_output_vertex_count = *curr;
+      curr++;
+      break;
+   case D3D11_SB_OPCODE_DCL_GS_INSTANCE_COUNT:
+      opcode->specific.dcl_gs_instance_count = *curr;
       curr++;
       break;
    case D3D10_SB_OPCODE_DCL_INPUT_SGV:
@@ -578,6 +815,30 @@ Shader_parse_opcode(struct Shader_parser *parser,
       opcode->specific.dcl_num_temps = *curr;
       curr++;
       break;
+   case DX10_SM5_OPCODE_DCL_UAV_STRUCTURED:
+   case DX10_SM5_OPCODE_DCL_RESOURCE_STRUCTURED:
+      opcode->specific.dcl_structured_stride = *curr++;
+      break;
+   case DX10_SM5_OPCODE_DCL_TGSM_RAW:
+      opcode->specific.dcl_tgsm.byte_count = *curr++;
+      break;
+   case DX10_SM5_OPCODE_DCL_TGSM_STRUCTURED:
+      opcode->specific.dcl_tgsm.structured_stride = *curr++;
+      opcode->specific.dcl_tgsm.structured_count = *curr++;
+      opcode->specific.dcl_tgsm.byte_count =
+         opcode->specific.dcl_tgsm.structured_stride *
+         opcode->specific.dcl_tgsm.structured_count;
+      break;
+   case DX10_SM5_OPCODE_DCL_THREAD_GROUP:
+      curr += 3;
+      break;
+   case DX11_SM5_OPCODE_DCL_HS_MAX_TESSFACTOR:
+      opcode->specific.dcl_hs_max_tessfactor_bits = *curr++;
+      break;
+   case DX11_SM5_OPCODE_DCL_HS_FORK_PHASE_INSTANCE_COUNT:
+   case DX11_SM5_OPCODE_DCL_HS_JOIN_PHASE_INSTANCE_COUNT:
+      opcode->specific.dcl_hs_phase_instance_count = *curr++;
+      break;
    case D3D10_SB_OPCODE_DCL_INDEXABLE_TEMP:
       opcode->specific.dcl_indexable_temp.index = *curr++;
       opcode->specific.dcl_indexable_temp.count = *curr++;
@@ -586,13 +847,34 @@ Shader_parse_opcode(struct Shader_parser *parser,
    case D3D10_SB_OPCODE_DCL_INDEX_RANGE:
       opcode->specific.index_range_count = *curr++;
       break;
+   case D3D11_SB_OPCODE_DCL_STREAM:
+   case D3D11_SB_OPCODE_EMIT_STREAM:
+   case D3D11_SB_OPCODE_CUT_STREAM:
+   case D3D11_SB_OPCODE_EMITTHENCUT_STREAM:
+      parse_stream_operand(&curr, opcode);
+      break;
    default:
       break;
    }
 
-   assert(curr == parser->curr + length);
+   if (opcode->type == D3D10_1_SB_OPCODE_SAMPLE_POS &&
+       curr < parser->curr + length) {
+      assert(parser->curr + length - curr == 1);
+      curr++;
+   }
 
-skip:
+   if (curr != parser->curr + length) {
+      yttrium_gdi_trace_warnf("yttrium: shader parse instruction length mismatch opcode=%s type=%u offset=%u consumed=%u length=%u\n",
+                              info->name, opcode->type,
+                              (unsigned)(parser->curr - parser->code),
+                              (unsigned)(curr - parser->curr), length);
+      if (curr > parser->curr + length) {
+         parser->curr += length;
+         assert(0);
+         return false;
+      }
+   }
+
    /* Advance to the next opcode. */
    parser->curr += length;
 
@@ -607,4 +889,42 @@ Shader_opcode_free(struct Shader_opcode *opcode)
          FREE(opcode->customdata.u.constbuf.data);
       }
    }
+}
+
+bool
+Shader_parse_tessellation_properties(
+   const unsigned *code,
+   struct Shader_tessellation_properties *properties)
+{
+   struct Shader_parser parser;
+   struct Shader_opcode opcode;
+
+   if (!code || !properties)
+      return false;
+
+   memset(properties, 0, sizeof(*properties));
+   Shader_parse_init(&parser, code);
+   if (parser.header.type != DX11_SM5_HULL_SHADER)
+      return false;
+
+   while (Shader_parse_opcode(&parser, &opcode)) {
+      switch (opcode.type) {
+      case DX11_SM5_OPCODE_DCL_TESS_DOMAIN:
+         properties->domain = opcode.specific.dcl_tess_domain;
+         break;
+      case DX11_SM5_OPCODE_DCL_TESS_PARTITIONING:
+         properties->partitioning = opcode.specific.dcl_tess_partitioning;
+         break;
+      case DX11_SM5_OPCODE_DCL_TESS_OUTPUT_PRIMITIVE:
+         properties->output_primitive =
+            opcode.specific.dcl_tess_output_primitive;
+         break;
+      default:
+         break;
+      }
+      Shader_opcode_free(&opcode);
+   }
+
+   return properties->domain && properties->partitioning &&
+          properties->output_primitive;
 }

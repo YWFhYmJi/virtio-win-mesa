@@ -32,8 +32,11 @@
 
 
 #include "DriverIncludes.h"
+#include "ShaderParse.h"
 #include "pipe/p_screen.h"
 #include "util/u_hash_table.h"
+#include "util/list.h"
+#include "util/u_atomic.h"
 #include "cso_cache/cso_context.h"
 #include "util/u_thread.h"
 
@@ -41,8 +44,14 @@
 #include "gdikmt_d3dddi.h"
 
 #define SUPPORT_MSAA 0
-#define SUPPORT_D3D10_1 0
-#define SUPPORT_D3D11 0
+#define SUPPORT_D3D10_1 1
+#define SUPPORT_D3D11 1
+#ifndef SUPPORT_D3D11_1
+#define SUPPORT_D3D11_1 1
+#endif
+#ifndef SUPPORT_D3D_WDDM1_3
+#define SUPPORT_D3D_WDDM1_3 (SUPPORT_D3D11_1 && D3D11DDI_MINOR_HEADER_VERSION >= 4)
+#endif
 
 
 struct Adapter
@@ -64,12 +73,34 @@ struct Shader
    void *handle;
    uint type;
    struct pipe_shader_state state;
+   struct pipe_compute_state compute_state;
+   unsigned thread_group_size[3];
+   unsigned compute_emulation;
+   unsigned compute_store_imm[4];
+   unsigned tess_output_primitive;
+   struct Shader_tessellation_properties tessellation_properties;
+   struct Shader_tessellation_properties tessellation_compiled_properties;
+   unsigned *tessellation_code;
+   unsigned tessellation_code_size;
+   D3D10_SB_NAME tessellation_input_system_values[32];
+   D3D10_SB_NAME tessellation_output_system_values[32];
+   unsigned char tessellation_input_masks[32];
+   unsigned char tessellation_output_masks[32];
+   unsigned tessellation_input_signature_count;
+   unsigned tessellation_output_signature_count;
+   bool tessellation_has_signatures;
+   bool tessellation_properties_valid;
+   bool tessellation_compiled_properties_valid;
    unsigned output_mapping[PIPE_MAX_SHADER_OUTPUTS];
    bool output_resolved;
+   bool no_rasterized_stream;
 };
 
 struct Query;
 struct ElementLayout;
+struct Resource;
+struct RasterizerState;
+struct UnorderedAccessView;
 
 struct Device
 {
@@ -79,6 +110,7 @@ struct Device
    struct gdikmt_device_d3dddi device;
 
    struct cso_context *cso;
+   unsigned feature_level;
 
    struct pipe_framebuffer_state fb;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
@@ -87,18 +119,43 @@ struct Device
    unsigned restart_index;
    unsigned index_size;
    unsigned ib_offset;
+   unsigned viewport_fb_width;
+   unsigned viewport_fb_height;
    void *samplers[MESA_SHADER_STAGES][PIPE_MAX_SAMPLERS];
+   D3D10DDI_HSHADERRESOURCEVIEW shader_resource_views[MESA_SHADER_STAGES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
    struct pipe_sampler_view *sampler_views[MESA_SHADER_STAGES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
+   struct UnorderedAccessView *unordered_access_views[MESA_SHADER_STAGES][PIPE_MAX_SHADER_IMAGES];
+   struct pipe_resource *constant_buffers[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   Resource *constant_buffer_resources[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   Resource *constant_buffer_binding_resources[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   unsigned constant_buffer_offsets[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   unsigned constant_buffer_sizes[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   bool constant_buffer_published[MESA_SHADER_STAGES][PIPE_MAX_CONSTANT_BUFFERS];
+   bool constant_publication_enabled;
+   uint32_t bufinfo_constants[MESA_SHADER_STAGES][D3D10UMD_BUFINFO_CB_DWORDS];
+   bool bufinfo_constants_dirty[MESA_SHADER_STAGES];
+   bool bufinfo_constants_bound[MESA_SHADER_STAGES];
+   bool shader_resource_views_dirty;
+   struct pipe_image_view shader_images[MESA_SHADER_STAGES][PIPE_MAX_SHADER_IMAGES];
 
    void *empty_fs;
    void *empty_vs;
+   void *default_depth_stencil_state;
 
    enum mesa_prim primitive;
 
    struct pipe_stream_output_target *so_targets[PIPE_MAX_SO_BUFFERS];
    struct pipe_stream_output_target *draw_so_target;
    Shader *bound_empty_gs;
+   Shader *bound_gs;
    Shader *bound_vs;
+   Shader *bound_ps;
+   Shader *bound_cs;
+   Shader *bound_hs;
+   Shader *bound_ds;
+   unsigned patch_vertices;
+   RasterizerState *rasterizer_state;
+   void *default_rasterizer_discard_state;
 
    unsigned max_dual_source_render_targets;
    
@@ -116,6 +173,7 @@ struct Device
    BOOL vbuffers_changed;
    
    mtx_t CreateResourceMtx;
+   struct list_head resources;
 };
 
 
@@ -132,7 +190,6 @@ CastPipeContext(D3D10DDI_HDEVICE hDevice)
    Device *pDevice = CastDevice(hDevice);
    return pDevice ? pDevice->pipe : NULL;
 }
-
 
 static inline Device *
 CastDevice(DXGI_DDI_HDEVICE hDevice)
@@ -161,11 +218,27 @@ SetError(D3D10DDI_HDEVICE hDevice, HRESULT hr)
 
 struct Resource
 {
+   struct list_head list;
+   bool listed;
    DXGI_FORMAT Format;
+   UINT MiscFlags;
+   UINT ByteStride;
    UINT MipLevels;
    UINT NumSubResources;
+   UINT SampleCount;
    bool buffer;
+   bool yttrium_primary;
    struct pipe_resource *resource;
+   void *buffer_shadow;
+   unsigned buffer_shadow_size;
+   struct pipe_resource *constant_published_buffer;
+   void *constant_published_cpu;
+   unsigned constant_published_offset;
+   unsigned constant_published_size;
+   bool constant_shadow_valid;
+   bool constant_original_stale;
+   bool constant_publication_fallback_warned;
+   uint32_t constant_buffer_bindings[MESA_SHADER_STAGES];
    struct pipe_transfer **transfers;
    struct pipe_stream_output_target *so_target;
 };
@@ -209,6 +282,13 @@ CastPipeBuffer(D3D10DDI_HRESOURCE hResource)
       return NULL;
    }
    return static_cast<struct pipe_resource *>(pResource->resource);
+}
+
+
+static inline int
+PipeResourceRefCount(struct pipe_resource *resource)
+{
+   return resource ? p_atomic_read(&resource->reference.count) : 0;
 }
 
 
@@ -302,6 +382,9 @@ CastPipeDepthStencilState(D3D10DDI_HDEPTHSTENCILSTATE hDepthStencilState)
 struct RasterizerState
 {
    void *handle;
+   void *discard_handle;
+   struct pipe_rasterizer_state state;
+   unsigned forced_sample_count;
 };
 
 
@@ -372,6 +455,11 @@ struct ShaderResourceView
 {
    struct pipe_sampler_view *handle;
    Resource *resource;
+   bool buffer_raw;
+   bool buffer_structured;
+   UINT buffer_first_element;
+   UINT buffer_num_elements;
+   UINT buffer_stride;
 };
 
 
@@ -387,6 +475,30 @@ CastPipeShaderResourceView(D3D10DDI_HSHADERRESOURCEVIEW hShaderResourceView)
 {
    ShaderResourceView *pSRView = CastShaderResourceView(hShaderResourceView);
    return pSRView ? pSRView->handle : NULL;
+}
+
+
+struct UnorderedAccessView
+{
+   struct pipe_resource *pipe_resource;
+   struct pipe_image_view image;
+   enum pipe_format clear_format;
+   Resource *resource;
+   bool buffer_raw;
+   bool buffer_structured;
+   bool buffer_counter;
+   bool buffer_append;
+   UINT buffer_first_element;
+   UINT buffer_num_elements;
+   UINT buffer_stride;
+   UINT counter_value;
+};
+
+
+static inline UnorderedAccessView *
+CastUnorderedAccessView(D3D11DDI_HUNORDEREDACCESSVIEW hUnorderedAccessView)
+{
+   return static_cast<UnorderedAccessView *>(hUnorderedAccessView.pDrvPrivate);
 }
 
 

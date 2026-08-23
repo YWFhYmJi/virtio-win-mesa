@@ -238,16 +238,20 @@ struct tc_unflushed_batch_token;
 /* fence is pre-populated with a fence created by the create_fence callback */
 #define TC_FLUSH_ASYNC        (1u << 31)
 
-/* Size of the queue = number of batch slots in memory.
+/* Maximum number of batch slots reserved in memory.  The active count is a
+ * per-context option so experiments don't change queueing for other users.
+ *
+ * Size of the queue = active number of batch slots.
  * - 1 batch is always idle and records new commands
  * - 1 batch is being executed
- * so the queue size is TC_MAX_BATCHES - 2 = number of waiting batches.
+ * so the queue size is active batch slots - 2 = number of waiting batches.
  *
  * Use a size as small as possible for low CPU L2 cache usage but large enough
  * so that the queue isn't stalled too often for not having enough idle batch
  * slots.
  */
-#define TC_MAX_BATCHES        10
+#define TC_DEFAULT_BATCHES    10
+#define TC_MAX_BATCHES        64
 
 /* The size of one batch. Non-trivial calls (i.e. not setting a CSO pointer)
  * can occupy multiple call slots.
@@ -412,6 +416,10 @@ struct tc_call_base {
 struct tc_draw_single {
    struct tc_call_base base;
    unsigned index_bias;
+   unsigned min_index;
+   unsigned max_index;
+   bool no_merge;
+   bool index_bounds_valid;
    struct pipe_draw_info info;
 };
 
@@ -552,6 +560,28 @@ struct threaded_context_options {
    tc_is_resource_busy is_resource_busy;
    bool driver_calls_flush_notify;
 
+   /* Upload frontend-owned constant-buffer data before queuing the bind. */
+   bool upload_user_constant_buffers;
+
+   /* Preserve individual draw_vbo calls for drivers without multi-draw. */
+   bool disable_draw_merging;
+
+   /* Preserve frontend-computed index bounds for drivers that consume them. */
+   bool preserve_index_bounds;
+
+   /* Copy buffer_subdata payloads up to this many bytes into the call queue. */
+   unsigned buffer_subdata_copy_limit;
+
+   /* Number of active batch slots; zero selects TC_DEFAULT_BATCHES. */
+   unsigned batch_slots;
+
+   /*
+    * Target number of call slots per queued batch.  Zero selects the full
+    * TC_SLOTS_PER_BATCH capacity.  A single call larger than the target is
+    * still admitted up to the fixed capacity.
+    */
+   unsigned batch_size_slots;
+
    /**
     * If true, ctx->get_device_reset_status() will be called without
     * synchronizing with driver thread.  Drivers can enable this to avoid
@@ -660,6 +690,8 @@ struct threaded_context {
 #endif
 
    unsigned last, next, next_buf_list;
+   unsigned num_batch_slots;
+   unsigned batch_size_slots;
 
    /* The list fences that the driver should signal after the next flush.
     * If this is empty, all driver command buffers have been flushed.

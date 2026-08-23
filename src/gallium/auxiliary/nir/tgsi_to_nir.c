@@ -43,6 +43,8 @@
 #include "tgsi/tgsi_scan.h"
 #include "tgsi/tgsi_from_mesa.h"
 
+#define TTN_MAX_SWITCH_NESTING 16
+
 #define SWIZ(X, Y, Z, W) (unsigned[4]){      \
       TGSI_SWIZZLE_##X,                      \
       TGSI_SWIZZLE_##Y,                      \
@@ -58,6 +60,13 @@ struct ttn_reg_info {
    int offset;
 };
 
+struct ttn_switch_info {
+   nir_variable *value;
+   nir_variable *active;
+   nir_variable *matched;
+   bool case_open;
+};
+
 struct ttn_compile {
    union tgsi_full_token *token;
    nir_builder build;
@@ -66,11 +75,13 @@ struct ttn_compile {
    struct ttn_reg_info *output_regs;
    struct ttn_reg_info *temp_regs;
    nir_def **imm_defs;
+   bool direct_outputs[PIPE_MAX_SHADER_OUTPUTS];
 
    unsigned num_samp_types;
    nir_alu_type *samp_types;
 
-   nir_def *addr_reg;
+   nir_def **addr_regs;
+   unsigned num_addr_regs;
 
    nir_variable **inputs;
    nir_variable **outputs;
@@ -87,6 +98,9 @@ struct ttn_compile {
    nir_variable *input_var_position;
    nir_variable *input_var_point;
    nir_variable *clipdist;
+   nir_variable *culldist;
+   struct ttn_switch_info switch_stack[TTN_MAX_SWITCH_NESTING];
+   unsigned switch_depth;
 
    /* How many TGSI_FILE_IMMEDIATE vec4s have been parsed so far. */
    unsigned next_imm;
@@ -153,6 +167,9 @@ tgsi_varying_semantic_to_slot(unsigned semantic, unsigned index)
       return VARYING_SLOT_TESS_LEVEL_INNER;
    case TGSI_SEMANTIC_TESSOUTER:
       return VARYING_SLOT_TESS_LEVEL_OUTER;
+   case TGSI_SEMANTIC_PATCH:
+      assert(index < 32);
+      return VARYING_SLOT_PATCH0 + index;
    default:
       fprintf(stderr, "Bad TGSI semantic: %d/%d\n", semantic, index);
       abort();
@@ -176,6 +193,38 @@ ttn_get_depth_layout(unsigned tgsi_fs_depth_layout)
    default:
       UNREACHABLE("bad TGSI FS depth layout");
    }
+}
+
+static nir_variable *
+ttn_ensure_culldist_output(struct ttn_compile *c)
+{
+   nir_shader *nir = c->build.shader;
+   const struct glsl_type *type;
+
+   if (!nir->info.cull_distance_array_size)
+      return NULL;
+
+   if (c->culldist)
+      return c->culldist;
+
+   type = glsl_array_type(glsl_float_type(),
+                          nir->info.cull_distance_array_size,
+                          sizeof(float));
+   if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
+      assert(nir->info.tess.tcs_vertices_out);
+      type = glsl_array_type(type, nir->info.tess.tcs_vertices_out, 0);
+   }
+
+   c->culldist =
+      nir_variable_create(nir, nir_var_shader_out, type, "gl_CullDistance");
+   c->culldist->data.location = VARYING_SLOT_CULL_DIST0;
+   c->culldist->data.index = 0;
+   c->culldist->data.interpolation = INTERP_MODE_NONE;
+   nir->info.outputs_written |= VARYING_BIT_CULL_DIST0;
+   if (nir->info.cull_distance_array_size > 4)
+      nir->info.outputs_written |= VARYING_BIT_CULL_DIST1;
+
+   return c->culldist;
 }
 
 static enum glsl_interp_mode
@@ -232,13 +281,19 @@ ttn_emit_declaration(struct ttn_compile *c)
          }
       }
    } else if (file == TGSI_FILE_ADDRESS) {
-      c->addr_reg = nir_decl_reg(b, 4, 32, 0);
+      for (i = decl->Range.First; i <= decl->Range.Last; i++) {
+         assert(i < c->num_addr_regs);
+         if (!c->addr_regs[i])
+            c->addr_regs[i] = nir_decl_reg(b, 4, 32, 0);
+      }
    } else if (file == TGSI_FILE_SYSTEM_VALUE) {
       /* Nothing to record for system values. */
    } else if (file == TGSI_FILE_BUFFER) {
       /* Nothing to record for buffers. */
    } else if (file == TGSI_FILE_IMAGE) {
       /* Nothing to record for images. */
+   } else if (file == TGSI_FILE_MEMORY) {
+      /* Nothing to record for shared memory. */
    } else if (file == TGSI_FILE_SAMPLER) {
       /* Nothing to record for samplers. */
    } else if (file == TGSI_FILE_SAMPLER_VIEW) {
@@ -299,8 +354,17 @@ ttn_emit_declaration(struct ttn_compile *c)
 
          switch (file) {
          case TGSI_FILE_INPUT:
+            {
+            int semantic_name = decl->Semantic.Name;
+            bool patch_input = semantic_name == TGSI_SEMANTIC_TESSINNER ||
+                               semantic_name == TGSI_SEMANTIC_TESSOUTER ||
+                               semantic_name == TGSI_SEMANTIC_PATCH;
+
             var->data.read_only = true;
             var->data.mode = nir_var_shader_in;
+            var->data.patch = patch_input;
+            var->data.compact = semantic_name == TGSI_SEMANTIC_TESSINNER ||
+                                semantic_name == TGSI_SEMANTIC_TESSOUTER;
             nir_variable_set_namef(b->shader, var, "in_%d", idx);
 
             if (c->scan->processor == MESA_SHADER_FRAGMENT) {
@@ -334,9 +398,73 @@ ttn_emit_declaration(struct ttn_compile *c)
                      tgsi_varying_semantic_to_slot(decl->Semantic.Name,
                                                    decl->Semantic.Index);
                }
+            } else if (c->scan->processor == MESA_SHADER_GEOMETRY ||
+                       c->scan->processor == MESA_SHADER_TESS_CTRL ||
+                       c->scan->processor == MESA_SHADER_TESS_EVAL) {
+               var->data.location =
+                  tgsi_varying_semantic_to_slot(decl->Semantic.Name,
+                                                decl->Semantic.Index);
+               if (c->scan->processor == MESA_SHADER_GEOMETRY)
+                  var->type =
+                     glsl_array_type(var->type,
+                                     b->shader->info.gs.vertices_in, 0);
+               else if (var->data.location ==
+                        VARYING_SLOT_TESS_LEVEL_OUTER)
+                  var->type =
+                     glsl_array_type(glsl_float_type(), 4, 0);
+               else if (var->data.location ==
+                        VARYING_SLOT_TESS_LEVEL_INNER)
+                  var->type =
+                     glsl_array_type(glsl_float_type(), 2, 0);
             } else {
                assert(!decl->Declaration.Semantic);
                var->data.location = VERT_ATTRIB_GENERIC0 + idx;
+            }
+
+            if (b->shader->options->compact_arrays &&
+                var->data.location == VARYING_SLOT_CLIP_DIST0) {
+               const unsigned clip_size =
+                  b->shader->info.clip_distance_array_size;
+               const unsigned cull_size =
+                  b->shader->info.cull_distance_array_size;
+               const bool cull_only =
+                  !clip_size && cull_size;
+               unsigned distance_size =
+                  clip_size ? clip_size : cull_size;
+
+               /*
+                * These shader-info sizes describe outputs for non-fragment
+                * stages.  A TCS can consume clip distance without re-emitting
+                * it, so recover that input-only width from its declaration.
+                */
+               if (!distance_size &&
+                   (c->scan->processor == MESA_SHADER_TESS_CTRL ||
+                    c->scan->processor == MESA_SHADER_TESS_EVAL))
+                  distance_size =
+                     util_last_bit(decl->Declaration.UsageMask);
+
+               if (distance_size) {
+                  const struct glsl_type *distance_type =
+                     glsl_array_type(glsl_float_type(),
+                                     distance_size,
+                                     sizeof(float));
+                  const bool arrayed_input =
+                     !patch_input &&
+                     (c->scan->processor == MESA_SHADER_GEOMETRY ||
+                      c->scan->processor == MESA_SHADER_TESS_CTRL ||
+                      c->scan->processor == MESA_SHADER_TESS_EVAL);
+
+                  if (arrayed_input) {
+                     assert(glsl_type_is_array(var->type));
+                     var->type =
+                        glsl_array_type(distance_type,
+                                        glsl_get_length(var->type), 0);
+                  } else {
+                     var->type = distance_type;
+                  }
+                  if (cull_only)
+                     var->data.location = VARYING_SLOT_CULL_DIST0;
+               }
             }
             var->data.index = 0;
             var->data.interpolation =
@@ -344,28 +472,44 @@ ttn_emit_declaration(struct ttn_compile *c)
 
             c->inputs[idx] = var;
 
-            for (int i = 0; i < array_size; i++)
-               b->shader->info.inputs_read |= 1ull << (var->data.location + i);
+            if (patch_input &&
+                var->data.location >= VARYING_SLOT_PATCH0) {
+               b->shader->info.patch_inputs_read |=
+                  BITFIELD_BIT(var->data.location - VARYING_SLOT_PATCH0);
+            } else if (c->scan->processor == MESA_SHADER_GEOMETRY ||
+                       c->scan->processor == MESA_SHADER_TESS_CTRL ||
+                       c->scan->processor == MESA_SHADER_TESS_EVAL) {
+               b->shader->info.inputs_read |= 1ull << var->data.location;
+            } else {
+               for (int i = 0; i < array_size; i++)
+                  b->shader->info.inputs_read |= 1ull << (var->data.location + i);
+            }
 
             break;
+            }
          case TGSI_FILE_OUTPUT: {
             int semantic_name = decl->Semantic.Name;
             int semantic_index = decl->Semantic.Index;
+            bool patch_output = semantic_name == TGSI_SEMANTIC_TESSINNER ||
+                                semantic_name == TGSI_SEMANTIC_TESSOUTER ||
+                                semantic_name == TGSI_SEMANTIC_PATCH;
+            bool tcs_per_vertex_output =
+               c->scan->processor == MESA_SHADER_TESS_CTRL && !patch_output;
             /* Since we can't load from outputs in the IR, we make temporaries
              * for the outputs and emit stores to the real outputs at the end of
              * the shader.
              */
-            nir_def *reg = nir_decl_reg(b, 4, 32,
-                                            is_array ? array_size : 0);
+            nir_def *reg = nir_decl_reg(
+               b, 4, 32, is_array && !tcs_per_vertex_output ? array_size : 0);
 
             var->data.mode = nir_var_shader_out;
             nir_variable_set_namef(b->shader, var, "out_%d", idx);
             var->data.index = 0;
             var->data.interpolation =
                ttn_translate_interp_mode(decl->Interp.Interpolate);
-            var->data.patch = semantic_name == TGSI_SEMANTIC_TESSINNER ||
-                              semantic_name == TGSI_SEMANTIC_TESSOUTER ||
-                              semantic_name == TGSI_SEMANTIC_PATCH;
+            var->data.patch = patch_output;
+            var->data.compact = semantic_name == TGSI_SEMANTIC_TESSINNER ||
+                                semantic_name == TGSI_SEMANTIC_TESSOUTER;
 
             if (c->scan->processor == MESA_SHADER_FRAGMENT) {
                switch (semantic_name) {
@@ -413,12 +557,45 @@ ttn_emit_declaration(struct ttn_compile *c)
                   var->type = glsl_float_type();
                } else if (var->data.location == VARYING_SLOT_LAYER) {
                   var->type = glsl_int_type();
+               } else if (var->data.location == VARYING_SLOT_TESS_LEVEL_OUTER) {
+                  var->type = glsl_array_type(glsl_float_type(), 4, 0);
+               } else if (var->data.location == VARYING_SLOT_TESS_LEVEL_INNER) {
+                  var->type = glsl_array_type(glsl_float_type(), 2, 0);
                } else if (b->shader->options->compact_arrays &&
                           var->data.location == VARYING_SLOT_CLIP_DIST0) {
-                  var->type = glsl_array_type(glsl_float_type(),
-                                              b->shader->info.clip_distance_array_size,
-                                              sizeof(float));
-                  c->clipdist = var;
+                  unsigned clip_size =
+                     b->shader->info.clip_distance_array_size;
+                  unsigned cull_size =
+                     b->shader->info.cull_distance_array_size;
+                  if (clip_size || cull_size) {
+                     const bool cull_only = !clip_size;
+                     const struct glsl_type *distance_type =
+                        glsl_array_type(glsl_float_type(),
+                                        cull_only ? cull_size : clip_size,
+                                        sizeof(float));
+                     if (tcs_per_vertex_output) {
+                        assert(b->shader->info.tess.tcs_vertices_out);
+                        var->type =
+                           glsl_array_type(
+                              distance_type,
+                              b->shader->info.tess.tcs_vertices_out, 0);
+                     } else {
+                        var->type = distance_type;
+                     }
+                     if (cull_only) {
+                        var->data.location = VARYING_SLOT_CULL_DIST0;
+                        c->culldist = var;
+                     } else {
+                        c->clipdist = var;
+                     }
+                  }
+                  if (clip_size && cull_size)
+                     ttn_ensure_culldist_output(c);
+               } else if (tcs_per_vertex_output) {
+                  assert(b->shader->info.tess.tcs_vertices_out);
+                  var->type =
+                     glsl_array_type(var->type,
+                                     b->shader->info.tess.tcs_vertices_out, 0);
                }
             }
 
@@ -435,13 +612,24 @@ ttn_emit_declaration(struct ttn_compile *c)
 
             c->outputs[idx] = var;
 
-            if (b->shader->options->compact_arrays && var->data.location == VARYING_SLOT_CLIP_DIST1) {
+            if (b->shader->options->compact_arrays &&
+                (var->data.location == VARYING_SLOT_CLIP_DIST1 ||
+                 (var->data.location == VARYING_SLOT_CLIP_DIST0 &&
+                  !b->shader->info.clip_distance_array_size &&
+                  b->shader->info.cull_distance_array_size))) {
                /* ignore this entirely */
                continue;
             }
 
-            for (int i = 0; i < array_size; i++)
-               b->shader->info.outputs_written |= 1ull << (var->data.location + i);
+            if (patch_output &&
+                var->data.location >= VARYING_SLOT_PATCH0) {
+               b->shader->info.patch_outputs_written |=
+                  BITFIELD_BIT(var->data.location - VARYING_SLOT_PATCH0);
+            } else {
+               for (int i = 0; i < array_size; i++)
+                  b->shader->info.outputs_written |=
+                     1ull << (var->data.location + i);
+            }
          }
             break;
          case TGSI_FILE_CONSTANT:
@@ -569,7 +757,9 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
       break;
 
    case TGSI_FILE_ADDRESS:
-      src = nir_src_for_ssa(nir_load_reg(b, c->addr_reg));
+      assert(index < c->num_addr_regs);
+      assert(c->addr_regs[index]);
+      src = nir_src_for_ssa(nir_load_reg(b, c->addr_regs[index]));
       assert(!dim);
       break;
 
@@ -597,6 +787,15 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
          break;
       case TGSI_SEMANTIC_INSTANCEID:
          load = nir_load_instance_id(b);
+         break;
+      case TGSI_SEMANTIC_INVOCATIONID:
+         load = nir_load_invocation_id(b);
+         break;
+      case TGSI_SEMANTIC_TESSCOORD:
+         load = nir_load_tess_coord(b);
+         break;
+      case TGSI_SEMANTIC_PRIMID:
+         load = nir_load_primitive_id(b);
          break;
       case TGSI_SEMANTIC_FACE:
          assert(c->cap_face_is_sysval);
@@ -626,6 +825,9 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
          load = nir_load_sample_id(b);
          b->shader->info.fs.uses_sample_shading = true;
          break;
+      case TGSI_SEMANTIC_SAMPLEMASK:
+         load = nir_load_sample_mask_in(b);
+         break;
       default:
          UNREACHABLE("bad system value");
       }
@@ -653,10 +855,45 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
          assert(!c->cap_point_is_sysval && c->input_var_point);
          return nir_src_for_ssa(nir_load_var(&c->build, c->input_var_point));
       } else {
-         /* Indirection on input arrays isn't supported by TTN. */
-         assert(!dim);
          nir_deref_instr *deref = nir_build_deref_var(&c->build,
                                                       c->inputs[index]);
+         bool patch_input = c->inputs[index]->data.patch;
+         if ((c->scan->processor == MESA_SHADER_GEOMETRY ||
+              c->scan->processor == MESA_SHADER_TESS_CTRL ||
+              c->scan->processor == MESA_SHADER_TESS_EVAL) &&
+             !patch_input) {
+            assert(dim);
+            nir_def *vertex_index = nir_imm_int(b, dim->Index);
+            if (dimind) {
+               vertex_index = nir_iadd(b, vertex_index,
+                                       ttn_src_for_indirect(c, dimind));
+            } else {
+               assert(!dim->Indirect);
+            }
+            deref = nir_build_deref_array(&c->build, deref, vertex_index);
+         } else {
+            /* Indirection on input arrays isn't supported by TTN. */
+            assert(!dim);
+         }
+
+         if (b->shader->options->compact_arrays &&
+             (c->inputs[index]->data.location == VARYING_SLOT_CLIP_DIST0 ||
+              c->inputs[index]->data.location == VARYING_SLOT_CULL_DIST0) &&
+             glsl_type_is_array(deref->type)) {
+            nir_def *components[4];
+            const unsigned component_count =
+               MIN2(glsl_get_length(deref->type), ARRAY_SIZE(components));
+
+            for (unsigned i = 0; i < ARRAY_SIZE(components); i++)
+               components[i] = nir_imm_float(b, 0.0f);
+            for (unsigned i = 0; i < component_count; i++) {
+               nir_deref_instr *component =
+                  nir_build_deref_array_imm(b, deref, i);
+               components[i] = nir_load_deref(b, component);
+            }
+            return nir_src_for_ssa(nir_vec(b, components,
+                                           ARRAY_SIZE(components)));
+         }
          return nir_src_for_ssa(nir_load_deref(&c->build, deref));
       }
       break;
@@ -666,6 +903,19 @@ ttn_src_for_file_and_index(struct ttn_compile *c, unsigned file, unsigned index,
          c->outputs[index]->data.fb_fetch_output = 1;
          nir_deref_instr *deref = nir_build_deref_var(&c->build,
                                                       c->outputs[index]);
+         return nir_src_for_ssa(nir_load_deref(&c->build, deref));
+      } else if (c->scan->processor == MESA_SHADER_TESS_CTRL &&
+                 c->outputs[index] && c->outputs[index]->data.patch) {
+         nir_variable *var = c->outputs[index];
+         nir_deref_instr *deref;
+
+         if (glsl_type_is_array(var->type)) {
+            deref = ttn_array_deref(c, var, c->output_regs[index].offset,
+                                    indirect);
+         } else {
+            assert(!indirect);
+            deref = nir_build_deref_var(&c->build, var);
+         }
          return nir_src_for_ssa(nir_load_deref(&c->build, deref));
       }
       UNREACHABLE("unsupported output read");
@@ -802,8 +1052,10 @@ ttn_get_src(struct ttn_compile *c, struct tgsi_full_src_register *tgsi_fsrc,
    if (tgsi_src->File == TGSI_FILE_NULL) {
       return nir_imm_float(b, 0.0);
    } else if (tgsi_src->File == TGSI_FILE_SAMPLER ||
+              tgsi_src->File == TGSI_FILE_SAMPLER_VIEW ||
               tgsi_src->File == TGSI_FILE_IMAGE ||
-              tgsi_src->File == TGSI_FILE_BUFFER) {
+              tgsi_src->File == TGSI_FILE_BUFFER ||
+              tgsi_src->File == TGSI_FILE_MEMORY) {
       /* Only the index of the resource gets used in texturing, and it will
        * handle looking that up on its own instead of using the nir_alu_src.
        */
@@ -954,7 +1206,16 @@ ttn_lit(nir_builder *b, nir_def **src)
 static void
 ttn_barrier(nir_builder *b)
 {
-   nir_barrier(b, .execution_scope = SCOPE_WORKGROUP);
+   nir_variable_mode memory_modes = nir_var_mem_shared;
+
+   if (b->shader->info.stage == MESA_SHADER_TESS_CTRL)
+      memory_modes |= nir_var_shader_out;
+
+   nir_barrier(b,
+               .execution_scope = SCOPE_WORKGROUP,
+               .memory_scope = SCOPE_WORKGROUP,
+               .memory_semantics = NIR_MEMORY_ACQ_REL,
+               .memory_modes = memory_modes);
 }
 
 static void
@@ -974,6 +1235,106 @@ ttn_kill_if(nir_builder *b, nir_def **src)
 
    nir_discard_if(b, cmp);
    b->shader->info.fs.uses_discard = true;
+}
+
+static void
+ttn_close_switch_case(struct ttn_compile *c)
+{
+   assert(c->switch_depth);
+
+   struct ttn_switch_info *sw = &c->switch_stack[c->switch_depth - 1];
+   if (!sw->case_open)
+      return;
+
+   nir_pop_if(&c->build, NULL);
+   sw->case_open = false;
+}
+
+static void
+ttn_switch(struct ttn_compile *c, nir_def **src)
+{
+   assert(c->switch_depth < TTN_MAX_SWITCH_NESTING);
+
+   nir_builder *b = &c->build;
+   struct ttn_switch_info *sw = &c->switch_stack[c->switch_depth++];
+
+   sw->value = nir_local_variable_create(b->impl, glsl_uint_type(),
+                                         "ttn_switch_value");
+   sw->active = nir_local_variable_create(b->impl, glsl_bool_type(),
+                                          "ttn_switch_active");
+   sw->matched = nir_local_variable_create(b->impl, glsl_bool_type(),
+                                           "ttn_switch_matched");
+   sw->case_open = false;
+
+   nir_store_var(b, sw->value, ttn_channel(b, src[0], X), 1);
+   nir_store_var(b, sw->active, nir_imm_false(b), 1);
+   nir_store_var(b, sw->matched, nir_imm_false(b), 1);
+
+   nir_loop_add_continue_construct(nir_push_loop(b));
+}
+
+static void
+ttn_case(struct ttn_compile *c, nir_def **src)
+{
+   assert(c->switch_depth);
+
+   nir_builder *b = &c->build;
+   struct ttn_switch_info *sw = &c->switch_stack[c->switch_depth - 1];
+
+   if (sw->case_open)
+      ttn_close_switch_case(c);
+
+   nir_def *match = nir_ieq(b, nir_load_var(b, sw->value),
+                            ttn_channel(b, src[0], X));
+   nir_store_var(b, sw->matched,
+                 nir_ior(b, nir_load_var(b, sw->matched), match), 1);
+   nir_store_var(b, sw->active,
+                 nir_ior(b, nir_load_var(b, sw->active), match), 1);
+
+   nir_push_if(b, nir_load_var(b, sw->active));
+   sw->case_open = true;
+}
+
+static void
+ttn_default(struct ttn_compile *c)
+{
+   assert(c->switch_depth);
+
+   nir_builder *b = &c->build;
+   struct ttn_switch_info *sw = &c->switch_stack[c->switch_depth - 1];
+
+   if (sw->case_open)
+      ttn_close_switch_case(c);
+
+   nir_store_var(b, sw->active,
+                 nir_ior(b, nir_load_var(b, sw->active),
+                         nir_inot(b, nir_load_var(b, sw->matched))), 1);
+
+   nir_push_if(b, nir_load_var(b, sw->active));
+   sw->case_open = true;
+}
+
+static void
+ttn_endswitch(struct ttn_compile *c)
+{
+   assert(c->switch_depth);
+
+   if (c->switch_stack[c->switch_depth - 1].case_open)
+      ttn_close_switch_case(c);
+
+   nir_push_if(&c->build, nir_imm_true(&c->build));
+   nir_jump(&c->build, nir_jump_break);
+   nir_pop_if(&c->build, NULL);
+   nir_pop_loop(&c->build, NULL);
+   c->switch_depth--;
+}
+
+static void
+ttn_break(nir_builder *b)
+{
+   nir_push_if(b, nir_imm_true(b));
+   nir_jump(b, nir_jump_break);
+   nir_pop_if(b, NULL);
 }
 
 static void
@@ -1214,10 +1575,24 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       }
       num_srcs = 2;
       break;
+   case TGSI_OPCODE_SAMPLE_I:
+      op = nir_texop_txf;
+      num_srcs = 1;
+      break;
    case TGSI_OPCODE_TXD:
       op = nir_texop_txd;
       num_srcs = 3;
       samp = 3;
+      break;
+   case TGSI_OPCODE_SAMPLE_C:
+      op = nir_texop_tex;
+      num_srcs = 1;
+      samp = 1;
+      break;
+   case TGSI_OPCODE_SAMPLE_C_LZ:
+      op = nir_texop_txl;
+      num_srcs = 2;
+      samp = 1;
       break;
    case TGSI_OPCODE_LODQ:
       op = nir_texop_lod;
@@ -1229,6 +1604,10 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       op = nir_texop_tg4;
       num_srcs = 1;
       samp = 2;
+      break;
+   case TGSI_OPCODE_SAMPLE_INFO:
+      op = nir_texop_texture_samples;
+      num_srcs = 0;
       break;
 
    default:
@@ -1264,19 +1643,33 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
    if (instr->is_array)
       instr->coord_components++;
 
-   assert(tgsi_inst->Src[samp].Register.File == TGSI_FILE_SAMPLER);
+   if (op == nir_texop_texture_samples) {
+      assert(tgsi_inst->Src[samp].Register.File == TGSI_FILE_SAMPLER_VIEW);
+      sview = tgsi_inst->Src[samp].Register.Index;
+   } else if (tgsi_inst->Src[samp].Register.File == TGSI_FILE_SAMPLER_VIEW) {
+      assert(tgsi_inst->Instruction.Opcode == TGSI_OPCODE_LODQ ||
+             tgsi_inst->Instruction.Opcode == TGSI_OPCODE_SAMPLE_I ||
+             tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TG4 ||
+             tgsi_inst->Instruction.Opcode == TGSI_OPCODE_SAMPLE_C ||
+             tgsi_inst->Instruction.Opcode == TGSI_OPCODE_SAMPLE_C_LZ);
+      sview = tgsi_inst->Src[samp].Register.Index;
+   } else {
+      assert(tgsi_inst->Src[samp].Register.File == TGSI_FILE_SAMPLER);
 
-   /* TODO if we supported any opc's which take an explicit SVIEW
-    * src, we would use that here instead.  But for the "legacy"
-    * texture opc's the SVIEW index is same as SAMP index:
-    */
-   sview = tgsi_inst->Src[samp].Register.Index;
+      /* TODO if we supported any opc's which take an explicit SVIEW
+       * src, we would use that here instead.  But for the "legacy"
+       * texture opc's the SVIEW index is same as SAMP index:
+       */
+      sview = tgsi_inst->Src[samp].Register.Index;
+   }
 
    nir_alu_type sampler_type =
       sview < c->num_samp_types ? c->samp_types[sview] : nir_type_float32;
 
    if (op == nir_texop_lod) {
       instr->dest_type = nir_type_float32;
+   } else if (op == nir_texop_texture_samples) {
+      instr->dest_type = nir_type_uint32;
    } else {
       instr->dest_type = sampler_type;
    }
@@ -1299,10 +1692,12 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
                                                 &deref->def);
    src_number++;
 
-   instr->src[src_number] =
-      nir_tex_src_for_ssa(nir_tex_src_coord,
-                          nir_trim_vector(b, src[0], instr->coord_components));
-   src_number++;
+   if (op != nir_texop_texture_samples) {
+      instr->src[src_number] =
+         nir_tex_src_for_ssa(nir_tex_src_coord,
+                             nir_trim_vector(b, src[0], instr->coord_components));
+      src_number++;
+   }
 
    if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXP) {
       instr->src[src_number] = nir_tex_src_for_ssa(nir_tex_src_projector,
@@ -1338,6 +1733,12 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       src_number++;
    }
 
+   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_SAMPLE_C_LZ) {
+      instr->src[src_number].src = nir_src_for_ssa(nir_imm_int(b, 0));
+      instr->src[src_number].src_type = nir_tex_src_lod;
+      src_number++;
+   }
+
    if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXF ||
        tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXF_LZ) {
       if (op == nir_texop_txf_ms) {
@@ -1356,11 +1757,11 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
    if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_TXD) {
       instr->src[src_number] =
          nir_tex_src_for_ssa(nir_tex_src_ddx,
-               nir_trim_vector(b, src[1], nir_tex_instr_src_size(instr, src_number)));
+               nir_trim_vector(b, src[1], instr->coord_components));
       src_number++;
       instr->src[src_number] =
          nir_tex_src_for_ssa(nir_tex_src_ddy,
-               nir_trim_vector(b, src[2], nir_tex_instr_src_size(instr, src_number)));
+               nir_trim_vector(b, src[2], instr->coord_components));
       src_number++;
    }
 
@@ -1372,7 +1773,10 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
    }
 
    if (instr->is_shadow) {
-      if (instr->coord_components == 4)
+      if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_SAMPLE_C ||
+          tgsi_inst->Instruction.Opcode == TGSI_OPCODE_SAMPLE_C_LZ)
+         instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[3], X));
+      else if (instr->coord_components == 4)
          instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[1], X));
       else if (instr->coord_components == 3)
          instr->src[src_number].src = nir_src_for_ssa(ttn_channel(b, src[0], W));
@@ -1385,6 +1789,8 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
 
    for (i = 0; i < tgsi_inst->Texture.NumOffsets; i++) {
       struct tgsi_texture_offset *tex_offset = &tgsi_inst->TexOffsets[i];
+      unsigned offset_components =
+         instr->is_array ? instr->coord_components - 1 : instr->coord_components;
       /* since TexOffset ins't using tgsi_full_src_register we get to
        * do some extra gymnastics:
        */
@@ -1404,7 +1810,7 @@ ttn_tex(struct ttn_compile *c, nir_def **src)
       src.swizzle[3] = TGSI_SWIZZLE_W;
 
       instr->src[src_number] = nir_tex_src_for_ssa(nir_tex_src_offset,
-                                                   nir_mov_alu(b, src, nir_tex_instr_src_size(instr, src_number)));
+                                                   nir_mov_alu(b, src, offset_components));
       src_number++;
    }
 
@@ -1515,6 +1921,35 @@ get_mem_qualifier(struct tgsi_full_instruction *tgsi_inst)
    return access;
 }
 
+static nir_atomic_op
+ttn_atomic_op(unsigned tgsi_op)
+{
+   switch (tgsi_op) {
+   case TGSI_OPCODE_ATOMUADD:
+      return nir_atomic_op_iadd;
+   case TGSI_OPCODE_ATOMXCHG:
+      return nir_atomic_op_xchg;
+   case TGSI_OPCODE_ATOMAND:
+      return nir_atomic_op_iand;
+   case TGSI_OPCODE_ATOMOR:
+      return nir_atomic_op_ior;
+   case TGSI_OPCODE_ATOMXOR:
+      return nir_atomic_op_ixor;
+   case TGSI_OPCODE_ATOMUMIN:
+      return nir_atomic_op_umin;
+   case TGSI_OPCODE_ATOMUMAX:
+      return nir_atomic_op_umax;
+   case TGSI_OPCODE_ATOMIMIN:
+      return nir_atomic_op_imin;
+   case TGSI_OPCODE_ATOMIMAX:
+      return nir_atomic_op_imax;
+   case TGSI_OPCODE_ATOMCAS:
+      return nir_atomic_op_cmpxchg;
+   default:
+      UNREACHABLE("unexpected atomic opcode");
+   }
+}
+
 static nir_def *
 ttn_mem(struct ttn_compile *c, nir_def **src)
 {
@@ -1522,6 +1957,7 @@ ttn_mem(struct ttn_compile *c, nir_def **src)
    struct tgsi_full_instruction *tgsi_inst = &c->token->FullInstruction;
    nir_intrinsic_instr *instr = NULL;
    unsigned resource_index, addr_src_index, file;
+   bool is_atomic = false;
 
    switch (tgsi_inst->Instruction.Opcode) {
    case TGSI_OPCODE_LOAD:
@@ -1530,11 +1966,33 @@ ttn_mem(struct ttn_compile *c, nir_def **src)
       file = tgsi_inst->Src[0].Register.File;
       addr_src_index = 1;
       break;
+   case TGSI_OPCODE_RESQ:
+      assert(!tgsi_inst->Src[0].Register.Indirect);
+      resource_index = tgsi_inst->Src[0].Register.Index;
+      file = tgsi_inst->Src[0].Register.File;
+      addr_src_index = 0;
+      break;
    case TGSI_OPCODE_STORE:
       assert(!tgsi_inst->Dst[0].Register.Indirect);
       resource_index = tgsi_inst->Dst[0].Register.Index;
       file = tgsi_inst->Dst[0].Register.File;
       addr_src_index = 0;
+      break;
+   case TGSI_OPCODE_ATOMUADD:
+   case TGSI_OPCODE_ATOMXCHG:
+   case TGSI_OPCODE_ATOMCAS:
+   case TGSI_OPCODE_ATOMAND:
+   case TGSI_OPCODE_ATOMOR:
+   case TGSI_OPCODE_ATOMXOR:
+   case TGSI_OPCODE_ATOMUMIN:
+   case TGSI_OPCODE_ATOMUMAX:
+   case TGSI_OPCODE_ATOMIMIN:
+   case TGSI_OPCODE_ATOMIMAX:
+      assert(!tgsi_inst->Src[0].Register.Indirect);
+      resource_index = tgsi_inst->Src[0].Register.Index;
+      file = tgsi_inst->Src[0].Register.File;
+      addr_src_index = 1;
+      is_atomic = true;
       break;
    default:
       UNREACHABLE("unexpected memory opcode");
@@ -1571,6 +2029,76 @@ ttn_mem(struct ttn_compile *c, nir_def **src)
       if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_STORE)
          nir_intrinsic_set_write_mask(instr, tgsi_inst->Dst[0].Register.WriteMask);
 
+   } else if (file == TGSI_FILE_MEMORY) {
+      nir_intrinsic_op op;
+
+      switch (tgsi_inst->Instruction.Opcode) {
+      case TGSI_OPCODE_LOAD:
+         op = nir_intrinsic_load_shared;
+         break;
+      case TGSI_OPCODE_STORE:
+         op = nir_intrinsic_store_shared;
+         break;
+      case TGSI_OPCODE_ATOMCAS:
+         op = nir_intrinsic_shared_atomic_swap;
+         break;
+      case TGSI_OPCODE_ATOMUADD:
+      case TGSI_OPCODE_ATOMXCHG:
+      case TGSI_OPCODE_ATOMAND:
+      case TGSI_OPCODE_ATOMOR:
+      case TGSI_OPCODE_ATOMXOR:
+      case TGSI_OPCODE_ATOMUMIN:
+      case TGSI_OPCODE_ATOMUMAX:
+      case TGSI_OPCODE_ATOMIMIN:
+      case TGSI_OPCODE_ATOMIMAX:
+         op = nir_intrinsic_shared_atomic;
+         break;
+      default:
+         UNREACHABLE("unexpected shared memory opcode");
+      }
+
+      instr = nir_intrinsic_instr_create(b->shader, op);
+      nir_intrinsic_set_base(instr, 0);
+
+      switch (tgsi_inst->Instruction.Opcode) {
+      case TGSI_OPCODE_LOAD:
+         instr->num_components =
+            util_last_bit(tgsi_inst->Dst[0].Register.WriteMask);
+         instr->src[0] =
+            nir_src_for_ssa(ttn_channel(b, src[addr_src_index], X));
+         nir_intrinsic_set_access(instr, get_mem_qualifier(tgsi_inst));
+         nir_intrinsic_set_align(instr, 4, 0);
+         break;
+      case TGSI_OPCODE_STORE:
+         instr->num_components =
+            util_last_bit(tgsi_inst->Dst[0].Register.WriteMask);
+         instr->src[0] =
+            nir_src_for_ssa(nir_swizzle(b, src[1], SWIZ(X, Y, Z, W),
+                                        instr->num_components));
+         instr->src[1] =
+            nir_src_for_ssa(ttn_channel(b, src[addr_src_index], X));
+         nir_intrinsic_set_access(instr, get_mem_qualifier(tgsi_inst));
+         nir_intrinsic_set_write_mask(instr,
+                                      tgsi_inst->Dst[0].Register.WriteMask);
+         nir_intrinsic_set_align(instr, 4, 0);
+         break;
+      case TGSI_OPCODE_ATOMCAS:
+         instr->src[0] =
+            nir_src_for_ssa(ttn_channel(b, src[addr_src_index], X));
+         instr->src[1] = nir_src_for_ssa(ttn_channel(b, src[2], X));
+         instr->src[2] = nir_src_for_ssa(ttn_channel(b, src[3], X));
+         nir_intrinsic_set_atomic_op(instr,
+                                     ttn_atomic_op(tgsi_inst->Instruction.Opcode));
+         break;
+      default:
+         instr->src[0] =
+            nir_src_for_ssa(ttn_channel(b, src[addr_src_index], X));
+         instr->src[1] = nir_src_for_ssa(ttn_channel(b, src[2], X));
+         nir_intrinsic_set_atomic_op(instr,
+                                     ttn_atomic_op(tgsi_inst->Instruction.Opcode));
+         break;
+      }
+
    } else if (file == TGSI_FILE_IMAGE) {
       nir_intrinsic_op op;
 
@@ -1578,8 +2106,25 @@ ttn_mem(struct ttn_compile *c, nir_def **src)
       case TGSI_OPCODE_LOAD:
          op = nir_intrinsic_image_deref_load;
          break;
+      case TGSI_OPCODE_RESQ:
+         op = nir_intrinsic_image_deref_size;
+         break;
       case TGSI_OPCODE_STORE:
          op = nir_intrinsic_image_deref_store;
+         break;
+      case TGSI_OPCODE_ATOMCAS:
+         op = nir_intrinsic_image_deref_atomic_swap;
+         break;
+      case TGSI_OPCODE_ATOMUADD:
+      case TGSI_OPCODE_ATOMXCHG:
+      case TGSI_OPCODE_ATOMAND:
+      case TGSI_OPCODE_ATOMOR:
+      case TGSI_OPCODE_ATOMXOR:
+      case TGSI_OPCODE_ATOMUMIN:
+      case TGSI_OPCODE_ATOMUMAX:
+      case TGSI_OPCODE_ATOMIMIN:
+      case TGSI_OPCODE_ATOMIMAX:
+         op = nir_intrinsic_image_deref_atomic;
          break;
       default:
          UNREACHABLE("unexpected file opcode");
@@ -1602,7 +2147,25 @@ ttn_mem(struct ttn_compile *c, nir_def **src)
       nir_deref_instr *image_deref = nir_build_deref_var(b, image);
       const struct glsl_type *type = image_deref->type;
 
+      nir_intrinsic_set_image_dim(instr, dim);
+      nir_intrinsic_set_image_array(instr, is_array);
+      nir_intrinsic_set_format(instr, tgsi_inst->Memory.Format);
       nir_intrinsic_set_access(instr, image_deref->var->data.access);
+
+      if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_RESQ) {
+         unsigned size_components = glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_1D ? 1 :
+                                    glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_2D ? 2 :
+                                    glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_3D ? 3 : 4;
+         if (glsl_sampler_type_is_array(type) && size_components < 4)
+            size_components++;
+
+         instr->src[0] = nir_src_for_ssa(&image_deref->def);
+         instr->src[1] = nir_src_for_ssa(nir_imm_int(b, 0)); /* LOD */
+         instr->num_components = size_components;
+         nir_def_init(&instr->instr, &instr->def, size_components, 32);
+         nir_builder_instr_insert(b, &instr->instr);
+         return nir_pad_vector_imm_int(b, &instr->def, 0, 4);
+      }
 
       instr->src[0] = nir_src_for_ssa(&image_deref->def);
       instr->src[1] = nir_src_for_ssa(src[addr_src_index]);
@@ -1618,24 +2181,34 @@ ttn_mem(struct ttn_compile *c, nir_def **src)
          instr->src[3] = nir_src_for_ssa(nir_imm_int(b, 0)); /* LOD */
       }
 
-      unsigned num_components = util_last_bit(tgsi_inst->Dst[0].Register.WriteMask);
+      unsigned num_components = is_atomic ?
+         1 : util_last_bit(tgsi_inst->Dst[0].Register.WriteMask);
 
       if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_STORE) {
          instr->src[3] = nir_src_for_ssa(nir_swizzle(b, src[1], SWIZ(X, Y, Z, W),
                                                      num_components));
          instr->src[4] = nir_src_for_ssa(nir_imm_int(b, 0)); /* LOD */
+      } else if (is_atomic) {
+         instr->src[3] = nir_src_for_ssa(ttn_channel(b, src[2], X));
+         if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_ATOMCAS)
+            instr->src[4] = nir_src_for_ssa(ttn_channel(b, src[3], X));
+         nir_intrinsic_set_atomic_op(instr,
+                                     ttn_atomic_op(tgsi_inst->Instruction.Opcode));
       }
 
-      instr->num_components = num_components;
+      if (!is_atomic)
+         instr->num_components = num_components;
    } else {
       UNREACHABLE("unexpected file");
    }
 
 
-   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_LOAD) {
-      nir_def_init(&instr->instr, &instr->def, instr->num_components, 32);
+   if (tgsi_inst->Instruction.Opcode == TGSI_OPCODE_LOAD || is_atomic) {
+      unsigned def_components = is_atomic ? 1 : instr->num_components;
+      nir_def_init(&instr->instr, &instr->def, def_components, 32);
       nir_builder_instr_insert(b, &instr->instr);
-      return nir_pad_vector_imm_int(b, &instr->def, 0, 4);
+      return is_atomic ? &instr->def :
+                         nir_pad_vector_imm_int(b, &instr->def, 0, 4);
    } else {
       nir_builder_instr_insert(b, &instr->instr);
       return NULL;
@@ -1763,11 +2336,6 @@ static const nir_op op_trans[TGSI_OPCODE_LAST] = {
    [TGSI_OPCODE_USLT] = nir_op_ult,
    [TGSI_OPCODE_USNE] = nir_op_ine,
 
-   [TGSI_OPCODE_SWITCH] = 0, /* not emitted by glsl_to_tgsi.cpp */
-   [TGSI_OPCODE_CASE] = 0, /* not emitted by glsl_to_tgsi.cpp */
-   [TGSI_OPCODE_DEFAULT] = 0, /* not emitted by glsl_to_tgsi.cpp */
-   [TGSI_OPCODE_ENDSWITCH] = 0, /* not emitted by glsl_to_tgsi.cpp */
-
    /* XXX: SAMPLE opcodes */
 
    [TGSI_OPCODE_UARL] = nir_op_mov,
@@ -1817,6 +2385,8 @@ static const nir_op op_trans[TGSI_OPCODE_LAST] = {
    [TGSI_OPCODE_I64ABS] = nir_op_iabs,
 };
 
+static void ttn_add_output_stores(struct ttn_compile *c);
+
 static void
 ttn_emit_instruction(struct ttn_compile *c)
 {
@@ -1828,6 +2398,13 @@ ttn_emit_instruction(struct ttn_compile *c)
 
    if (tgsi_op == TGSI_OPCODE_END)
       return;
+
+   if ((tgsi_op == TGSI_OPCODE_CASE ||
+        tgsi_op == TGSI_OPCODE_DEFAULT ||
+        tgsi_op == TGSI_OPCODE_ENDSWITCH) &&
+       c->switch_depth &&
+       c->switch_stack[c->switch_depth - 1].case_open)
+      ttn_close_switch_case(c);
 
    nir_def *src[TGSI_FULL_MAX_SRC_REGISTERS];
    for (i = 0; i < tgsi_inst->Instruction.NumSrcRegs; i++) {
@@ -1848,6 +2425,15 @@ ttn_emit_instruction(struct ttn_compile *c)
    nir_def *dst = NULL;
 
    switch (tgsi_op) {
+   case TGSI_OPCODE_EMIT:
+      ttn_add_output_stores(c);
+      nir_emit_vertex(b, 0);
+      break;
+
+   case TGSI_OPCODE_ENDPRIM:
+      nir_end_primitive(b, 0);
+      break;
+
    case TGSI_OPCODE_RSQ:
       dst = nir_frsq(b, ttn_channel(b, src[0], X));
       break;
@@ -1950,6 +2536,22 @@ ttn_emit_instruction(struct ttn_compile *c)
       ttn_kill_if(b, src);
       break;
 
+   case TGSI_OPCODE_SWITCH:
+      ttn_switch(c, src);
+      break;
+
+   case TGSI_OPCODE_CASE:
+      ttn_case(c, src);
+      break;
+
+   case TGSI_OPCODE_DEFAULT:
+      ttn_default(c);
+      break;
+
+   case TGSI_OPCODE_ENDSWITCH:
+      ttn_endswitch(c);
+      break;
+
    case TGSI_OPCODE_TEX:
    case TGSI_OPCODE_TEX_LZ:
    case TGSI_OPCODE_TXP:
@@ -1963,6 +2565,10 @@ ttn_emit_instruction(struct ttn_compile *c)
    case TGSI_OPCODE_TXF_LZ:
    case TGSI_OPCODE_TG4:
    case TGSI_OPCODE_LODQ:
+   case TGSI_OPCODE_SAMPLE_I:
+   case TGSI_OPCODE_SAMPLE_INFO:
+   case TGSI_OPCODE_SAMPLE_C:
+   case TGSI_OPCODE_SAMPLE_C_LZ:
       dst = ttn_tex(c, src);
       break;
 
@@ -1971,7 +2577,18 @@ ttn_emit_instruction(struct ttn_compile *c)
       break;
 
    case TGSI_OPCODE_LOAD:
+   case TGSI_OPCODE_RESQ:
    case TGSI_OPCODE_STORE:
+   case TGSI_OPCODE_ATOMUADD:
+   case TGSI_OPCODE_ATOMXCHG:
+   case TGSI_OPCODE_ATOMCAS:
+   case TGSI_OPCODE_ATOMAND:
+   case TGSI_OPCODE_ATOMOR:
+   case TGSI_OPCODE_ATOMXOR:
+   case TGSI_OPCODE_ATOMUMIN:
+   case TGSI_OPCODE_ATOMUMAX:
+   case TGSI_OPCODE_ATOMIMIN:
+   case TGSI_OPCODE_ATOMIMAX:
       dst = ttn_mem(c, src);
       break;
 
@@ -1999,7 +2616,7 @@ ttn_emit_instruction(struct ttn_compile *c)
       break;
 
    case TGSI_OPCODE_BRK:
-      nir_jump(b, nir_jump_break);
+      ttn_break(b);
       break;
 
    case TGSI_OPCODE_CONT:
@@ -2064,6 +2681,132 @@ ttn_emit_instruction(struct ttn_compile *c)
 
    assert(dst->num_components == 4);
 
+   /*
+    * D3D hull-shader fork phases address tessellation factors as an output
+    * array indexed by the fork instance.  TGSI represents that as an
+    * indirect output register, but the corresponding NIR interface is a
+    * packed patch-output array.  Staging the write in a function register
+    * would make each TCS invocation update private storage, so the invocation
+    * that emits the patch output could not see factors written by the other
+    * invocations.  Store factors directly to the patch output instead.
+    */
+   if (tgsi_dst->Register.File == TGSI_FILE_OUTPUT &&
+       c->build.shader->info.stage == MESA_SHADER_TESS_CTRL) {
+      unsigned index = tgsi_dst->Register.Index;
+      nir_variable *var = c->outputs[index];
+      bool tess_level =
+         var && (var->data.location == VARYING_SLOT_TESS_LEVEL_OUTER ||
+                 var->data.location == VARYING_SLOT_TESS_LEVEL_INNER);
+
+      if (tess_level) {
+         nir_deref_instr *deref = nir_build_deref_var(b, var);
+         nir_def *factor_index = NULL;
+         unsigned writemask = tgsi_dst->Register.WriteMask;
+         float max_factor = 64.0f;
+         unsigned max_factor_bits =
+            c->scan->properties[TGSI_PROPERTY_TCS_TESS_FACTOR_MAX];
+
+         if (max_factor_bits)
+            memcpy(&max_factor, &max_factor_bits, sizeof(max_factor));
+         if (!(max_factor >= 1.0f && max_factor <= 64.0f))
+            max_factor = 64.0f;
+
+         dst = nir_fmin(b, dst, nir_imm_float(b, max_factor));
+
+         if (c->scan->properties[
+                TGSI_PROPERTY_TCS_TESS_FACTOR_ROUND_TO_POW2]) {
+            /*
+             * D3D's pow2 partitioning rounds each positive tessellation
+             * factor up to the next power of two.  Vulkan exposes only
+             * equal, fractional-odd and fractional-even spacing, so perform
+             * the missing normalization in the TCS and use equal spacing in
+             * the TES.  Non-positive factors become zero and continue to
+             * cull the patch.
+            */
+            nir_def *positive =
+               nir_flt(b, nir_imm_float(b, 0.0f), dst);
+            nir_def *clamped =
+               nir_fmin(b, nir_fmax(b, dst, nir_imm_float(b, 1.0f)),
+                        nir_imm_float(b, max_factor));
+            nir_def *rounded =
+               nir_fexp2(b, nir_fceil(b, nir_flog2(b, clamped)));
+            rounded =
+               nir_fmin(b, rounded, nir_imm_float(b, max_factor));
+            dst = nir_bcsel(b, positive, rounded,
+                            nir_imm_float(b, 0.0f));
+         }
+
+         if (tgsi_dst->Register.Indirect) {
+            factor_index =
+               ttn_src_for_indirect(c, &tgsi_dst->Indirect);
+            int base = c->output_regs[index].offset;
+            if (base)
+               factor_index = nir_iadd_imm(b, factor_index, base);
+         } else if (tgsi_dst->Register.Dimension) {
+            struct tgsi_dimension *dim = &tgsi_dst->Dimension;
+            if (dim->Indirect) {
+               factor_index =
+                  ttn_src_for_indirect(c, &tgsi_dst->DimIndirect);
+               if (dim->Index)
+                  factor_index =
+                     nir_iadd_imm(b, factor_index, dim->Index);
+            } else {
+               factor_index = nir_imm_int(b, dim->Index);
+            }
+         }
+
+         if (factor_index) {
+            unsigned component = 0;
+            while (component < 4 &&
+                   !(writemask & BITFIELD_BIT(component)))
+               ++component;
+
+            if (component < 4 &&
+                writemask == BITFIELD_BIT(component)) {
+               deref = nir_build_deref_array(b, deref, factor_index);
+               nir_store_deref(b, deref, nir_channel(b, dst, component),
+                               0x1);
+               c->direct_outputs[index] = true;
+               return;
+            }
+         } else {
+            for (unsigned component = 0; component < 4; ++component) {
+               if (!(writemask & BITFIELD_BIT(component)))
+                  continue;
+
+               nir_deref_instr *component_deref =
+                  nir_build_deref_array_imm(b, deref, component);
+               nir_store_deref(b, component_deref,
+                               nir_channel(b, dst, component), 0x1);
+            }
+            c->direct_outputs[index] = true;
+            return;
+         }
+      }
+
+      if (var && var->data.patch && !tess_level) {
+         nir_deref_instr *deref;
+
+         /*
+          * Patch outputs are shared across TCS invocations and may be read by
+          * a later join phase.  Store them directly in the shader-output
+          * interface instead of staging them in invocation-private registers.
+          */
+         if (glsl_type_is_array(var->type)) {
+            struct tgsi_ind_register *indirect =
+               tgsi_dst->Register.Indirect ? &tgsi_dst->Indirect : NULL;
+            deref = ttn_array_deref(c, var, c->output_regs[index].offset,
+                                    indirect);
+         } else {
+            assert(!tgsi_dst->Register.Indirect);
+            deref = nir_build_deref_var(b, var);
+         }
+         nir_store_deref(b, deref, dst, tgsi_dst->Register.WriteMask);
+         c->direct_outputs[index] = true;
+         return;
+      }
+   }
+
    /* Finally, copy the SSA def to the NIR variable/register */
    nir_variable *var = ttn_get_var(c, tgsi_dst);
    if (var) {
@@ -2087,9 +2830,23 @@ ttn_emit_instruction(struct ttn_compile *c)
       } else if (tgsi_dst->Register.File == TGSI_FILE_OUTPUT) {
          reg = c->output_regs[index].reg;
          base_offset = c->output_regs[index].offset;
+         if (tgsi_dst->Register.Dimension) {
+            struct tgsi_dimension *dim = &tgsi_dst->Dimension;
+
+            base_offset += dim->Index;
+            if (dim->Indirect) {
+               assert(!tgsi_dst->Register.Indirect);
+               nir_store_reg_indirect(
+                  b, dst, reg, ttn_src_for_indirect(c, &tgsi_dst->DimIndirect),
+                  .base = base_offset,
+                  .write_mask = tgsi_dst->Register.WriteMask);
+               return;
+            }
+         }
       } else if (tgsi_dst->Register.File == TGSI_FILE_ADDRESS) {
-         assert(index == 0);
-         reg = c->addr_reg;
+         assert(index < c->num_addr_regs);
+         assert(c->addr_regs[index]);
+         reg = c->addr_regs[index];
       }
 
       if (tgsi_dst->Register.Indirect) {
@@ -2118,64 +2875,125 @@ ttn_add_output_stores(struct ttn_compile *c)
 
    for (int i = 0; i < c->build.shader->num_outputs; i++) {
       nir_variable *var = c->outputs[i];
-      if (!var)
+      if (!var || c->direct_outputs[i])
          continue;
 
-      nir_def *store_value =
-         nir_build_load_reg(b, 4, 32, c->output_regs[i].reg,
-                            .base = c->output_regs[i].offset);
+      unsigned array_size =
+         glsl_type_is_array(var->type) ? glsl_get_length(var->type) : 1;
+      bool tcs_per_vertex_output =
+         c->build.shader->info.stage == MESA_SHADER_TESS_CTRL &&
+         !var->data.patch && glsl_type_is_array(var->type);
+      bool compact_distance_output =
+         b->shader->options->compact_arrays &&
+         (var->data.location == VARYING_SLOT_CLIP_DIST0 ||
+          var->data.location == VARYING_SLOT_CLIP_DIST1 ||
+          var->data.location == VARYING_SLOT_CULL_DIST0);
+      unsigned store_count =
+         tcs_per_vertex_output || compact_distance_output ? 1 : array_size;
 
-      uint32_t store_mask = BITFIELD_MASK(store_value->num_components);
-      if (c->build.shader->info.stage == MESA_SHADER_FRAGMENT) {
-         /* TGSI uses TGSI_SEMANTIC_POSITION.z for the depth output
-          * and TGSI_SEMANTIC_STENCIL.y for the stencil output,
-          * while NIR uses a single-component output.
-          */
-         if (var->data.location == FRAG_RESULT_DEPTH)
-            store_value = nir_channel(b, store_value, 2);
-         else if (var->data.location == FRAG_RESULT_STENCIL)
-            store_value = nir_channel(b, store_value, 1);
-         else if (var->data.location == FRAG_RESULT_SAMPLE_MASK)
-            store_value = nir_channel(b, store_value, 0);
-      } else {
-         /* FOGC, LAYER, and PSIZ are scalar values */
-         if (var->data.location == VARYING_SLOT_FOGC ||
-             var->data.location == VARYING_SLOT_LAYER ||
-             var->data.location == VARYING_SLOT_PSIZ) {
-            store_value = nir_channel(b, store_value, 0);
-         }
-         if (var->data.location == VARYING_SLOT_CLIP_DIST0)
-            store_mask = BITFIELD_MASK(MIN2(c->build.shader->info.clip_distance_array_size, 4));
-         else if (var->data.location == VARYING_SLOT_CLIP_DIST1) {
-            if (c->build.shader->info.clip_distance_array_size > 4)
-               store_mask = BITFIELD_MASK(c->build.shader->info.clip_distance_array_size - 4);
-            else
-               store_mask = 0;
-         }
-      }
+      for (unsigned array_index = 0; array_index < store_count; ++array_index) {
+         bool tess_level =
+            var->data.location == VARYING_SLOT_TESS_LEVEL_OUTER ||
+            var->data.location == VARYING_SLOT_TESS_LEVEL_INNER;
+         bool tcs_tess_level =
+            tess_level &&
+            c->build.shader->info.stage == MESA_SHADER_TESS_CTRL;
 
-      if (b->shader->options->compact_arrays &&
-          (var->data.location == VARYING_SLOT_CLIP_DIST0 ||
-           var->data.location == VARYING_SLOT_CLIP_DIST1)) {
-         if (!store_mask)
-            continue;
+         if (tcs_tess_level)
+            nir_push_if(b, nir_ieq_imm(b, nir_load_invocation_id(b), 0));
 
-         nir_deref_instr *deref = nir_build_deref_var(b, c->clipdist);
-         nir_def *zero = nir_imm_zero(b, 1, 32);
-         unsigned offset = var->data.location == VARYING_SLOT_CLIP_DIST1 ? 4 : 0;
-         unsigned size = var->data.location == VARYING_SLOT_CLIP_DIST1 ?
-                          b->shader->info.clip_distance_array_size :
-                          MIN2(4, b->shader->info.clip_distance_array_size);
-         for (unsigned i = offset; i < size; i++) {
-            /* deref the array member and store each component */
-            nir_deref_instr *component_deref = nir_build_deref_array_imm(b, deref, i);
-            nir_def *val = zero;
-            if (store_mask & BITFIELD_BIT(i - offset))
-               val = nir_channel(b, store_value, i - offset);
-            nir_store_deref(b, component_deref, val, 0x1);
+         nir_def *store_value =
+            nir_build_load_reg(b, 4, 32, c->output_regs[i].reg,
+                               .base = c->output_regs[i].offset +
+                                       (tess_level ? 0 : array_index));
+         uint32_t store_mask = BITFIELD_MASK(store_value->num_components);
+
+         if (tess_level) {
+            store_value = nir_channel(b, store_value, array_index);
+            store_mask = 0x1;
+         } else if (c->build.shader->info.stage == MESA_SHADER_FRAGMENT) {
+            if (var->data.location == FRAG_RESULT_DEPTH)
+               store_value = nir_channel(b, store_value, 2);
+            else if (var->data.location == FRAG_RESULT_STENCIL)
+               store_value = nir_channel(b, store_value, 1);
+            else if (var->data.location == FRAG_RESULT_SAMPLE_MASK)
+               store_value = nir_channel(b, store_value, 0);
+         } else {
+            if (var->data.location == VARYING_SLOT_FOGC ||
+                var->data.location == VARYING_SLOT_LAYER ||
+                var->data.location == VARYING_SLOT_PSIZ)
+               store_value = nir_channel(b, store_value, 0);
+
+            if (var->data.location == VARYING_SLOT_CLIP_DIST0) {
+               unsigned distance_size =
+                  c->build.shader->info.clip_distance_array_size +
+                  c->build.shader->info.cull_distance_array_size;
+               store_mask = BITFIELD_MASK(MIN2(distance_size, 4));
+            } else if (var->data.location == VARYING_SLOT_CLIP_DIST1) {
+               unsigned distance_size =
+                  c->build.shader->info.clip_distance_array_size +
+                  c->build.shader->info.cull_distance_array_size;
+               store_mask = distance_size > 4 ?
+                  BITFIELD_MASK(MIN2(distance_size - 4, 4)) : 0;
+            } else if (var->data.location == VARYING_SLOT_CULL_DIST0) {
+               store_mask = BITFIELD_MASK(
+                  MIN2(c->build.shader->info.cull_distance_array_size, 4));
+            }
          }
-      } else {
-         nir_store_deref(b, nir_build_deref_var(b, var), store_value, store_mask);
+
+         if (b->shader->options->compact_arrays &&
+             (var->data.location == VARYING_SLOT_CLIP_DIST0 ||
+              var->data.location == VARYING_SLOT_CLIP_DIST1 ||
+              var->data.location == VARYING_SLOT_CULL_DIST0)) {
+            unsigned clip_size = b->shader->info.clip_distance_array_size;
+            unsigned cull_size = b->shader->info.cull_distance_array_size;
+            const bool separate_cull =
+               var->data.location == VARYING_SLOT_CULL_DIST0;
+            unsigned total_size =
+               separate_cull ? cull_size : clip_size + cull_size;
+            unsigned global_start =
+               var->data.location == VARYING_SLOT_CLIP_DIST1 ? 4 : 0;
+            unsigned global_end = MIN2(global_start + 4, total_size);
+
+            if (store_mask && global_start < global_end) {
+               nir_def *zero = nir_imm_zero(b, 1, 32);
+               for (unsigned global = global_start;
+                    global < global_end; ++global) {
+                  unsigned component = global - global_start;
+                  nir_variable *dist =
+                     separate_cull ? c->culldist :
+                     global < clip_size ? c->clipdist :
+                                          ttn_ensure_culldist_output(c);
+                  unsigned distance_index =
+                     separate_cull ? global :
+                     global < clip_size ? global : global - clip_size;
+                  if (!dist)
+                     continue;
+
+                  nir_deref_instr *deref = nir_build_deref_var(b, dist);
+                  if (tcs_per_vertex_output)
+                     deref = nir_build_deref_array(
+                        b, deref, nir_load_invocation_id(b));
+                  nir_deref_instr *component_deref =
+                     nir_build_deref_array_imm(b, deref, distance_index);
+                  nir_def *val = zero;
+                  if (store_mask & BITFIELD_BIT(component))
+                     val = nir_channel(b, store_value, component);
+                  nir_store_deref(b, component_deref, val, 0x1);
+               }
+            }
+         } else {
+            nir_deref_instr *deref = nir_build_deref_var(b, var);
+            if (tcs_per_vertex_output)
+               deref = nir_build_deref_array(
+                  b, deref, nir_load_invocation_id(b));
+            else if (array_size > 1)
+               deref = nir_build_deref_array_imm(b, deref, array_index);
+            nir_store_deref(b, deref, store_value, store_mask);
+         }
+
+         if (tcs_tess_level)
+            nir_pop_if(b, NULL);
       }
    }
 }
@@ -2299,6 +3117,24 @@ ttn_compile_init(const void *tgsi_tokens,
       unsigned value = scan.properties[i];
 
       switch (i) {
+      case TGSI_PROPERTY_GS_INPUT_PRIM:
+         if (s->info.stage == MESA_SHADER_GEOMETRY) {
+            s->info.gs.input_primitive = value;
+            s->info.gs.vertices_in = mesa_vertices_per_prim(value);
+         }
+         break;
+      case TGSI_PROPERTY_GS_OUTPUT_PRIM:
+         if (s->info.stage == MESA_SHADER_GEOMETRY)
+            s->info.gs.output_primitive = value;
+         break;
+      case TGSI_PROPERTY_GS_MAX_OUTPUT_VERTICES:
+         if (s->info.stage == MESA_SHADER_GEOMETRY)
+            s->info.gs.vertices_out = value;
+         break;
+      case TGSI_PROPERTY_GS_INVOCATIONS:
+         if (s->info.stage == MESA_SHADER_GEOMETRY)
+            s->info.gs.invocations = value;
+         break;
       case TGSI_PROPERTY_FS_COLOR0_WRITES_ALL_CBUFS:
          break; /* handled in ttn_emit_declaration */
       case TGSI_PROPERTY_FS_COORD_ORIGIN:
@@ -2312,6 +3148,10 @@ ttn_compile_init(const void *tgsi_tokens,
       case TGSI_PROPERTY_FS_DEPTH_LAYOUT:
          if (s->info.stage == MESA_SHADER_FRAGMENT)
             s->info.fs.depth_layout = ttn_get_depth_layout(value);
+         break;
+      case TGSI_PROPERTY_FS_EARLY_DEPTH_STENCIL:
+         if (s->info.stage == MESA_SHADER_FRAGMENT)
+            s->info.fs.early_fragment_tests = value;
          break;
       case TGSI_PROPERTY_VS_WINDOW_SPACE_POSITION:
          if (s->info.stage == MESA_SHADER_VERTEX)
@@ -2343,6 +3183,52 @@ ttn_compile_init(const void *tgsi_tokens,
       case TGSI_PROPERTY_NUM_CLIPDIST_ENABLED:
          s->info.clip_distance_array_size = value;
          break;
+      case TGSI_PROPERTY_NUM_CULLDIST_ENABLED:
+         s->info.cull_distance_array_size = value;
+         break;
+      case TGSI_PROPERTY_TCS_VERTICES_OUT:
+         if (s->info.stage == MESA_SHADER_TESS_CTRL)
+            s->info.tess.tcs_vertices_out = value;
+         break;
+      case TGSI_PROPERTY_TCS_TESS_FACTOR_ROUND_TO_POW2:
+         /*
+          * This is a translator directive consumed while lowering TCS
+           * tessellation-factor stores.  It has no independent NIR shader-info
+           * representation.
+           */
+         break;
+      case TGSI_PROPERTY_TCS_TESS_FACTOR_MAX:
+         /* Consumed while lowering TCS tessellation-factor stores. */
+         break;
+      case TGSI_PROPERTY_TES_PRIM_MODE:
+         if (s->info.stage == MESA_SHADER_TESS_EVAL) {
+            switch (value) {
+            case MESA_PRIM_LINES:
+               s->info.tess._primitive_mode = TESS_PRIMITIVE_ISOLINES;
+               break;
+            case MESA_PRIM_TRIANGLES:
+               s->info.tess._primitive_mode = TESS_PRIMITIVE_TRIANGLES;
+               break;
+            case MESA_PRIM_QUADS:
+               s->info.tess._primitive_mode = TESS_PRIMITIVE_QUADS;
+               break;
+            default:
+               UNREACHABLE("invalid TGSI tessellation primitive");
+            }
+         }
+         break;
+      case TGSI_PROPERTY_TES_SPACING:
+         if (s->info.stage == MESA_SHADER_TESS_EVAL)
+            s->info.tess.spacing = (value + 2) % 3;
+         break;
+      case TGSI_PROPERTY_TES_VERTEX_ORDER_CW:
+         if (s->info.stage == MESA_SHADER_TESS_EVAL)
+            s->info.tess.ccw = !value;
+         break;
+      case TGSI_PROPERTY_TES_POINT_MODE:
+         if (s->info.stage == MESA_SHADER_TESS_EVAL)
+            s->info.tess.point_mode = value;
+         break;
       case TGSI_PROPERTY_LEGACY_MATH_RULES:
          s->info.use_legacy_math_rules = value;
          break;
@@ -2372,12 +3258,18 @@ ttn_compile_init(const void *tgsi_tokens,
                                 scan.file_max[TGSI_FILE_TEMPORARY] + 1);
    c->imm_defs = rzalloc_array(c, nir_def *,
                                scan.file_max[TGSI_FILE_IMMEDIATE] + 1);
+   c->num_addr_regs = scan.file_max[TGSI_FILE_ADDRESS] >= 0 ?
+                      scan.file_max[TGSI_FILE_ADDRESS] + 1 : 0;
+   c->addr_regs = rzalloc_array(c, nir_def *, c->num_addr_regs);
 
    c->num_samp_types = scan.file_max[TGSI_FILE_SAMPLER_VIEW] + 1;
    c->samp_types = rzalloc_array(c, nir_alu_type, c->num_samp_types);
+   for (unsigned i = 0; i < c->num_samp_types; i++)
+      c->samp_types[i] = nir_type_float32;
 
    ttn_parse_tgsi(c, tgsi_tokens);
-   ttn_add_output_stores(c);
+   if (s->info.stage != MESA_SHADER_GEOMETRY)
+      ttn_add_output_stores(c);
 
    nir_validate_shader(c->build.shader, "TTN: after parsing TGSI and creating the NIR shader");
 
@@ -2475,7 +3367,20 @@ lower_clipdistance_to_array(nir_shader *nir)
    nir_variable *dist0 = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_CLIP_DIST0);
    nir_variable *dist1 = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_CLIP_DIST1);
    /* resize VARYING_SLOT_CLIP_DIST0 to the full array size */
-   dist0->type = glsl_array_type(glsl_float_type(), nir->info.clip_distance_array_size, sizeof(float));
+   const struct glsl_type *clip_type =
+      glsl_array_type(glsl_float_type(),
+                      nir->info.clip_distance_array_size, sizeof(float));
+   if (nir_is_arrayed_io(dist0, nir->info.stage)) {
+      assert(glsl_type_is_array(dist0->type));
+      if (!glsl_type_is_array(glsl_get_array_element(dist0->type))) {
+         dist0->type =
+            glsl_array_type(clip_type, glsl_get_length(dist0->type), 0);
+         progress = true;
+      }
+   } else if (dist0->type != clip_type) {
+      dist0->type = clip_type;
+      progress = true;
+   }
    struct set *deletes = _mesa_set_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
    nir_foreach_function_impl(impl, nir) {
       bool func_progress = false;
@@ -2492,6 +3397,8 @@ lower_clipdistance_to_array(nir_shader *nir)
             if (intr->intrinsic != nir_intrinsic_store_deref)
                continue;
             nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (glsl_type_is_scalar(deref->type))
+               continue;
             nir_variable *var = nir_deref_instr_get_variable(deref);
             if (var != dist0 && (!dist1 || var != dist1))
                continue;
@@ -2511,6 +3418,7 @@ lower_clipdistance_to_array(nir_shader *nir)
             /* immediately remove the old store, save the original deref */
             nir_instr_remove(instr);
             _mesa_set_add(deletes, deref);
+            progress = true;
          }
       }
       nir_progress(func_progress, impl, nir_metadata_none);

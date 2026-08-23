@@ -1,12 +1,57 @@
 #include "gdikmt_d3dddi.h"
+#include "Debug.h"
 #include <string.h>
 #include "gdikmt/gdikmt.h"
 #include "pipe/p_state.h"
 #include "util/u_debug.h"
 #include "util/u_memory.h"
+#include "virtio/wddm/viogpu_wddm_driver.h"
+#include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
 
 #include <d3dukmdt.h>
+#include <d3dkmthk.h>
 #include "winddk_compat.h"
+
+/*
+ * Measurement knob for the KMD present round trip.  Rendering is published
+ * independently before this layer is reached.  This option controls only
+ * whether pfnPresentCb is issued:
+ *
+ *   D3D10UMD_YTTRIUM_PRESENT_EVERY=0 skip every callback
+ *   D3D10UMD_YTTRIUM_PRESENT_EVERY=N issue one callback in N
+ *
+ * Skipped presents still emit the BEFORE/AFTER trace pair so the frame count
+ * and the present rate stay comparable against an unmodified run.
+ */
+static bool
+yttrium_present_skip_this_one(void)
+{
+   static const int64_t every = []() {
+      int64_t n = yttrium_gdi_debug_get_num_option(
+                     "D3D10UMD_YTTRIUM_PRESENT_EVERY", 1);
+      return n >= 0 ? n : 1;
+   }();
+   static volatile LONG64 counter;
+
+   if (every == 0)
+      return true;
+   if (every == 1)
+      return false;
+
+   const uint64_t index =
+      (uint64_t)(InterlockedIncrement64(&counter) - 1);
+   return (index % (uint64_t)every) != 0;
+}
+
+static HRESULT
+yttrium_prepare_present(const struct gdikmt_present_info *present_info)
+{
+   if (!present_info || present_info->version < 2 ||
+       !present_info->prepare_present)
+      return S_OK;
+
+   return present_info->prepare_present(present_info->prepare_present_data);
+}
 
 static inline struct gdikmt_context_d3dddi *
 gdikmt_context_d3dddi(struct gdikmt_context *iws)
@@ -18,6 +63,106 @@ static inline struct gdikmt_device_d3dddi *
 gdikmt_device_d3dddi(struct gdikmt_device *iws)
 {
    return (struct gdikmt_device_d3dddi *)iws;
+}
+
+static NTSTATUS
+gdikmt_d3dddi_record_status(struct gdikmt_device *device,
+                            NTSTATUS status,
+                            const char *callback)
+{
+   if (status != (NTSTATUS)D3DDDIERR_DEVICEREMOVED &&
+       status != STATUS_DEVICE_REMOVED)
+      return status;
+
+   if (gdikmt_device_get_reset_status(device) == PIPE_NO_RESET) {
+      yttrium_gdi_trace_warnf(
+         "yttrium: device removed by runtime callback "
+         "owner=yttrium-runtime-callback "
+         "callback=%s status=0x%lx pid=%lu tid=%lu\n",
+         callback ? callback : "<unknown>", (unsigned long)status,
+         GetCurrentProcessId(), GetCurrentThreadId());
+   }
+   gdikmt_device_report_reset(device, PIPE_UNKNOWN_CONTEXT_RESET);
+   return status;
+}
+
+static bool
+gdikmt_is_known_viogpu_escape_type(USHORT type)
+{
+   switch (type) {
+   case VIOGPU_GET_DEVICE_ID:
+   case VIOGPU_GET_CUSTOM_RESOLUTION:
+   case VIOGPU_GET_CAPS:
+   case VIOGPU_RES_INFO:
+   case VIOGPU_RES_BUSY:
+   case VIOGPU_RES_MAP_BLOB:
+   case VIOGPU_RES_UNMAP_BLOB:
+   case VIOGPU_RES_CREATE_BLOB:
+   case VIOGPU_RES_SET_SCANOUT_BLOB:
+   case VIOGPU_RES_ATTACH_WAIT:
+   case VIOGPU_CTX_INIT:
+   case VIOGPU_SUBMIT_CMD:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+gdikmt_warn_invalid_viogpu_escape(const char *source,
+                                  HANDLE hRTAdapter,
+                                  HANDLE hRTDevice,
+                                  const void *private_data,
+                                  UINT private_size)
+{
+   static volatile LONG warning_count;
+   LONG count = InterlockedIncrement(&warning_count);
+   if (count > 8)
+      return;
+
+   USHORT type = 0xffff;
+   USHORT data_length = 0xffff;
+   unsigned char first_bytes[16] = {0};
+
+   if (private_data) {
+      const unsigned char *bytes = (const unsigned char *)private_data;
+      const UINT copy = private_size < sizeof(first_bytes) ?
+         private_size : (UINT)sizeof(first_bytes);
+      memcpy(first_bytes, bytes, copy);
+      if (private_size >= sizeof(type))
+         memcpy(&type, bytes, sizeof(type));
+      if (private_size >= sizeof(type) + sizeof(data_length))
+         memcpy(&data_length, bytes + sizeof(type), sizeof(data_length));
+   }
+
+   yttrium_gdi_trace_warnf(
+      "yttrium: UMD invalid VIOGPU escape source=%s hRTAdapter=%p hRTDevice=%p private=%p private_size=%u type=0x%x data_length=%u pid=%lu tid=%lu bytes=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+      source, hRTAdapter, hRTDevice, private_data, private_size, type, data_length,
+      GetCurrentProcessId(), GetCurrentThreadId(),
+      first_bytes[0], first_bytes[1], first_bytes[2], first_bytes[3],
+      first_bytes[4], first_bytes[5], first_bytes[6], first_bytes[7],
+      first_bytes[8], first_bytes[9], first_bytes[10], first_bytes[11],
+      first_bytes[12], first_bytes[13], first_bytes[14], first_bytes[15]);
+}
+
+static void
+gdikmt_check_viogpu_escape(const char *source,
+                           HANDLE hRTAdapter,
+                           HANDLE hRTDevice,
+                           const void *private_data,
+                           UINT private_size)
+{
+   const UINT header_size = sizeof(USHORT) + sizeof(USHORT);
+   if (!private_data || private_size < header_size) {
+      gdikmt_warn_invalid_viogpu_escape(source, hRTAdapter, hRTDevice,
+                                        private_data, private_size);
+      return;
+   }
+
+   const VIOGPU_ESCAPE *escape = (const VIOGPU_ESCAPE *)private_data;
+   if (!gdikmt_is_known_viogpu_escape_type(escape->Type))
+      gdikmt_warn_invalid_viogpu_escape(source, hRTAdapter, hRTDevice,
+                                        private_data, private_size);
 }
 
 NTSTATUS
@@ -33,8 +178,11 @@ gdikmt_d3dddi_queryadapterinfo(struct gdikmt_device *_device,
    queryAdapterInfo.pPrivateDriverData = pPrivateDriverData;
    queryAdapterInfo.PrivateDriverDataSize = PrivateDriverDataSize;
 
-   return device->pAdapterCallbacks->pfnQueryAdapterInfoCb(device->hRTAdapter,
-                                                           &queryAdapterInfo);
+   NTSTATUS status =
+      device->pAdapterCallbacks->pfnQueryAdapterInfoCb(device->hRTAdapter,
+                                                       &queryAdapterInfo);
+   return gdikmt_d3dddi_record_status(_device, status,
+                                      "pfnQueryAdapterInfoCb");
 }
 
 NTSTATUS
@@ -42,6 +190,8 @@ gdikmt_d3dddi_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
                      UINT PrivateDriverDataSize)
 {
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
+   gdikmt_check_viogpu_escape("d3dddi", device->hRTAdapter, device->hRTDevice,
+                              pPrivateDriverData, PrivateDriverDataSize);
 
    D3DDDICB_ESCAPE escape;
    memset(&escape, 0, sizeof(escape));
@@ -49,7 +199,9 @@ gdikmt_d3dddi_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
    escape.pPrivateDriverData = pPrivateDriverData;
    escape.PrivateDriverDataSize = PrivateDriverDataSize;
 
-   return device->KTCallbacks.pfnEscapeCb(device->hRTAdapter, &escape);
+   NTSTATUS status =
+      device->KTCallbacks.pfnEscapeCb(device->hRTAdapter, &escape);
+   return gdikmt_d3dddi_record_status(_device, status, "pfnEscapeCb");
 }
 
 NTSTATUS
@@ -75,17 +227,63 @@ gdikmt_d3dddi_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
    render.Flags.ResizeAllocationList = options->ResizeAllocationList;
    render.Flags.ResizePatchLocationList = options->ResizePatchLocationList;
 
-   NTSTATUS Status = dev->KTCallbacks.pfnRenderCb(dev->hRTDevice, &render);
-
-   if(options->CompletionEvent) {
-      D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signalEvent;
-      memset(&signalEvent, 0, sizeof(signalEvent));
-      signalEvent.hContext = ctx->hContext;
-      signalEvent.ObjectCount = 0;
-      signalEvent.BroadcastContextCount = 0;
-      signalEvent.Flags.EnqueueCpuEvent = TRUE;
-      signalEvent.CpuEventHandle = options->CompletionEvent;
-      dev->KTCallbacks.pfnSignalSynchronizationObject2Cb(dev->hRTDevice, &signalEvent);
+   yttrium_gdi_trace_debugf("yttrium: pfnRenderCb before hDevice=%p hContext=%p command_length=%u command_offset=%u allocations=%u patches=%u resize_cmd=%u resize_alloc=%u resize_patch=%u new_sizes=%u/%u/%u completion=%p\n",
+                            dev->hRTDevice,
+                            render.hContext,
+                            render.CommandLength,
+                            render.CommandOffset,
+                            render.NumAllocations,
+                            render.NumPatchLocations,
+                            render.Flags.ResizeCommandBuffer ? 1 : 0,
+                            render.Flags.ResizeAllocationList ? 1 : 0,
+                            render.Flags.ResizePatchLocationList ? 1 : 0,
+                            render.NewCommandBufferSize,
+                            render.NewAllocationListSize,
+                            render.NewPatchLocationListSize,
+                            options->CompletionEvent);
+   NTSTATUS Status = gdikmt_d3dddi_record_status(
+      &dev->base,
+      dev->KTCallbacks.pfnRenderCb(dev->hRTDevice, &render),
+      "pfnRenderCb");
+   yttrium_gdi_trace_debugf("yttrium: pfnRenderCb after status=0x%lx hContext=%p new_cmd=%p new_alloc=%p new_patch=%p new_sizes=%u/%u/%u\n",
+                            (unsigned long)Status,
+                            render.hContext,
+                            render.pNewCommandBuffer,
+                            render.pNewAllocationList,
+                            render.pNewPatchLocationList,
+                            render.NewCommandBufferSize,
+                            render.NewAllocationListSize,
+                            render.NewPatchLocationListSize);
+   if (options->CompletionEvent) {
+      NTSTATUS signal_status;
+      if (dev->use_legacy_signal_sync) {
+         static bool warned_legacy_completion_event;
+         if (!warned_legacy_completion_event) {
+            yttrium_gdi_trace_warnf("yttrium: WARNING: D3D9 render "
+                                    "completion event is CPU-signaled, "
+                                    "not GPU-complete\n");
+            yttrium_gdi_user_logf("WARNING: yttrium: D3D9 render "
+                                  "completion event is CPU-signaled, "
+                                  "not GPU-complete\n");
+            warned_legacy_completion_event = true;
+         }
+         signal_status = SetEvent(options->CompletionEvent) ? S_OK : E_FAIL;
+      } else {
+         D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 signalEvent;
+         memset(&signalEvent, 0, sizeof(signalEvent));
+         signalEvent.hContext = ctx->hContext;
+         signalEvent.ObjectCount = 0;
+         signalEvent.BroadcastContextCount = 0;
+         signalEvent.Flags.EnqueueCpuEvent = TRUE;
+         signalEvent.CpuEventHandle = options->CompletionEvent;
+         signal_status = gdikmt_d3dddi_record_status(
+            &dev->base,
+            dev->KTCallbacks.pfnSignalSynchronizationObject2Cb(
+               dev->hRTDevice, &signalEvent),
+            "pfnSignalSynchronizationObject2Cb");
+      }
+      if (!NT_SUCCESS(signal_status))
+         return signal_status;
    }
 
    ctx->base.pCommandBuffer = render.pNewCommandBuffer;
@@ -108,11 +306,31 @@ gdikmt_d3dddi_destroycontext(struct gdikmt_context *_ctx)
    D3DDDICB_DESTROYCONTEXT destroyContext;
    memset(&destroyContext, 0, sizeof(destroyContext));
    destroyContext.hContext = ctx->hContext;
-   dev->KTCallbacks.pfnDestroyContextCb(dev->hRTDevice, &destroyContext);
+   ResourceEvent(RESOURCE_EVENT_CB_BEFORE,
+                 (uint64_t)(uintptr_t)dev->hRTDevice,
+                 ctx, NULL, 0, RESOURCE_EVENT_CB_DESTROY_CONTEXT, 0,
+                 (uint64_t)(uintptr_t)ctx->hContext);
+   NTSTATUS status =
+      dev->KTCallbacks.pfnDestroyContextCb(dev->hRTDevice, &destroyContext);
+   status = gdikmt_d3dddi_record_status(&dev->base, status,
+                                        "pfnDestroyContextCb");
+   ResourceEvent(RESOURCE_EVENT_CB_AFTER,
+                 (uint64_t)(uintptr_t)dev->hRTDevice,
+                 ctx, NULL, 0, RESOURCE_EVENT_CB_DESTROY_CONTEXT,
+                 (uint32_t)status,
+                 (uint64_t)(uintptr_t)ctx->hContext);
 
    FREE(ctx);
 
    return;
+}
+
+static D3DKMT_HANDLE
+gdikmt_d3dddi_context_kmt_handle(struct gdikmt_context *_ctx)
+{
+   struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
+
+   return (D3DKMT_HANDLE)(uintptr_t)ctx->hContext;
 }
 
 NTSTATUS
@@ -129,8 +347,22 @@ gdikmt_d3dddi_createcontext(struct gdikmt_device *_device,
 
    D3DDDICB_CREATECONTEXT createContext;
    memset(&createContext, 0, sizeof(createContext));
-   NTSTATUS Status =
-      device->KTCallbacks.pfnCreateContextCb(device->hRTDevice, &createContext);
+   if (device->use_legacy_signal_sync)
+      createContext.EngineAffinity = 1;
+   NTSTATUS Status = gdikmt_d3dddi_record_status(
+      _device,
+      device->KTCallbacks.pfnCreateContextCb(device->hRTDevice,
+                                             &createContext),
+      "pfnCreateContextCb");
+   yttrium_gdi_trace_debugf("yttrium: pfnCreateContextCb status=0x%lx hContext=%p cmd=%p cmd_size=%u alloc_list=%p alloc_list_size=%u patch_list=%p patch_list_size=%u\n",
+                            (unsigned long)Status,
+                            createContext.hContext,
+                            createContext.pCommandBuffer,
+                            createContext.CommandBufferSize,
+                            createContext.pAllocationList,
+                            createContext.AllocationListSize,
+                            createContext.pPatchLocationList,
+                            createContext.PatchLocationListSize);
 
    if (NT_SUCCESS(Status)) {
       ctx->hContext = createContext.hContext;
@@ -145,6 +377,7 @@ gdikmt_d3dddi_createcontext(struct gdikmt_device *_device,
 
       ctx->base.destroy = gdikmt_d3dddi_destroycontext;
       ctx->base.render = gdikmt_d3dddi_render;
+      ctx->base.kmt_handle = gdikmt_d3dddi_context_kmt_handle;
 
       *out_ctx = &ctx->base;
    }
@@ -166,17 +399,55 @@ gdikmt_d3dddi_createallocation(struct gdikmt_device *_device,
    createAllocation.pPrivateDriverData = options->pPrivateDriverData;
    createAllocation.PrivateDriverDataSize = options->PrivateDriverDataSize;
 
-   createAllocation.hResource = device->hRTResource;
+   HANDLE hRTResource =
+      options->force_allocation_handle ? NULL : device->hRTResource;
+   createAllocation.hResource = hRTResource;
 
    if (device->isPrimary) {
       options->pAllocationInfo->VidPnSourceId = device->allocationVidPn;
       options->pAllocationInfo->Flags.Primary = 1;
    }
 
-   NTSTATUS Status =
-      device->KTCallbacks.pfnAllocateCb(device->hRTDevice, &createAllocation);
+   NTSTATUS Status = gdikmt_d3dddi_record_status(
+      _device,
+      device->KTCallbacks.pfnAllocateCb(device->hRTDevice,
+                                        &createAllocation),
+      "pfnAllocateCb");
+   yttrium_gdi_trace_debugf("yttrium: pfnAllocateCb status=0x%lx hRTResource=%p hKMResource=0x%lx allocations=%u primary=%u vidpn=%u private_size=%u resource_private=%p\n",
+                            (unsigned long)Status,
+                            hRTResource,
+                            (unsigned long)createAllocation.hKMResource,
+                            createAllocation.NumAllocations,
+                            device->isPrimary ? 1 : 0,
+                            device->allocationVidPn,
+                            createAllocation.PrivateDriverDataSize,
+                            createAllocation.pPrivateDriverData);
+   for (UINT i = 0; i < createAllocation.NumAllocations; i++) {
+      const D3DDDI_ALLOCATIONINFO *info = &createAllocation.pAllocationInfo[i];
+      yttrium_gdi_trace_debugf("yttrium: pfnAllocateCb allocation[%u] hAllocation=0x%lx pSystemMem=%p vidpn=%u flags=0x%x private_size=%u private=%p\n",
+                               i,
+                               (unsigned long)info->hAllocation,
+                               info->pSystemMem,
+                               info->VidPnSourceId,
+                               info->Flags.Value,
+                               info->PrivateDriverDataSize,
+                               info->pPrivateDriverData);
+      ResourceEvent(RESOURCE_EVENT_CB_AFTER,
+                    (uint64_t)info->hAllocation,
+                    hRTResource,
+                    device->hRTResource,
+                    (int32_t)Status,
+                    RESOURCE_EVENT_CB_ALLOCATE,
+                    options->force_allocation_handle ? 1 : 0,
+                    (uint64_t)(uintptr_t)device->hRTDevice);
+   }
 
-   options->hResource = (HANDLE)(uintptr_t)createAllocation.hKMResource;
+   options->hAllocationResource = options->force_allocation_handle ? NULL :
+      (HANDLE)(uintptr_t)createAllocation.hKMResource;
+   options->hResource = options->force_allocation_handle ? NULL :
+      (hRTResource ? hRTResource : options->hAllocationResource);
+   options->hResourceIsD3D9Runtime =
+      hRTResource && device->hRTResourceIsD3D9;
 
    return Status;
 }
@@ -187,16 +458,78 @@ gdikmt_d3dddi_destroyallocation(struct gdikmt_device *_device, HANDLE hResource,
 {
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
 
+   /* DestroyDevice is itself a runtime callback.  At this point the runtime
+    * has destroyed all child resources and owns final cleanup of allocations
+    * associated with the device.  Calling back into pfnDeallocateCb from the
+    * Gallium screen/context teardown is rejected with E_INVALIDARG even
+    * though the kernel allocation remains queryable until DestroyDevice
+    * returns.  Do all driver-side unmapping before reaching here, then leave
+    * the runtime-owned allocation for the enclosing device teardown. */
+   if (_device->runtime_destroying) {
+      yttrium_gdi_trace_debugf(
+         "yttrium: allocation release delegated to runtime device teardown "
+         "hAllocation=0x%lx hResource=%p hRTDevice=%p\n",
+         (unsigned long)hAllocation, hResource, device->hRTDevice);
+      return STATUS_SUCCESS;
+   }
+
    D3DDDICB_DEALLOCATE destroyAllocation;
+   /* HandleList is consumed by pfnDeallocateCb below, so its storage must
+    * remain live after the branch which selects the deallocation path. */
+   D3DKMT_HANDLE allocationHandle = hAllocation;
    memset(&destroyAllocation, 0, sizeof(destroyAllocation));
 
-   D3DKMT_HANDLE allocations[1];
-   allocations[0] = hAllocation;
-   destroyAllocation.NumAllocations = 1;
-   destroyAllocation.HandleList = allocations;
+   if (hResource) {
+      destroyAllocation.hResource = hResource;
+   } else {
+      destroyAllocation.NumAllocations = 1;
+      destroyAllocation.HandleList = &allocationHandle;
+   }
 
-   return device->KTCallbacks.pfnDeallocateCb(device->hRTDevice,
-                                              &destroyAllocation);
+   ResourceEvent(RESOURCE_EVENT_CB_BEFORE,
+                 (uint64_t)hAllocation,
+                 destroyAllocation.hResource, NULL, 0,
+                 RESOURCE_EVENT_CB_DEALLOCATE,
+                 destroyAllocation.NumAllocations,
+                 (uint64_t)(uintptr_t)device->hRTDevice);
+   NTSTATUS status =
+      device->KTCallbacks.pfnDeallocateCb(device->hRTDevice,
+                                          &destroyAllocation);
+   status = gdikmt_d3dddi_record_status(_device, status,
+                                        "pfnDeallocateCb");
+   if (!NT_SUCCESS(status)) {
+      VIOGPU_ESCAPE resinfo;
+      memset(&resinfo, 0, sizeof(resinfo));
+      resinfo.Type = VIOGPU_RES_INFO;
+      resinfo.DataLength = sizeof(VIOGPU_RES_INFO_REQ);
+      resinfo.ResourceInfo.ResHandle = hAllocation;
+      NTSTATUS probe_status = STATUS_DEVICE_REMOVED;
+      if (gdikmt_device_get_reset_status(_device) == PIPE_NO_RESET)
+         probe_status =
+            gdikmt_d3dddi_escape(_device, &resinfo, sizeof(resinfo));
+
+      yttrium_gdi_trace_warnf(
+         "yttrium: allocation deallocate callback failed "
+         "status=0x%lx hAllocation=0x%lx "
+         "hResource=%p path=%s count=%u hRTDevice=%p "
+         "callback=%s post_failure_res_info_status=0x%lx "
+         "res_id=%u pid=%lu tid=%lu\n",
+         (unsigned long)status, (unsigned long)hAllocation,
+         destroyAllocation.hResource,
+         destroyAllocation.hResource ? "resource" : "handle-list",
+         destroyAllocation.NumAllocations, device->hRTDevice,
+         "pfnDeallocateCb",
+         (unsigned long)probe_status,
+         NT_SUCCESS(probe_status) ? resinfo.ResourceInfo.Id : 0,
+         GetCurrentProcessId(), GetCurrentThreadId());
+   }
+   ResourceEvent(RESOURCE_EVENT_CB_AFTER,
+                 (uint64_t)hAllocation,
+                 destroyAllocation.hResource, NULL, (int32_t)status,
+                 RESOURCE_EVENT_CB_DEALLOCATE,
+                 destroyAllocation.NumAllocations,
+                 (uint64_t)(uintptr_t)device->hRTDevice);
+   return status;
 }
 
 NTSTATUS
@@ -211,11 +544,30 @@ gdikmt_d3dddi_lockallocation(struct gdikmt_device *_device,
    lock.Flags = flags;
    lock.Flags.LockEntire = TRUE;
    lock.hAllocation = hAllocation;
-   NTSTATUS Status = device->KTCallbacks.pfnLockCb(device->hRTDevice, &lock);
+   NTSTATUS Status = gdikmt_d3dddi_record_status(
+      _device,
+      device->KTCallbacks.pfnLockCb(device->hRTDevice, &lock),
+      "pfnLockCb");
 
    *out_ptr = lock.pData;
 
    return Status;
+}
+
+NTSTATUS
+gdikmt_d3dddi_unlockallocation(struct gdikmt_device *_device,
+                               D3DKMT_HANDLE hAllocation)
+{
+   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
+
+   D3DDDICB_UNLOCK unlock;
+   memset(&unlock, 0, sizeof(unlock));
+   unlock.NumAllocations = 1;
+   unlock.phAllocations = &hAllocation;
+
+   NTSTATUS status =
+      device->KTCallbacks.pfnUnlockCb(device->hRTDevice, &unlock);
+   return gdikmt_d3dddi_record_status(_device, status, "pfnUnlockCb");
 }
 
 NTSTATUS
@@ -224,6 +576,30 @@ gdikmt_d3dddi_queryallocation(struct gdikmt_device *_device,
 {
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
 
+   if (device->pD3D9OpenResource) {
+      options->hAllocationResource =
+         (HANDLE)(uintptr_t)device->pD3D9OpenResource->hKMResource;
+      options->hResource = device->hRTResource ?
+         device->hRTResource :
+         options->hAllocationResource;
+      options->hResourceIsD3D9Runtime =
+         device->hRTResource && device->hRTResourceIsD3D9;
+      options->NumAllocations = device->pD3D9OpenResource->NumAllocations;
+      options->PrivateDriverDataSize =
+         device->pD3D9OpenResource->PrivateDriverDataSize;
+      options->TotalBufferSize = 1;
+      return STATUS_SUCCESS;
+   }
+
+   if (!device->pOpenResource)
+      return STATUS_INVALID_PARAMETER;
+
+   options->hAllocationResource =
+      (HANDLE)(uintptr_t)device->pOpenResource->hKMResource.handle;
+   options->hResource = device->hRTResource ?
+      device->hRTResource : options->hAllocationResource;
+   options->hResourceIsD3D9Runtime =
+      device->hRTResource && device->hRTResourceIsD3D9;
    options->NumAllocations = device->pOpenResource->NumAllocations;
    options->PrivateDriverDataSize =
       device->pOpenResource->PrivateDriverDataSize;
@@ -238,6 +614,29 @@ gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
 {
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
 
+   if (device->pD3D9OpenResource) {
+      for (UINT i = 0; i < options->NumAllocations; i++)
+         options->pOpenAllocation[i] =
+            device->pD3D9OpenResource->pOpenAllocationInfo[i];
+
+      memcpy(options->pPrivateDriverData,
+             device->pD3D9OpenResource->pPrivateDriverData,
+             device->pD3D9OpenResource->PrivateDriverDataSize);
+
+      options->hAllocationResource =
+         (HANDLE)(uintptr_t)device->pD3D9OpenResource->hKMResource;
+      options->hResource = device->hRTResource ?
+         device->hRTResource : options->hAllocationResource;
+      options->hResourceIsD3D9Runtime =
+         device->hRTResource && device->hRTResourceIsD3D9;
+      options->PrivateDriverDataSize =
+         device->pD3D9OpenResource->PrivateDriverDataSize;
+      return STATUS_SUCCESS;
+   }
+
+   if (!device->pOpenResource)
+      return STATUS_INVALID_PARAMETER;
+
    for (UINT i = 0; i < options->NumAllocations; i++) {
       options->pOpenAllocation[i] =
          device->pOpenResource->pOpenAllocationInfo[i];
@@ -247,6 +646,12 @@ gdikmt_d3dddi_openallocation(struct gdikmt_device *_device,
           device->pOpenResource->pPrivateDriverData,
           device->pOpenResource->PrivateDriverDataSize);
 
+   options->hAllocationResource =
+      (HANDLE)(uintptr_t)device->pOpenResource->hKMResource.handle;
+   options->hResource = device->hRTResource ?
+      device->hRTResource : options->hAllocationResource;
+   options->hResourceIsD3D9Runtime =
+      device->hRTResource && device->hRTResourceIsD3D9;
    options->PrivateDriverDataSize =
       device->pOpenResource->PrivateDriverDataSize;
 
@@ -259,17 +664,145 @@ gdikmt_d3dddi_present(struct gdikmt_context *_ctx, D3DKMT_HANDLE hSrcAllocation,
 {
    struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_ctx->device);
+   const struct gdikmt_present_info *present_info =
+      gdikmt_present_info_from_context(winsys_drawable_handle);
+
+   if (!device->pDXGIBaseCallbacks && device->KTCallbacks.pfnPresentCb) {
+      D3DDDICB_PRESENT kmPresent;
+      memset(&kmPresent, 0, sizeof(kmPresent));
+      kmPresent.hSrcAllocation = hSrcAllocation;
+      kmPresent.hDstAllocation =
+         present_info ? present_info->hDstAllocation : 0;
+      kmPresent.hContext = ctx->hContext;
+      kmPresent.BroadcastContextCount = 0;
+      yttrium_gdi_trace_debugf("yttrium: d3d9 pfnPresentCb before hSrcAllocation=0x%lx hDstAllocation=0x%lx hContext=%p broadcast=%u sync_override_valid=%u sync_override=%u\n",
+                               (unsigned long)kmPresent.hSrcAllocation,
+                               (unsigned long)kmPresent.hDstAllocation,
+                               kmPresent.hContext,
+                               kmPresent.BroadcastContextCount,
+                               kmPresent.SyncIntervalOverrideValid ? 1 : 0,
+                               kmPresent.SyncIntervalOverride);
+      HRESULT res = yttrium_prepare_present(present_info);
+      if (FAILED(res)) {
+         yttrium_gdi_trace_warnf("yttrium: ERROR: display callback suppressed owner=yttrium-runtime-callback reason=render-publication-not-issued callback=D3D9-pfnPresentCb status=0x%lx\n",
+                                 (unsigned long)res);
+         return res;
+      }
+
+      if (yttrium_present_skip_this_one()) {
+         yttrium_gdi_trace_debugf("yttrium: d3d9 pfnPresentCb skipped by PRESENT_EVERY\n");
+         return S_OK;
+      }
+
+      yttrium_gdi_trace_debugf("yttrium: d3d9 pfnPresentCb actual callback issue\n");
+      res = device->KTCallbacks.pfnPresentCb(device->hRTDevice, &kmPresent);
+      res = gdikmt_d3dddi_record_status(_ctx->device, res,
+                                        "pfnPresentCb");
+      yttrium_gdi_trace_debugf("yttrium: d3d9 pfnPresentCb after status=0x%lx hSrcAllocation=0x%lx hDstAllocation=0x%lx hContext=%p optimize=%u private_size=%u private=%p\n",
+                               (unsigned long)res,
+                               (unsigned long)kmPresent.hSrcAllocation,
+                               (unsigned long)kmPresent.hDstAllocation,
+                               kmPresent.hContext,
+                               kmPresent.bOptimizeForComposition ? 1 : 0,
+                               kmPresent.PrivateDriverDataSize,
+                               kmPresent.pPrivateDriverData);
+      return res;
+   }
 
    DXGIDDICB_PRESENT kmPresent;
    memset(&kmPresent, 0, sizeof(kmPresent));
    kmPresent.hSrcAllocation = hSrcAllocation;
-   kmPresent.hDstAllocation = NULL;
-   kmPresent.pDXGIContext = winsys_drawable_handle;
+   kmPresent.hDstAllocation =
+      present_info ? present_info->hDstAllocation : 0;
+   kmPresent.pDXGIContext =
+      present_info ? present_info->dxgi_context : winsys_drawable_handle;
    kmPresent.hContext = ctx->hContext;
    kmPresent.BroadcastContextCount = 0;
+   yttrium_gdi_trace_present_callback(
+      YTTRIUM_GDI_TRACE_PFN_PRESENT_BEFORE,
+      0,
+      (uint64_t)kmPresent.hSrcAllocation,
+      (uint64_t)kmPresent.hDstAllocation,
+      (uint64_t)(uintptr_t)kmPresent.hContext,
+      (uint64_t)(uintptr_t)kmPresent.pDXGIContext,
+      kmPresent.PrivateDriverDataSize,
+      kmPresent.bOptimizeForComposition ? 1 : 0,
+      kmPresent.BroadcastContextCount);
+   yttrium_gdi_trace_debugf("yttrium: pfnPresentCb before hSrcAllocation=0x%lx hDstAllocation=0x%lx hContext=%p pDXGIContext=%p private_size=%u private=%p broadcast=%u sync_override_valid=%u sync_override=%u\n",
+                            (unsigned long)kmPresent.hSrcAllocation,
+                            (unsigned long)kmPresent.hDstAllocation,
+                            kmPresent.hContext,
+                            kmPresent.pDXGIContext,
+                            kmPresent.PrivateDriverDataSize,
+                            kmPresent.pPrivateDriverData,
+                            kmPresent.BroadcastContextCount,
+                            kmPresent.SyncIntervalOverrideValid ? 1 : 0,
+                            kmPresent.SyncIntervalOverride);
+   /*
+    * Diagnostic: pfnPresentCb costs 19.4 ms per frame windowed, where it
+    * blocks on DWM compositing the surface through the CPU, and 0.5 ms
+    * fullscreen.  Skipping or thinning it measures what the frame costs
+    * without the present round trip, which is the only way to separate the
+    * render loop from the compositor.
+    *
+    * PRESENT_EVERY=0 skips the callback entirely.  PRESENT_EVERY=N issues one
+    * callback in N and skips the rest, which keeps the window updating while
+    * removing most of the KMD ResFlush round trips.  Rendering publication is
+    * asynchronous and happens independently for every application Present.
+    */
+   HRESULT res = yttrium_prepare_present(present_info);
+   if (FAILED(res)) {
+      yttrium_gdi_trace_warnf("yttrium: ERROR: display callback suppressed owner=yttrium-runtime-callback reason=render-publication-not-issued callback=DXGI-pfnPresentCb status=0x%lx\n",
+                              (unsigned long)res);
+      yttrium_gdi_trace_present_callback(
+         YTTRIUM_GDI_TRACE_PFN_PRESENT_AFTER, res,
+         (uint64_t)kmPresent.hSrcAllocation,
+         (uint64_t)kmPresent.hDstAllocation,
+         (uint64_t)(uintptr_t)kmPresent.hContext,
+         (uint64_t)(uintptr_t)kmPresent.pDXGIContext,
+         kmPresent.PrivateDriverDataSize,
+         kmPresent.bOptimizeForComposition ? 1 : 0,
+         kmPresent.BroadcastContextCount);
+      return res;
+   }
 
-   HRESULT res =
-      device->pDXGIBaseCallbacks->pfnPresentCb(device->hRTDevice, &kmPresent);
+   if (yttrium_present_skip_this_one()) {
+      yttrium_gdi_trace_debugf("yttrium: pfnPresentCb skipped by PRESENT_EVERY\n");
+      yttrium_gdi_trace_present_callback(
+         YTTRIUM_GDI_TRACE_PFN_PRESENT_AFTER, 0,
+         (uint64_t)kmPresent.hSrcAllocation,
+         (uint64_t)kmPresent.hDstAllocation,
+         (uint64_t)(uintptr_t)kmPresent.hContext,
+         (uint64_t)(uintptr_t)kmPresent.pDXGIContext,
+         kmPresent.PrivateDriverDataSize,
+         kmPresent.bOptimizeForComposition ? 1 : 0,
+         kmPresent.BroadcastContextCount);
+      return S_OK;
+   }
+
+   yttrium_gdi_trace_debugf("yttrium: pfnPresentCb actual callback issue\n");
+   res = device->pDXGIBaseCallbacks->pfnPresentCb(device->hRTDevice, &kmPresent);
+   res = gdikmt_d3dddi_record_status(_ctx->device, res,
+                                     "DXGI pfnPresentCb");
+   yttrium_gdi_trace_present_callback(
+      YTTRIUM_GDI_TRACE_PFN_PRESENT_AFTER,
+      res,
+      (uint64_t)kmPresent.hSrcAllocation,
+      (uint64_t)kmPresent.hDstAllocation,
+      (uint64_t)(uintptr_t)kmPresent.hContext,
+      (uint64_t)(uintptr_t)kmPresent.pDXGIContext,
+      kmPresent.PrivateDriverDataSize,
+      kmPresent.bOptimizeForComposition ? 1 : 0,
+      kmPresent.BroadcastContextCount);
+   yttrium_gdi_trace_debugf("yttrium: pfnPresentCb after status=0x%lx hSrcAllocation=0x%lx hDstAllocation=0x%lx hContext=%p pDXGIContext=%p optimize=%u private_size=%u private=%p\n",
+                            (unsigned long)res,
+                            (unsigned long)kmPresent.hSrcAllocation,
+                            (unsigned long)kmPresent.hDstAllocation,
+                            kmPresent.hContext,
+                            kmPresent.pDXGIContext,
+                            kmPresent.bOptimizeForComposition ? 1 : 0,
+                            kmPresent.PrivateDriverDataSize,
+                            kmPresent.pPrivateDriverData);
    return res;
 };
 
@@ -280,12 +813,14 @@ gdikmt_d3dddi_setdisplaymode(struct gdikmt_device *_device,
    struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
 
    D3DDDICB_SETDISPLAYMODE setMode;
+   memset(&setMode, 0, sizeof(setMode));
    setMode.hPrimaryAllocation = hSrcAllocation;
    setMode.PrivateDriverFormatAttribute = 0;
 
-   HRESULT res =
+   NTSTATUS status =
       device->KTCallbacks.pfnSetDisplayModeCb(device->hRTDevice, &setMode);
-   return res;
+   return gdikmt_d3dddi_record_status(_device, status,
+                                      "pfnSetDisplayModeCb");
 };
 
 void gdikmt_d3dddi_destroy(struct gdikmt_device *_device){};
@@ -302,6 +837,7 @@ gdikmt_d3dddi_fill_basefuncs(struct gdikmt_device_d3dddi *device)
    device->base.createAllocation = gdikmt_d3dddi_createallocation;
    device->base.destroyAllocation = gdikmt_d3dddi_destroyallocation;
    device->base.lockAllocation = gdikmt_d3dddi_lockallocation;
+   device->base.unlockAllocation = gdikmt_d3dddi_unlockallocation;
    device->base.queryAllocation = gdikmt_d3dddi_queryallocation;
    device->base.openAllocation = gdikmt_d3dddi_openallocation;
 

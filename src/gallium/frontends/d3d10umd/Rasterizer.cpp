@@ -32,9 +32,47 @@
 
 
 #include "Rasterizer.h"
+#include "OutputMerger.h"
+#include "Shader.h"
 #include "State.h"
 
 #include "Debug.h"
+
+static void *
+GetDefaultRasterizerDiscardState(Device *pDevice)
+{
+   if (!pDevice->default_rasterizer_discard_state) {
+      struct pipe_rasterizer_state state;
+      memset(&state, 0, sizeof state);
+      state.rasterizer_discard = 1;
+      state.half_pixel_center = 1;
+      state.clip_halfz = 1;
+      state.depth_clip_near = 1;
+      state.depth_clip_far = 1;
+      state.depth_clamp = 1;
+      pDevice->default_rasterizer_discard_state =
+         pDevice->pipe->create_rasterizer_state(pDevice->pipe, &state);
+   }
+
+   return pDevice->default_rasterizer_discard_state;
+}
+
+void
+ApplyRasterizerState(Device *pDevice)
+{
+   RasterizerState *state = pDevice->rasterizer_state;
+   bool discard =
+      pDevice->bound_gs && pDevice->bound_gs->no_rasterized_stream;
+   void *handle;
+
+   if (state) {
+      handle = discard ? state->discard_handle : state->handle;
+   } else {
+      handle = discard ? GetDefaultRasterizerDiscardState(pDevice) : NULL;
+   }
+
+   pDevice->pipe->bind_rasterizer_state(pDevice->pipe, handle);
+}
 
 
 /*
@@ -55,7 +93,8 @@ SetViewports(D3D10DDI_HDEVICE hDevice,                                        //
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
+   Device *pDevice = CastDevice(hDevice);
+   struct pipe_context *pipe = pDevice->pipe;
    struct pipe_viewport_state states[PIPE_MAX_VIEWPORTS];
 
    ASSERT(NumViewports + ClearViewports <=
@@ -79,13 +118,31 @@ SetViewports(D3D10DDI_HDEVICE hDevice,                                        //
       states[i].translate[0] = half_width + x;
       states[i].translate[1] = half_height + y;
       states[i].translate[2] = z;
+
+      if (i == 0) {
+         pDevice->viewport_fb_width = (unsigned)(x + width);
+         pDevice->viewport_fb_height = (unsigned)(y + height);
+      }
    }
    if (ClearViewports) {
       memset(states + NumViewports, 0,
              sizeof(struct pipe_viewport_state) * ClearViewports);
+      if (!NumViewports) {
+         pDevice->viewport_fb_width = 0;
+         pDevice->viewport_fb_height = 0;
+      }
    }
    pipe->set_viewport_states(pipe, 0, NumViewports + ClearViewports,
                              states);
+
+   if (!pDevice->fb.nr_cbufs && !pDevice->fb.zsbuf.texture &&
+       pDevice->viewport_fb_width && pDevice->viewport_fb_height &&
+       (pDevice->fb.width != pDevice->viewport_fb_width ||
+        pDevice->fb.height != pDevice->viewport_fb_height)) {
+      pDevice->fb.width = pDevice->viewport_fb_width;
+      pDevice->fb.height = pDevice->viewport_fb_height;
+      pipe->set_framebuffer_state(pipe, &pDevice->fb);
+   }
 }
 
 
@@ -235,7 +292,12 @@ CreateRasterizerState(
    state.line_width = 1.0f;
    state.line_rectangular = 0;
 
+   pRasterizerState->state = state;
+   pRasterizerState->forced_sample_count = 0;
    pRasterizerState->handle = pipe->create_rasterizer_state(pipe, &state);
+   state.rasterizer_discard = 1;
+   pRasterizerState->discard_handle =
+      pipe->create_rasterizer_state(pipe, &state);
 }
 
 
@@ -260,7 +322,12 @@ DestroyRasterizerState(D3D10DDI_HDEVICE hDevice,                     // IN
    struct pipe_context *pipe = CastPipeContext(hDevice);
    RasterizerState *pRasterizerState = CastRasterizerState(hRasterizerState);
 
+   Device *pDevice = CastDevice(hDevice);
+   if (pDevice->rasterizer_state == pRasterizerState)
+      pDevice->rasterizer_state = NULL;
+
    pipe->delete_rasterizer_state(pipe, pRasterizerState->handle);
+   pipe->delete_rasterizer_state(pipe, pRasterizerState->discard_handle);
 }
 
 
@@ -280,8 +347,12 @@ SetRasterizerState(D3D10DDI_HDEVICE hDevice,                   // IN
 {
    LOG_ENTRYPOINT();
 
-   struct pipe_context *pipe = CastPipeContext(hDevice);
-   void *state = CastPipeRasterizerState(hRasterizerState);
+   Device *pDevice = CastDevice(hDevice);
 
-   pipe->bind_rasterizer_state(pipe, state);
+   pDevice->rasterizer_state = CastRasterizerState(hRasterizerState);
+   ApplyRasterizerState(pDevice);
+   UpdateFramebufferForcedSampleCount(pDevice);
+   pDevice->pipe->set_framebuffer_state(pDevice->pipe, &pDevice->fb);
+   UpdateBufferInfoSampleConstants(pDevice, MESA_SHADER_FRAGMENT);
+   UpdateBufferInfoConstants(pDevice, MESA_SHADER_FRAGMENT);
 }

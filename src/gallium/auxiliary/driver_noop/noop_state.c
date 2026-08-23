@@ -217,6 +217,7 @@ static struct pipe_stream_output_target *noop_create_stream_output_target(
       return NULL;
 
    pipe_reference_init(&t->reference, 1);
+   t->context = ctx;
    pipe_resource_reference(&t->buffer, res);
    t->buffer_offset = buffer_offset;
    t->buffer_size = buffer_size;

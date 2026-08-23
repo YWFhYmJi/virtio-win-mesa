@@ -138,6 +138,13 @@ option(
 )
 
 option(
+  'gallium-yttrium',
+  type : 'boolean',
+  value : false,
+  description : 'build gallium Yttrium support for Windows D3D10/Vulkan presentation.',
+)
+
+option(
   'gallium-rusticl',
   type : 'boolean',
   value : false,

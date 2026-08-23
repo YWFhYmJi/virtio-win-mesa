@@ -37,6 +37,8 @@
 
 #include "Debug.h"
 
+#include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+
 #include "util/u_memory.h"
 
 
@@ -45,6 +47,15 @@ static HRESULT APIENTRY CloseAdapter(D3D10DDI_HADAPTER hAdapter);
 static unsigned long numAdapters = 0;
 #if 0
 static unsigned long memdbg_no = 0;
+#endif
+
+#if SUPPORT_D3D11_1
+static bool
+ExposeD3D11_1()
+{
+   return yttrium_gdi_debug_get_bool_option(
+      "D3D10UMD_YTTRIUM_ENABLE_FL11_1", true);
+}
 #endif
 
 /*
@@ -120,6 +131,19 @@ OpenAdapter10(__inout D3D10DDIARG_OPENADAPTER *pOpenData)   // IN
 #if SUPPORT_D3D11
    case D3D11_0_DDI_INTERFACE_VERSION:
    case D3D11_0_7_DDI_INTERFACE_VERSION:
+      break;
+#if SUPPORT_D3D11_1
+   case D3D11_1_DDI_INTERFACE_VERSION:
+      if (!ExposeD3D11_1())
+         return E_FAIL;
+      break;
+#endif
+#if SUPPORT_D3D_WDDM1_3
+   case D3DWDDM1_3_DDI_INTERFACE_VERSION:
+      if (!ExposeD3D11_1())
+         return E_FAIL;
+      break;
+#endif
 #endif
       break;
    default:
@@ -135,7 +159,7 @@ OpenAdapter10(__inout D3D10DDIARG_OPENADAPTER *pOpenData)   // IN
 
 
 static const UINT64
-SupportedDDIInterfaceVersions[] = {
+SupportedDDIInterfaceVersionsBase[] = {
    D3D10_0_DDI_SUPPORTED,
    D3D10_0_x_DDI_SUPPORTED,
    D3D10_0_7_DDI_SUPPORTED,
@@ -149,6 +173,18 @@ SupportedDDIInterfaceVersions[] = {
    D3D11_0_7_DDI_SUPPORTED,
 #endif
 };
+
+#if SUPPORT_D3D11_1
+static const UINT64
+SupportedDDIInterfaceVersions11_1[] = {
+#if SUPPORT_D3D11_1
+   D3D11_1_DDI_SUPPORTED,
+#endif
+#if SUPPORT_D3D_WDDM1_3
+   D3DWDDM1_3_DDI_SUPPORTED,
+#endif
+};
+#endif
 
 
 /*
@@ -169,17 +205,31 @@ GetSupportedVersions(D3D10DDI_HADAPTER hAdapter,
 {
    LOG_ENTRYPOINT();
 
+   UINT32 entry_count = ARRAYSIZE(SupportedDDIInterfaceVersionsBase);
+#if SUPPORT_D3D11_1
+   if (ExposeD3D11_1())
+      entry_count += ARRAYSIZE(SupportedDDIInterfaceVersions11_1);
+#endif
+
    if (pSupportedDDIInterfaceVersions &&
-       *puEntries < ARRAYSIZE(SupportedDDIInterfaceVersions)) {
+       *puEntries < entry_count) {
       return E_OUTOFMEMORY;
    }
 
-   *puEntries = ARRAYSIZE(SupportedDDIInterfaceVersions);
+   *puEntries = entry_count;
 
    if (pSupportedDDIInterfaceVersions) {
       memcpy(pSupportedDDIInterfaceVersions,
-             SupportedDDIInterfaceVersions,
-             sizeof SupportedDDIInterfaceVersions);
+             SupportedDDIInterfaceVersionsBase,
+             sizeof SupportedDDIInterfaceVersionsBase);
+#if SUPPORT_D3D11_1
+      if (ExposeD3D11_1()) {
+         memcpy(pSupportedDDIInterfaceVersions +
+                   ARRAYSIZE(SupportedDDIInterfaceVersionsBase),
+                SupportedDDIInterfaceVersions11_1,
+                sizeof SupportedDDIInterfaceVersions11_1);
+      }
+#endif
    }
 
    return S_OK;
@@ -202,6 +252,60 @@ GetCaps(D3D10DDI_HADAPTER hAdapter,
 {
    LOG_ENTRYPOINT();
    memset(pData->pData, 0, pData->DataSize);
+   switch (pData->Type) {
+#if SUPPORT_D3D11
+   case D3D11DDICAPS_3DPIPELINESUPPORT:
+      if (pData->DataSize >= sizeof(D3D11DDI_3DPIPELINESUPPORT_CAPS)) {
+         D3D11DDI_3DPIPELINESUPPORT_CAPS *caps =
+            (D3D11DDI_3DPIPELINESUPPORT_CAPS *)pData->pData;
+         UINT pipeline_caps =
+            D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(
+               D3D11DDI_3DPIPELINELEVEL_10_0) |
+            D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(
+               D3D11DDI_3DPIPELINELEVEL_10_1) |
+            D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(
+               D3D11DDI_3DPIPELINELEVEL_11_0);
+#if SUPPORT_D3D11_1
+         if (ExposeD3D11_1()) {
+            pipeline_caps |= D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(
+               D3D11_1DDI_3DPIPELINELEVEL_11_1);
+         }
+#endif
+         caps->Caps = pipeline_caps;
+      }
+      break;
+   case D3D11DDICAPS_THREADING:
+      break;
+   case D3D11DDICAPS_SHADER:
+      if (pData->DataSize >= sizeof(D3D11DDI_SHADER_CAPS)) {
+         D3D11DDI_SHADER_CAPS *caps =
+            (D3D11DDI_SHADER_CAPS *)pData->pData;
+         caps->Caps =
+            D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X;
+      }
+      break;
+#if SUPPORT_D3D11_1
+   case D3D11_1DDICAPS_D3D11_OPTIONS:
+      if (pData->DataSize >= sizeof(D3D11_1DDI_D3D11_OPTIONS_DATA)) {
+         D3D11_1DDI_D3D11_OPTIONS_DATA *caps =
+            (D3D11_1DDI_D3D11_OPTIONS_DATA *)pData->pData;
+         caps->OutputMergerLogicOp = TRUE;
+      }
+      break;
+#endif
+#if SUPPORT_D3D_WDDM1_3
+   case D3DWDDM1_3DDICAPS_D3D11_OPTIONS1:
+      if (pData->DataSize >= sizeof(D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1)) {
+         D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1 *caps =
+            (D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1 *)pData->pData;
+         caps->TiledResourcesSupportFlags = 0;
+      }
+      break;
+#endif
+#endif
+   default:
+      break;
+   }
    return S_OK;
 }
 

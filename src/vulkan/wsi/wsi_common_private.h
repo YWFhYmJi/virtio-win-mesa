@@ -48,6 +48,9 @@ enum wsi_image_type {
    WSI_IMAGE_TYPE_CPU,
    WSI_IMAGE_TYPE_DRM,
    WSI_IMAGE_TYPE_DXGI,
+#if defined(HAVE_YTTRIUM)
+   WSI_IMAGE_TYPE_DXGI_SHARED,
+#endif
    WSI_IMAGE_TYPE_METAL,
 };
 
@@ -77,6 +80,12 @@ struct wsi_dxgi_image_params {
    struct wsi_base_image_params base;
    bool storage_image;
 };
+
+#if defined(HAVE_YTTRIUM)
+struct wsi_dxgi_shared_image_params {
+   struct wsi_base_image_params base;
+};
+#endif
 
 typedef uint32_t (*wsi_memory_type_select_cb)(const struct wsi_device *wsi,
                                               uint32_t type_bits);
@@ -390,6 +399,14 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
                          const VkSwapchainCreateInfoKHR *pCreateInfo,
                          const struct wsi_dxgi_image_params *params,
                          struct wsi_image_info *info);
+
+#if defined(HAVE_YTTRIUM)
+VkResult
+wsi_dxgi_shared_configure_image(const struct wsi_swapchain *chain,
+                                const VkSwapchainCreateInfoKHR *pCreateInfo,
+                                const struct wsi_dxgi_shared_image_params *params,
+                                struct wsi_image_info *info);
+#endif
 
 bool
 wsi_cpu_image_needs_buffer_blit(const struct wsi_device *wsi,

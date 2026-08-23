@@ -12,6 +12,9 @@
 
 #include "vk_enum_to_str.h"
 #include "wsi_common_entrypoints.h"
+#if defined(HAVE_YTTRIUM)
+#include "venus-protocol/vn_protocol_driver_image.h"
+#endif
 
 #include "vn_device.h"
 #include "vn_image.h"
@@ -128,15 +131,67 @@ vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
       &physical_dev->instance->base.vk, pName);
 }
 
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+static VkResult
+vn_wsi_create_image_memory_from_win32_handle(
+   VkDevice device,
+   VkImage image,
+   void *handle,
+   VkDeviceSize min_allocation_size,
+   const VkAllocationCallbacks *alloc,
+   VkDeviceMemory *out)
+{
+   struct vn_device *dev = vn_device_from_handle(device);
+
+   VkMemoryRequirements reqs;
+   vn_call_vkGetImageMemoryRequirements(dev->primary_ring, device, image,
+                                        &reqs);
+   if (!reqs.memoryTypeBits)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct wsi_memory_win32_handle_import_info import_info = {
+      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_WIN32_HANDLE_IMPORT_INFO_MESA,
+      .pNext = NULL,
+      .handle = handle,
+   };
+   VkMemoryDedicatedAllocateInfo dedicated_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .pNext = &import_info,
+      .image = image,
+      .buffer = VK_NULL_HANDLE,
+   };
+   VkMemoryAllocateInfo memory_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &dedicated_info,
+      .allocationSize = MAX2(reqs.size, min_allocation_size),
+      .memoryTypeIndex = ffs(reqs.memoryTypeBits) - 1,
+   };
+
+   return vn_AllocateMemory(device, &memory_info, alloc, out);
+}
+#endif
+
 VkResult
 vn_wsi_init(struct vn_physical_device *physical_dev)
 {
+#if DETECT_OS_WINDOWS
+   /* EXT_external_memory_dma_buf is Linux-only and is never advertised on
+    * Windows (see vn_physical_device_get_native_extensions), so it cannot be
+    * used to decide this here -- doing so would always mark the device as
+    * software.  That in turn makes wsi_win32_init() skip creating the DXGI
+    * factory, which disables both win32 present paths and silently forces the
+    * GDI cpu map+blit path.  The win32 WSI instead presents through a shared
+    * D3D11 texture imported via create_image_memory_from_win32_handle below.
+    */
+   const bool use_sw_device = false;
+#else
    const bool use_sw_device =
       !physical_dev->base.vk.supported_extensions
           .EXT_external_memory_dma_buf ||
       (physical_dev->renderer_driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
        physical_dev->renderer_driver_version <
           VN_MAKE_NVIDIA_VERSION(590, 48, 1, 0));
+#endif
 
    /* Normally Venus on Nvidia GPUs takes the prime blit path. The exception
     * is when KWin or any wlroots based compositors are used:
@@ -189,6 +244,10 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
    physical_dev->wsi_device.supports_scanout = false;
    physical_dev->wsi_device.supports_modifiers =
       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+   physical_dev->wsi_device.win32.create_image_memory_from_win32_handle =
+      vn_wsi_create_image_memory_from_win32_handle;
+#endif
    physical_dev->base.vk.wsi_device = &physical_dev->wsi_device;
 
    return VK_SUCCESS;

@@ -149,6 +149,12 @@ struct wsi_device {
       VkResult (*create_image_memory)(VkDevice device, void *resource,
                                       const VkAllocationCallbacks *alloc,
                                       VkDeviceMemory *out);
+#if defined(HAVE_YTTRIUM)
+      VkResult (*create_image_memory_from_win32_handle)(
+         VkDevice device, VkImage image, void *handle,
+         VkDeviceSize min_allocation_size, const VkAllocationCallbacks *alloc,
+         VkDeviceMemory *out);
+#endif
    } win32;
 
    struct {

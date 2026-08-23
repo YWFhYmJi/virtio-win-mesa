@@ -19,6 +19,7 @@
 
 #include "vn_renderer_d3dkmt.h"
 #include "vn_common.h"
+#include "util/log.h"
 #include "util/os_file.h"
 #include "util/sparse_array.h"
 
@@ -58,6 +59,11 @@ struct virtgpu_shmem {
 struct virtgpu_bo {
    struct vn_renderer_bo base;
    uint32_t alloc_handle;
+   /* Non-zero when this bo came from D3DKMTOpenResource: its allocation is
+    * owned by that resource and must be destroyed through it, not by the
+    * allocation handle alone.
+    */
+   uint32_t open_resource_handle;
    uint32_t blob_flags;
 };
 
@@ -148,9 +154,14 @@ struct virtgpu {
    PFND3DKMT_DESTROYALLOCATION pfnDestroyAllocation;
    PFND3DKMT_SHAREOBJECTS pfnShareObjects;
    PFND3DKMT_OPENRESOURCEFROMNTHANDLE pfnOpenResourceFromNtHandle;
+#if defined(HAVE_YTTRIUM)
+   PFND3DKMT_QUERYRESOURCEINFO pfnQueryResourceInfo;
+   PFND3DKMT_OPENRESOURCE pfnOpenResource;
+#endif
    PFND3DKMT_OPENADAPTERFROMHDC pfnOpenAdapterFromHdc;
    PFND3DKMT_CLOSEADAPTER pfnCloseAdapter;
    D3DKMT_HANDLE hAdapter;
+   LUID adapter_luid;
    D3DKMT_HANDLE hDevice;
    D3DKMT_HANDLE hContext;
    void *command_buffer;
@@ -741,21 +752,41 @@ virtgpu_d3dkmt_resource_unmap_blob(struct virtgpu *gpu, uint32_t alloc_handle)
    return virtgpu_d3dkmt_escape(gpu, &esc) ? 0 : -1;
 }
 
+/**
+ * Destroy an allocation.  \p resource_handle must be the D3DKMT resource the
+ * allocation belongs to when it came from D3DKMTOpenResource, and 0 for a
+ * standalone allocation -- destroying an owned allocation by its handle alone
+ * fails and leaks the resource.
+ */
 static void
-virtgpu_d3dkmt_gem_close(struct virtgpu *gpu, uint32_t alloc_handle)
+virtgpu_d3dkmt_gem_close_resource(struct virtgpu *gpu, uint32_t alloc_handle,
+                                  uint32_t resource_handle)
 {
-   if (!gpu->pfnDestroyAllocation || !alloc_handle)
+   if (!gpu->pfnDestroyAllocation || (!alloc_handle && !resource_handle))
       return;
 
    D3DKMT_HANDLE handle = (D3DKMT_HANDLE)alloc_handle;
    D3DKMT_DESTROYALLOCATION destroy = {0};
    destroy.hDevice = gpu->hDevice;
-   destroy.hResource = 0;
-   destroy.phAllocationList = &handle;
-   destroy.AllocationCount = 1;
+   destroy.hResource = (D3DKMT_HANDLE)resource_handle;
+   /* With a resource handle the runtime destroys the whole resource, and the
+    * allocation list must be empty.
+    */
+   destroy.phAllocationList = resource_handle ? NULL : &handle;
+   destroy.AllocationCount = resource_handle ? 0 : 1;
 
-   ASSERTED NTSTATUS status = gpu->pfnDestroyAllocation(&destroy);
-   assert(NT_SUCCESS(status));
+   NTSTATUS status = gpu->pfnDestroyAllocation(&destroy);
+   if (!NT_SUCCESS(status)) {
+      mesa_logw("venus: D3DKMTDestroyAllocation(alloc=0x%x resource=0x%x) "
+                "failed status=0x%lx", alloc_handle, resource_handle,
+                (unsigned long)status);
+   }
+}
+
+static void
+virtgpu_d3dkmt_gem_close(struct virtgpu *gpu, uint32_t alloc_handle)
+{
+   virtgpu_d3dkmt_gem_close_resource(gpu, alloc_handle, 0);
 }
 
 static int
@@ -783,6 +814,67 @@ virtgpu_d3dkmt_prime_handle_to_fd(struct virtgpu *gpu,
 
    return fd;
 }
+
+#if defined(HAVE_YTTRIUM)
+static uint32_t
+virtgpu_d3dkmt_shared_handle_to_handle(struct virtgpu *gpu, void *handle,
+                                       uint32_t *out_resource_handle)
+{
+   if (out_resource_handle)
+      *out_resource_handle = 0;
+
+   if (!gpu->pfnQueryResourceInfo || !gpu->pfnOpenResource || !handle)
+      return 0;
+
+   D3DKMT_QUERYRESOURCEINFO query = {0};
+   query.hDevice = gpu->hDevice;
+   query.hGlobalShare = (D3DKMT_HANDLE)(uintptr_t)handle;
+
+   NTSTATUS status = gpu->pfnQueryResourceInfo(&query);
+   if (!NT_SUCCESS(status) || query.NumAllocations != 1)
+      return 0;
+
+   D3DDDI_OPENALLOCATIONINFO *alloc_info =
+      calloc(query.NumAllocations, sizeof(*alloc_info));
+   void *resource_private = malloc(query.ResourcePrivateDriverDataSize);
+   void *total_private = malloc(query.TotalPrivateDriverDataSize);
+   void *runtime_private = malloc(query.PrivateRuntimeDataSize);
+   if (!alloc_info || !resource_private || !total_private ||
+       !runtime_private) {
+      free(runtime_private);
+      free(total_private);
+      free(resource_private);
+      free(alloc_info);
+      return 0;
+   }
+
+   D3DKMT_OPENRESOURCE open = {0};
+   open.hDevice = gpu->hDevice;
+   open.hGlobalShare = query.hGlobalShare;
+   open.NumAllocations = query.NumAllocations;
+   open.pOpenAllocationInfo = alloc_info;
+   open.pResourcePrivateDriverData = resource_private;
+   open.ResourcePrivateDriverDataSize = query.ResourcePrivateDriverDataSize;
+   open.pTotalPrivateDriverDataBuffer = total_private;
+   open.TotalPrivateDriverDataBufferSize = query.TotalPrivateDriverDataSize;
+   open.PrivateRuntimeDataSize = query.PrivateRuntimeDataSize;
+   open.pPrivateRuntimeData = runtime_private;
+
+   status = gpu->pfnOpenResource(&open);
+   uint32_t alloc_handle =
+      NT_SUCCESS(status) ? (uint32_t)alloc_info[0].hAllocation : 0;
+   /* The allocation belongs to this resource; teardown needs it. */
+   if (out_resource_handle)
+      *out_resource_handle = NT_SUCCESS(status) ? (uint32_t)open.hResource : 0;
+
+   free(runtime_private);
+   free(total_private);
+   free(resource_private);
+   free(alloc_info);
+
+   return alloc_handle;
+}
+#endif
 
 static uint32_t
 virtgpu_d3dkmt_prime_fd_to_handle(struct virtgpu *gpu, int fd)
@@ -858,6 +950,12 @@ virtgpu_load_d3dkmt(struct virtgpu *gpu)
    gpu->pfnOpenResourceFromNtHandle =
       (PFND3DKMT_OPENRESOURCEFROMNTHANDLE)GetProcAddress(
          gpu->gdi32, "D3DKMTOpenResourceFromNtHandle");
+#if defined(HAVE_YTTRIUM)
+   gpu->pfnQueryResourceInfo = (PFND3DKMT_QUERYRESOURCEINFO)GetProcAddress(
+      gpu->gdi32, "D3DKMTQueryResourceInfo");
+   gpu->pfnOpenResource = (PFND3DKMT_OPENRESOURCE)GetProcAddress(
+      gpu->gdi32, "D3DKMTOpenResource");
+#endif
    gpu->pfnOpenAdapterFromHdc =
       (PFND3DKMT_OPENADAPTERFROMHDC)GetProcAddress(gpu->gdi32,
                                                    "D3DKMTOpenAdapterFromHdc");
@@ -1436,8 +1534,10 @@ virtgpu_bo_destroy(struct vn_renderer *renderer, struct vn_renderer_bo *_bo)
     * by another newly created bo and unexpectedly zeroed in the tracker.
     */
    const uint32_t alloc_handle = bo->alloc_handle;
+   const uint32_t resource_handle = bo->open_resource_handle;
    bo->alloc_handle = 0;
-   virtgpu_d3dkmt_gem_close(gpu, alloc_handle);
+   bo->open_resource_handle = 0;
+   virtgpu_d3dkmt_gem_close_resource(gpu, alloc_handle, resource_handle);
 
    mtx_unlock(&gpu->import_mutex);
 
@@ -1463,50 +1563,32 @@ virtgpu_bo_blob_flags(struct virtgpu *gpu,
 }
 
 static VkResult
-virtgpu_bo_create_from_dma_buf(struct vn_renderer *renderer,
-                               VkDeviceSize size,
-                               int fd,
-                               VkMemoryPropertyFlags flags,
-                               struct vn_renderer_bo **out_bo)
+virtgpu_bo_create_from_alloc_handle(struct virtgpu *gpu,
+                                    VkDeviceSize size,
+                                    uint32_t alloc_handle,
+                                    VkMemoryPropertyFlags flags,
+                                    struct vn_renderer_bo **out_bo)
 {
-   struct virtgpu *gpu = (struct virtgpu *)renderer;
    struct virtgpu_resource_info info;
-   uint32_t alloc_handle = 0;
    struct virtgpu_bo *bo = NULL;
 
-   mtx_lock(&gpu->import_mutex);
-
-   alloc_handle = virtgpu_d3dkmt_prime_fd_to_handle(gpu, fd);
    if (!alloc_handle)
-      goto fail;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
    bo = util_sparse_array_get(&gpu->bo_array, alloc_handle);
 
    if (virtgpu_d3dkmt_resource_info(gpu, alloc_handle, &info))
-      goto fail;
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
-   /* Upon import, blob_flags is not passed to the kernel and is only for
-    * internal use. Set it to what works best for us.
-    * - blob mem: SHAREABLE + conditional MAPPABLE per VkMemoryPropertyFlags
-    * - classic 3d: SHAREABLE only for export and to fail the map
-    */
    uint32_t blob_flags = VIRTGPU_BLOB_FLAG_USE_SHAREABLE;
    size_t mmap_size = 0;
    if (info.blob_mem) {
-      /* must be VIRTGPU_BLOB_MEM_HOST3D or VIRTGPU_BLOB_MEM_GUEST_VRAM */
       if (info.blob_mem != gpu->bo_blob_mem)
-         goto fail;
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
       blob_flags |= virtgpu_bo_blob_flags(gpu, flags, 0);
 
-      /* mmap_size is only used when mappable */
-      mmap_size = 0;
       if (blob_flags & VIRTGPU_BLOB_FLAG_USE_MAPPABLE) {
-         /* If queried blob size is smaller than requested allocation size, we
-          * drop the mappable flag to defer the mapping failure till the app's
-          * vkMapMemory api call.
-          *
-          * Use size zero to request mapping the whole bo.
-          */
          if (info.size < size)
             blob_flags &= ~VIRTGPU_BLOB_FLAG_USE_MAPPABLE;
          else
@@ -1514,18 +1596,12 @@ virtgpu_bo_create_from_dma_buf(struct vn_renderer *renderer,
       }
    }
 
-   /* we check bo->alloc_handle instead of bo->refcount because bo->refcount
-    * might only be memset to 0 and is not considered initialized in theory
-    */
    if (bo->alloc_handle == alloc_handle) {
       if (bo->base.mmap_size < mmap_size)
-         goto fail;
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       if (blob_flags & ~bo->blob_flags)
-         goto fail;
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
-      /* we can't use vn_renderer_bo_ref as the refcount may drop to 0
-       * temporarily before virtgpu_bo_destroy grabs the lock
-       */
       vn_refcount_fetch_add_relaxed(&bo->base.refcount, 1);
    } else {
       *bo = (struct virtgpu_bo){
@@ -1539,18 +1615,88 @@ virtgpu_bo_create_from_dma_buf(struct vn_renderer *renderer,
       };
    }
 
-   mtx_unlock(&gpu->import_mutex);
-
    *out_bo = &bo->base;
+   return VK_SUCCESS;
+}
 
+static void
+virtgpu_bo_close_failed_import_handle(struct virtgpu *gpu,
+                                      uint32_t alloc_handle,
+                                      uint32_t resource_handle)
+{
+   if (!alloc_handle)
+      return;
+
+   struct virtgpu_bo *bo = util_sparse_array_get(&gpu->bo_array, alloc_handle);
+   if (bo->alloc_handle != alloc_handle)
+      virtgpu_d3dkmt_gem_close_resource(gpu, alloc_handle, resource_handle);
+}
+
+static VkResult
+virtgpu_bo_create_from_dma_buf(struct vn_renderer *renderer,
+                               VkDeviceSize size,
+                               int fd,
+                               VkMemoryPropertyFlags flags,
+                               struct vn_renderer_bo **out_bo)
+{
+   struct virtgpu *gpu = (struct virtgpu *)renderer;
+   uint32_t alloc_handle = 0;
+
+   mtx_lock(&gpu->import_mutex);
+
+   alloc_handle = virtgpu_d3dkmt_prime_fd_to_handle(gpu, fd);
+   VkResult result =
+      virtgpu_bo_create_from_alloc_handle(gpu, size, alloc_handle, flags,
+                                          out_bo);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   mtx_unlock(&gpu->import_mutex);
    return VK_SUCCESS;
 
 fail:
-   if (alloc_handle && bo->alloc_handle != alloc_handle)
-      virtgpu_d3dkmt_gem_close(gpu, alloc_handle);
+   /* prime_fd_to_handle opens a standalone allocation, not a resource. */
+   virtgpu_bo_close_failed_import_handle(gpu, alloc_handle, 0);
    mtx_unlock(&gpu->import_mutex);
    return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 }
+
+#if defined(HAVE_YTTRIUM)
+static VkResult
+virtgpu_bo_create_from_win32_handle(struct vn_renderer *renderer,
+                                    VkDeviceSize size,
+                                    void *handle,
+                                    VkMemoryPropertyFlags flags,
+                                    struct vn_renderer_bo **out_bo)
+{
+   struct virtgpu *gpu = (struct virtgpu *)renderer;
+
+   mtx_lock(&gpu->import_mutex);
+
+   uint32_t resource_handle = 0;
+   uint32_t alloc_handle =
+      virtgpu_d3dkmt_shared_handle_to_handle(gpu, handle, &resource_handle);
+
+   VkResult result =
+      virtgpu_bo_create_from_alloc_handle(gpu, size, alloc_handle, flags,
+                                          out_bo);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   /* Remember the opened resource so bo_destroy_now() can tear it down.
+    * Destroying the allocation on its own fails and leaks the resource.
+    */
+   ((struct virtgpu_bo *)*out_bo)->open_resource_handle = resource_handle;
+
+   mtx_unlock(&gpu->import_mutex);
+   return VK_SUCCESS;
+
+fail:
+   virtgpu_bo_close_failed_import_handle(gpu, alloc_handle, resource_handle);
+   mtx_unlock(&gpu->import_mutex);
+   return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+}
+#endif
 
 static VkResult
 virtgpu_bo_create_from_device_memory(
@@ -1715,9 +1861,14 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
    info->pci.vendor_id = VIRTGPU_PCI_VENDOR_ID;
    info->pci.device_id = VIRTGPU_PCI_DEVICE_ID;
 
+   STATIC_ASSERT(sizeof(info->id.luid) == sizeof(gpu->adapter_luid));
+   info->id.has_luid = true;
+   info->id.node_mask = 1;
+   memcpy(info->id.luid, &gpu->adapter_luid, sizeof(info->id.luid));
+
    info->has_dma_buf_import = true;
-   /* TODO switch from emulation to native sync */
-   info->has_external_sync = true;
+   /* D3DKMT cannot export renderer synchronization to WSI consumers. */
+   info->has_external_sync = false;
 
    info->has_implicit_fencing = false;
 
@@ -1968,6 +2119,7 @@ virtgpu_open(struct virtgpu *gpu)
    }
 
    gpu->hAdapter = open.hAdapter;
+   gpu->adapter_luid = open.AdapterLuid;
    gpu->hDevice = create.hDevice;
    gpu->adapter_info = info;
    gpu->has_primary = true;
@@ -2023,6 +2175,10 @@ virtgpu_init(struct virtgpu *gpu)
 
    gpu->base.bo_ops.create_from_device_memory = virtgpu_bo_create_from_device_memory;
    gpu->base.bo_ops.create_from_dma_buf = virtgpu_bo_create_from_dma_buf;
+#if defined(HAVE_YTTRIUM)
+   gpu->base.bo_ops.create_from_win32_handle =
+      virtgpu_bo_create_from_win32_handle;
+#endif
    gpu->base.bo_ops.destroy = virtgpu_bo_destroy;
    gpu->base.bo_ops.export_dma_buf = virtgpu_bo_export_dma_buf;
    gpu->base.bo_ops.export_sync_file =

@@ -10,9 +10,18 @@ libgallium_d3d10_def = custom_target(
 )
 
 gallium_d3d10_name = get_option('gallium-d3d10-dll-name')
+gallium_d3d10_deps = [
+  dep_ws2_32, idep_nir, driver_swrast, driver_virgl, winsys_yttrium_gdi,
+  idep_mesautil
+]
+gallium_d3d10_c_args = []
+if with_gallium_yttrium
+  gallium_d3d10_c_args += '-DGALLIUM_YTTRIUM'
+endif
 libgallium_d3d10 = shared_library(
   gallium_d3d10_name,
   ['d3d10_gdi.c'],
+  c_args : gallium_d3d10_c_args,
   vs_module_defs : libgallium_d3d10_def,
   include_directories : [
     inc_include, inc_src, inc_mesa, inc_gallium, inc_gallium_aux, inc_d3d10umd, inc_gallium_winsys, inc_gallium_winsys_sw, inc_gallium_drivers, inc_winddk
@@ -21,9 +30,7 @@ libgallium_d3d10 = shared_library(
   link_with : [
     libgallium, libgalliumvl, libwsgdi
   ],
-  dependencies : [
-    dep_ws2_32, idep_nir, driver_swrast, driver_virgl, idep_mesautil
-  ],
+  dependencies : gallium_d3d10_deps,
   name_prefix: '',
   install : true,
 )
@@ -35,8 +42,10 @@ if true
     executable(
       'test_d3d10',
       files('tests/tri.cpp'),
-      cpp_args : [cpp_msvc_compat_args],
-      dependencies : [cpp.find_library('d3d11')],
+      cpp_args : [
+        cpp_msvc_compat_args,
+      ],
+      dependencies : [cpp.find_library('d3d11'), cpp.find_library('dxgi'), cpp.find_library('d3d9')],
       link_with : [libgallium_d3d10],
     ),
     suite : ['d3d10'],

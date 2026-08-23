@@ -19,6 +19,7 @@ struct d3dkmt_callbacks {
    PFND3DKMT_CREATEALLOCATION createAllocation;
    PFND3DKMT_DESTROYALLOCATION destroyAllocation;
    PFND3DKMT_LOCK lock;
+   PFND3DKMT_UNLOCK unlock;
    PFND3DKMT_QUERYRESOURCEINFO queryResourceInfo;
    PFND3DKMT_OPENRESOURCE openResource;
    PFND3DKMT_CREATEDEVICE createDevice;
@@ -47,6 +48,7 @@ gdikmt_load_callbacks(HINSTANCE gdi32lib, struct d3dkmt_callbacks *cb)
    cb->destroyAllocation = (PFND3DKMT_DESTROYALLOCATION)GetProcAddress(
       gdi32lib, "D3DKMTDestroyAllocation");
    cb->lock = (PFND3DKMT_LOCK)GetProcAddress(gdi32lib, "D3DKMTLock");
+   cb->unlock = (PFND3DKMT_UNLOCK)GetProcAddress(gdi32lib, "D3DKMTUnlock");
    cb->queryResourceInfo = (PFND3DKMT_QUERYRESOURCEINFO)GetProcAddress(
       gdi32lib, "D3DKMTQueryResourceInfo");
    cb->openResource =
@@ -190,6 +192,14 @@ gdikmt_d3dkmt_destroycontext(struct gdikmt_context *_ctx)
    return;
 }
 
+static D3DKMT_HANDLE
+gdikmt_d3dkmt_context_kmt_handle(struct gdikmt_context *_ctx)
+{
+   struct gdikmt_context_d3dkmt *ctx = gdikmt_context_d3dkmt(_ctx);
+
+   return ctx->hContext;
+}
+
 static
 NTSTATUS
 gdikmt_d3dkmt_createcontext(struct gdikmt_device *_device,
@@ -221,6 +231,7 @@ gdikmt_d3dkmt_createcontext(struct gdikmt_device *_device,
 
       ctx->base.destroy = gdikmt_d3dkmt_destroycontext;
       ctx->base.render = gdikmt_d3dkmt_render;
+      ctx->base.kmt_handle = gdikmt_d3dkmt_context_kmt_handle;
 
       *out_ctx = &ctx->base;
    }
@@ -248,6 +259,8 @@ gdikmt_d3dkmt_createallocation(struct gdikmt_device *_device,
    NTSTATUS Status = device->cb.createAllocation(&createAllocation);
 
    options->hResource = (HANDLE)(uintptr_t)createAllocation.hResource;
+   options->hAllocationResource = options->hResource;
+   options->hResourceIsD3D9Runtime = false;
 
    return Status;
 }
@@ -271,6 +284,22 @@ gdikmt_d3dkmt_lockallocation(struct gdikmt_device *_device,
    *out_ptr = lock.pData;
 
    return Status;
+}
+
+static
+NTSTATUS
+gdikmt_d3dkmt_unlockallocation(struct gdikmt_device *_device,
+                               D3DKMT_HANDLE hAllocation)
+{
+   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
+
+   D3DKMT_UNLOCK unlock;
+   memset(&unlock, 0, sizeof(unlock));
+   unlock.hDevice = device->hDevice;
+   unlock.NumAllocations = 1;
+   unlock.phAllocations = &hAllocation;
+
+   return device->cb.unlock(&unlock);
 }
 
 static
@@ -398,6 +427,7 @@ gdikmt_create_from_hdc(HDC hDC)
    gdikmt_load_callbacks(device->gdi32lib, &device->cb);
 
    D3DKMT_OPENADAPTERFROMHDC openFromHdc;
+   memset(&openFromHdc, 0, sizeof(openFromHdc));
    NTSTATUS Status;
    openFromHdc.hDc = hDC;
    Status = device->cb.openAdapterFromHdc(&openFromHdc);
@@ -432,6 +462,7 @@ gdikmt_create_from_hdc(HDC hDC)
    device->base.createAllocation = gdikmt_d3dkmt_createallocation;
    device->base.destroyAllocation = gdikmt_d3dkmt_destroyallocation;
    device->base.lockAllocation = gdikmt_d3dkmt_lockallocation;
+   device->base.unlockAllocation = gdikmt_d3dkmt_unlockallocation;
    device->base.queryAllocation = gdikmt_d3dddi_queryallocation;
    device->base.openAllocation = gdikmt_d3dddi_openallocation;
 

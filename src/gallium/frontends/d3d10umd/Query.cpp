@@ -34,6 +34,8 @@
 #include "Query.h"
 #include "State.h"
 
+#include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+
 #include "Debug.h"
 
 
@@ -71,12 +73,21 @@ TranslateQueryType(D3D10DDI_QUERY query)
    case D3D10DDI_QUERY_TIMESTAMPDISJOINT:
       return PIPE_QUERY_TIMESTAMP_DISJOINT;
    case D3D10DDI_QUERY_PIPELINESTATS:
+   case D3D11DDI_QUERY_PIPELINESTATS:
       return PIPE_QUERY_PIPELINE_STATISTICS;
    case D3D10DDI_QUERY_OCCLUSIONPREDICATE:
       return PIPE_QUERY_OCCLUSION_PREDICATE;
    case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0:
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM1:
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM2:
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3:
       return PIPE_QUERY_SO_STATISTICS;
    case D3D10DDI_QUERY_STREAMOVERFLOWPREDICATE:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM0:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM1:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM2:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3:
       return PIPE_QUERY_SO_OVERFLOW_PREDICATE;
    default:
       LOG_UNSUPPORTED(true);
@@ -91,11 +102,27 @@ ShouldEmulateQuery(D3D10DDI_QUERY query)
    switch (query) {
    case D3D10DDI_QUERY_TIMESTAMP:
    case D3D10DDI_QUERY_TIMESTAMPDISJOINT:
-   case D3D10DDI_QUERY_PIPELINESTATS:
-   case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
       return true;
    default:
       return false;
+   }
+}
+
+static uint
+TranslateQueryIndex(D3D10DDI_QUERY query)
+{
+   switch (query) {
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM1:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM1:
+      return 1;
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM2:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM2:
+      return 2;
+   case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3:
+   case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3:
+      return 3;
+   default:
+      return 0;
    }
 }
 
@@ -132,7 +159,8 @@ CreateQuery(D3D10DDI_HDEVICE hDevice,                          // IN
 
    pQuery->pipe_type = TranslateQueryType(pCreateQuery->Query);
    if (!pQuery->Emulated && pQuery->pipe_type < PIPE_QUERY_TYPES) {
-      pQuery->handle = pipe->create_query(pipe, pQuery->pipe_type, 0);
+      pQuery->handle = pipe->create_query(pipe, pQuery->pipe_type,
+                                          TranslateQueryIndex(pCreateQuery->Query));
    }
 }
 
@@ -267,7 +295,14 @@ QueryGetData(D3D10DDI_HDEVICE hDevice,                      // IN
    bool ret;
 
    if (!pQuery->Emulated && !doNotFlush) {
-      pipe->flush(pipe, NULL, 0);
+      const char *screen_name =
+         pipe->screen && pipe->screen->get_name ?
+         pipe->screen->get_name(pipe->screen) : NULL;
+      const unsigned flush_flags =
+         screen_name && strcmp(screen_name, "yttrium") == 0 ?
+         PIPE_FLUSH_ASYNC : 0;
+      yttrium_gdi_flush_labeled(pipe, NULL, flush_flags,
+                                "D3D10 query GetData flush");
    }
 
    if (pQuery->Emulated) {
@@ -281,9 +316,14 @@ QueryGetData(D3D10DDI_HDEVICE hDevice,                      // IN
          result.timestamp_disjoint.disjoint = false;
          break;
       case D3D10DDI_QUERY_PIPELINESTATS:
+      case D3D11DDI_QUERY_PIPELINESTATS:
          result.pipeline_statistics = {};
          break;
       case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM1:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM2:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3:
          result.so_statistics.num_primitives_written = 0;
          result.so_statistics.primitives_storage_needed = 0;
          break;
@@ -338,13 +378,40 @@ QueryGetData(D3D10DDI_HDEVICE hDevice,                      // IN
             //pResult->CSInvocations = result.pipeline_statistics.cs_invocations;
          }
          break;
+      case D3D11DDI_QUERY_PIPELINESTATS:
+         {
+            D3D11_DDI_QUERY_DATA_PIPELINE_STATISTICS *pResult =
+              (D3D11_DDI_QUERY_DATA_PIPELINE_STATISTICS *)pData;
+            pResult->IAVertices = result.pipeline_statistics.ia_vertices;
+            pResult->IAPrimitives = result.pipeline_statistics.ia_primitives;
+            pResult->VSInvocations = result.pipeline_statistics.vs_invocations;
+            pResult->GSInvocations = result.pipeline_statistics.gs_invocations;
+            pResult->GSPrimitives = result.pipeline_statistics.gs_primitives;
+            pResult->CInvocations = result.pipeline_statistics.c_invocations;
+            pResult->CPrimitives = result.pipeline_statistics.c_primitives;
+            pResult->PSInvocations = result.pipeline_statistics.ps_invocations;
+            pResult->HSInvocations = 0;
+            pResult->DSInvocations = 0;
+            pResult->CSInvocations = 0;
+         }
+         break;
       case D3D10DDI_QUERY_STREAMOUTPUTSTATS:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM0:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM1:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM2:
+      case D3D11DDI_QUERY_STREAMOUTPUTSTATS_STREAM3:
          {
             D3D10_DDI_QUERY_DATA_SO_STATISTICS *pResult =
               (D3D10_DDI_QUERY_DATA_SO_STATISTICS *)pData;
             pResult->NumPrimitivesWritten = result.so_statistics.num_primitives_written;
             pResult->PrimitivesStorageNeeded = result.so_statistics.primitives_storage_needed;
          }
+         break;
+      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM0:
+      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM1:
+      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM2:
+      case D3D11DDI_QUERY_STREAMOVERFLOWPREDICATE_STREAM3:
+         *(BOOL *)pData = result.b;
          break;
       default:
          assert(0);

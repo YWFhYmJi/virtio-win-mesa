@@ -40,6 +40,55 @@
 #include "util/u_draw.h"
 #include "util/u_memory.h"
 
+#include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+
+static bool
+OrderedContextWorkerEnabled()
+{
+   static int enabled = -1;
+
+   if (enabled < 0) {
+      enabled = yttrium_gdi_debug_get_bool_option(
+         "D3D10UMD_YTTRIUM_ORDERED_CONTEXT_WORKER", true) ? 1 : 0;
+   }
+   return enabled != 0;
+}
+
+static bool
+ReadBufferRange(struct pipe_context *pipe, Resource *resource,
+                unsigned offset, unsigned size, void *data)
+{
+   if (!pipe || !resource || !resource->resource ||
+       resource->resource->target != PIPE_BUFFER || !data ||
+       offset > resource->resource->width0 ||
+       size > resource->resource->width0 - offset)
+      return false;
+
+   struct pipe_box box = {};
+   box.x = offset;
+   box.width = size;
+   box.height = 1;
+   box.depth = 1;
+
+   struct pipe_transfer *transfer = NULL;
+   void *map = pipe->buffer_map(pipe, resource->resource, 0, PIPE_MAP_READ,
+                                &box, &transfer);
+   if (map) {
+      memcpy(data, map, size);
+      pipe->buffer_unmap(pipe, transfer);
+      return true;
+   }
+
+   if (resource->buffer_shadow &&
+       offset <= resource->buffer_shadow_size &&
+       size <= resource->buffer_shadow_size - offset) {
+      memcpy(data, (const uint8_t *)resource->buffer_shadow + offset, size);
+      return true;
+   }
+
+   return false;
+}
+
 static unsigned
 ClampedUAdd(unsigned a,
             unsigned b)
@@ -79,6 +128,8 @@ update_velems(Device *pDevice)
 static void
 ResolveState(Device *pDevice)
 {
+   RefreshBoundShaderResourceViews(pDevice);
+
    if (pDevice->bound_empty_gs && pDevice->bound_vs &&
        pDevice->bound_vs->state.tokens) {
       Shader *gs = pDevice->bound_empty_gs;
@@ -105,7 +156,23 @@ ResolveState(Device *pDevice)
    update_velems(pDevice);
 
    if (pDevice->vbuffers_changed) {
-      cso_set_vertex_buffers(pDevice->cso, PIPE_MAX_ATTRIBS, pDevice->vertex_buffers);
+      unsigned count = PIPE_MAX_ATTRIBS;
+
+      if (OrderedContextWorkerEnabled()) {
+         count = 0;
+         for (unsigned i = PIPE_MAX_ATTRIBS; i > 0; i--) {
+            const struct pipe_vertex_buffer *vb =
+               &pDevice->vertex_buffers[i - 1];
+            if (vb->is_user_buffer ? vb->buffer.user != NULL :
+                                     vb->buffer.resource != NULL) {
+               count = i;
+               break;
+            }
+         }
+      }
+
+      cso_set_vertex_buffers(pDevice->cso, count,
+                             pDevice->vertex_buffers);
       pDevice->vbuffers_changed = false;
    }
 }
@@ -155,6 +222,10 @@ Draw(D3D10DDI_HDEVICE hDevice,   // IN
    Device *pDevice = CastDevice(hDevice);
 
    ResolveState(pDevice);
+   if (RunVertexShaderEmulation(pDevice, VertexCount))
+      return;
+   if (RunPixelShaderEmulation(pDevice))
+      return;
 
    assert(pDevice->primitive < MESA_PRIM_COUNT);
    util_draw_arrays(pDevice->pipe,
@@ -201,6 +272,11 @@ DrawIndexed(D3D10DDI_HDEVICE hDevice,  // IN
    }
 
    ResolveState(pDevice);
+   if (RunPixelShaderEmulation(pDevice)) {
+      if (null_ib)
+         pipe_resource_reference(&null_ib, NULL);
+      return;
+   }
 
    util_draw_init_info(&info);
    info.index_size = index_size;
@@ -247,6 +323,8 @@ DrawInstanced(D3D10DDI_HDEVICE hDevice,      // IN
    }
 
    ResolveState(pDevice);
+   if (RunPixelShaderEmulation(pDevice))
+      return;
 
    assert(pDevice->primitive < MESA_PRIM_COUNT);
    util_draw_arrays_instanced(pDevice->pipe,
@@ -302,6 +380,11 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
    }
 
    ResolveState(pDevice);
+   if (RunPixelShaderEmulation(pDevice)) {
+      if (null_ib)
+         pipe_resource_reference(&null_ib, NULL);
+      return;
+   }
 
    util_draw_init_info(&info);
    info.index_size = index_size;
@@ -320,6 +403,60 @@ DrawIndexedInstanced(D3D10DDI_HDEVICE hDevice,   // IN
    if (null_ib) {
       pipe_resource_reference(&null_ib, NULL);
    }
+}
+
+void APIENTRY
+DrawIndexedInstancedIndirect(D3D10DDI_HDEVICE hDevice,
+                             D3D10DDI_HRESOURCE hBufferForArgs,
+                             UINT AlignedByteOffsetForArgs)
+{
+   LOG_ENTRYPOINT();
+
+   struct DrawIndexedInstancedIndirectArgs {
+      UINT IndexCountPerInstance;
+      UINT InstanceCount;
+      UINT StartIndexLocation;
+      INT BaseVertexLocation;
+      UINT StartInstanceLocation;
+   } args = {};
+
+   Device *pDevice = CastDevice(hDevice);
+   Resource *pArgs = CastResource(hBufferForArgs);
+   if (!ReadBufferRange(pDevice->pipe, pArgs, AlignedByteOffsetForArgs,
+                        sizeof(args), &args)) {
+      LOG_UNSUPPORTED("DrawIndexedInstancedIndirect failed to read args");
+      return;
+   }
+
+   DrawIndexedInstanced(hDevice, args.IndexCountPerInstance,
+                        args.InstanceCount, args.StartIndexLocation,
+                        args.BaseVertexLocation, args.StartInstanceLocation);
+}
+
+void APIENTRY
+DrawInstancedIndirect(D3D10DDI_HDEVICE hDevice,
+                      D3D10DDI_HRESOURCE hBufferForArgs,
+                      UINT AlignedByteOffsetForArgs)
+{
+   LOG_ENTRYPOINT();
+
+   struct DrawInstancedIndirectArgs {
+      UINT VertexCountPerInstance;
+      UINT InstanceCount;
+      UINT StartVertexLocation;
+      UINT StartInstanceLocation;
+   } args = {};
+
+   Device *pDevice = CastDevice(hDevice);
+   Resource *pArgs = CastResource(hBufferForArgs);
+   if (!ReadBufferRange(pDevice->pipe, pArgs, AlignedByteOffsetForArgs,
+                        sizeof(args), &args)) {
+      LOG_UNSUPPORTED("DrawInstancedIndirect failed to read args");
+      return;
+   }
+
+   DrawInstanced(hDevice, args.VertexCountPerInstance, args.InstanceCount,
+                 args.StartVertexLocation, args.StartInstanceLocation);
 }
 
 
@@ -356,6 +493,8 @@ DrawAuto(D3D10DDI_HDEVICE hDevice)  // IN
    assert(pDevice->primitive < MESA_PRIM_COUNT);
 
    ResolveState(pDevice);
+   if (RunPixelShaderEmulation(pDevice))
+      return;
 
    util_draw_init_info(&info);
    info.mode = pDevice->primitive;

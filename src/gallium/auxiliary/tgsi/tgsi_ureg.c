@@ -2278,6 +2278,12 @@ ureg_set_next_shader_processor(struct ureg_program *ureg, unsigned processor)
    ureg->next_shader_processor = processor;
 }
 
+void
+ureg_set_any_inout_decl_range(struct ureg_program *ureg, bool enable)
+{
+   ureg->supports_any_inout_decl_range = enable;
+}
+
 
 unsigned
 ureg_get_nr_outputs( const struct ureg_program *ureg )

@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: MIT
 
 gallium_wgl_link_args = []
+gallium_wgl_c_args = []
+
+if with_gallium_yttrium
+  gallium_wgl_c_args += '-DHAVE_YTTRIUM'
+endif
 
 wgl_def = custom_target(
   'gallium_wgl.def',
@@ -22,6 +27,8 @@ libgallium_wgl = shared_library(
   link_with : [
     libgallium, libglsl, libmesa, libwsgdi, libglapi_bridge, libglapi, libgalliumvl_stub,
   ],
+  c_args : gallium_wgl_c_args,
+  cpp_args : gallium_wgl_c_args,
   dependencies : [
     dep_ws2_32, idep_nir, idep_mesautil, driver_swrast,
     driver_d3d12, driver_zink, driver_virgl, winsys_d3d12_wgl

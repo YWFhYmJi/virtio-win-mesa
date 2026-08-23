@@ -160,6 +160,14 @@ struct vn_renderer_bo_ops {
                                    VkMemoryPropertyFlags flags,
                                    struct vn_renderer_bo **out_bo);
 
+#if defined(HAVE_YTTRIUM)
+   VkResult (*create_from_win32_handle)(struct vn_renderer *renderer,
+                                        VkDeviceSize size,
+                                        void *handle,
+                                        VkMemoryPropertyFlags flags,
+                                        struct vn_renderer_bo **out_bo);
+#endif
+
    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
 
    int (*export_dma_buf)(struct vn_renderer *renderer,
@@ -357,6 +365,32 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
    *out_bo = bo;
    return VK_SUCCESS;
 }
+
+#if defined(HAVE_YTTRIUM)
+static inline VkResult
+vn_renderer_bo_create_from_win32_handle(struct vn_renderer *renderer,
+                                        VkDeviceSize size,
+                                        void *handle,
+                                        VkMemoryPropertyFlags flags,
+                                        struct vn_renderer_bo **out_bo)
+{
+   if (!renderer->bo_ops.create_from_win32_handle)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct vn_renderer_bo *bo;
+   VkResult result = renderer->bo_ops.create_from_win32_handle(
+      renderer, size, handle, flags, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   assert(vn_refcount_is_valid(&bo->refcount));
+   assert(bo->res_id);
+   assert(!bo->mmap_size || bo->mmap_size >= size);
+
+   *out_bo = bo;
+   return VK_SUCCESS;
+}
+#endif
 
 static inline struct vn_renderer_bo *
 vn_renderer_bo_ref(struct vn_renderer *renderer, struct vn_renderer_bo *bo)

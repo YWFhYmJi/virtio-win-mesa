@@ -99,6 +99,10 @@ vn_c_args = [
   '-Werror=switch',
 ])
 
+if with_gallium_yttrium
+  vn_c_args += '-DHAVE_YTTRIUM'
+endif
+
 vn_link_args = [
   ld_args_bsymbolic,
   ld_args_gc_sections,

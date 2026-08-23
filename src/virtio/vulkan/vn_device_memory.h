@@ -63,6 +63,14 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
                                 const VkMemoryAllocateInfo *alloc_info,
                                 int fd);
 
+#if defined(HAVE_YTTRIUM)
+VkResult
+vn_device_memory_import_win32_handle(struct vn_device *dev,
+                                     struct vn_device_memory *mem,
+                                     const VkMemoryAllocateInfo *alloc_info,
+                                     void *handle);
+#endif
+
 VkResult
 vn_get_memory_dma_buf_properties(struct vn_device *dev,
                                  int fd,

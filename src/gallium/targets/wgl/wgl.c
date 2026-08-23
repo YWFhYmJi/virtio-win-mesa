@@ -36,6 +36,7 @@
 
 #include <windows.h>
 
+#include "util/log.h"
 #include "util/u_debug.h"
 #include "stw_winsys.h"
 #include "stw_device.h"
@@ -109,7 +110,22 @@ wgl_screen_create_by_name(HDC hDC, const char* driver, struct sw_winsys *winsys)
 #endif
 #ifdef GALLIUM_ZINK
    if (strcmp(driver, "zink") == 0) {
-      screen = zink_create_screen(winsys, NULL);
+      /* Use the win32 entry point and hand zink the WGL adapter's LUID.  The
+       * generic zink_create_screen() passes no LUID, which makes choose_pdev()
+       * take whichever physical device enumerates first and then reject it
+       * outright if it turns out to be a CPU device -- so with lavapipe also
+       * installed, zink can fail even though a real GPU is present.  With a
+       * LUID it matches the adapter this HDC actually belongs to.
+       */
+      LUID adapter_luid = { 0 };
+      if (stw_dev && stw_dev->callbacks.pfnGetAdapterLuid)
+         stw_dev->callbacks.pfnGetAdapterLuid(hDC, &adapter_luid);
+
+      uint64_t luid;
+      STATIC_ASSERT(sizeof(luid) == sizeof(adapter_luid));
+      memcpy(&luid, &adapter_luid, sizeof(luid));
+
+      screen = zink_win32_create_screen(luid);
       if (screen)
          use_zink = true;
    }
@@ -133,36 +149,48 @@ wgl_screen_create(HDC hDC)
    if (!winsys)
       return NULL;
 
+   /* WGL_GALLIUM_DRIVER scopes the override to this ICD.  GALLIUM_DRIVER is
+    * process-global and is also read by the D3D10/11 UMD (see
+    * d3d10_create_screen in targets/d3d10umd/d3d10_gdi.c), so using it to
+    * select e.g. zink here would simultaneously stop that UMD from finding
+    * "yttrium" and make D3D11CreateDevice fail.
+    */
+   const char *env_driver = debug_get_option("WGL_GALLIUM_DRIVER", NULL);
+   if (!env_driver)
+      env_driver = debug_get_option("GALLIUM_DRIVER", "");
+
+   /* zink is the only driver selected automatically, and there is deliberately
+    * no fallback to virgl or to a software driver: a silent downgrade looks
+    * exactly like success and hides real breakage.  If zink cannot bring up a
+    * screen, fail and say so.  virgl and d3d12 remain reachable by name for
+    * comparison, and the software drivers when they are explicitly asked for.
+    */
    const char *const drivers[] = {
-      debug_get_option("GALLIUM_DRIVER", ""),
-#ifdef GALLIUM_VIRGL
-      sw_only ? "" : "virgl",
-#endif
-#ifdef GALLIUM_D3D12
-      sw_only ? "" : "d3d12",
-#endif
+      env_driver,
 #ifdef GALLIUM_ZINK
       sw_only ? "" : "zink",
 #endif
 #if defined(GALLIUM_LLVMPIPE)
-      "llvmpipe",
+      sw_only ? "llvmpipe" : "",
 #endif
 #if defined(GALLIUM_SOFTPIPE)
-      "softpipe",
+      sw_only ? "softpipe" : "",
 #endif
    };
 
-   /* If the default driver screen creation fails, fall back to the next option in the
-    * sorted list. Don't do this if GALLIUM_DRIVER is specified.
-    */
+   /* An explicitly named driver is never second-guessed either. */
    for (unsigned i = 0; i < ARRAY_SIZE(drivers); ++i) {
+      if (!drivers[i][0])
+         continue;
+
       struct pipe_screen* screen = wgl_screen_create_by_name(hDC, drivers[i], winsys);
       if (screen) {
          created_driver_name = drivers[i];
          return screen;
       }
-      if (i == 0 && drivers[i][0] != '\0')
-         break;
+
+      mesa_logw("wgl: %s screen creation failed; not falling back", drivers[i]);
+      break;
    }
 
    winsys->destroy(winsys);

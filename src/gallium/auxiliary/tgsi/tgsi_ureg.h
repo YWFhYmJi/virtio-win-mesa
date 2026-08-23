@@ -116,6 +116,9 @@ ureg_create_shader( struct ureg_program *,
 void
 ureg_set_next_shader_processor(struct ureg_program *ureg, unsigned processor);
 
+void
+ureg_set_any_inout_decl_range(struct ureg_program *ureg, bool enable);
+
 /* Alternately, return the built token stream and hand ownership of
  * that memory to the caller:
  */

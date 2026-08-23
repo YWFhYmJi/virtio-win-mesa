@@ -168,6 +168,8 @@ const char *tgsi_property_names[TGSI_PROPERTY_COUNT] =
    "LAYER_VIEWPORT_RELATIVE",
    "FS_BLEND_EQUATION_ADVANCED",
    "SEPARABLE_PROGRAM",
+   "TCS_TESS_FACTOR_ROUND_TO_POW2",
+   "TCS_TESS_FACTOR_MAX",
 };
 
 const char *tgsi_return_type_names[TGSI_RETURN_TYPE_COUNT] =

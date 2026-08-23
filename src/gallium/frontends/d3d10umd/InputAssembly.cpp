@@ -60,6 +60,7 @@ IaSetTopology(D3D10DDI_HDEVICE hDevice,                        // IN
    Device *pDevice = CastDevice(hDevice);
 
    enum mesa_prim primitive;
+   unsigned patch_vertices = 0;
    switch (PrimitiveTopology) {
    case D3D10_DDI_PRIMITIVE_TOPOLOGY_UNDEFINED:
       /* Apps might set topology to UNDEFINED when cleaning up on exit. */
@@ -92,13 +93,53 @@ IaSetTopology(D3D10DDI_HDEVICE hDevice,                        // IN
    case D3D10_DDI_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ:
       primitive = MESA_PRIM_TRIANGLE_STRIP_ADJACENCY;
       break;
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_2_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_5_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_6_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_7_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_8_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_9_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_10_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_11_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_12_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_13_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_14_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_15_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_16_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_17_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_18_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_19_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_20_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_21_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_22_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_23_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_24_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_25_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_26_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_27_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_28_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_29_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_30_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_31_CONTROL_POINT_PATCHLIST:
+   case D3D11_DDI_PRIMITIVE_TOPOLOGY_32_CONTROL_POINT_PATCHLIST:
+      primitive = MESA_PRIM_PATCHES;
+      patch_vertices = PrimitiveTopology -
+         D3D11_DDI_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1;
+      break;
    default:
       assert(0);
       primitive = MESA_PRIM_COUNT;
       break;
    }
 
+   if (patch_vertices && pDevice->pipe->set_patch_vertices)
+      pDevice->pipe->set_patch_vertices(pDevice->pipe, patch_vertices);
+
    pDevice->primitive = primitive;
+   pDevice->patch_vertices = patch_vertices;
 }
 
 
@@ -126,6 +167,8 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,                                    
    LOG_ENTRYPOINT();
 
    Device *pDevice = CastDevice(hDevice);
+   bool velems_changed = false;
+   bool vbuffers_changed = false;
    unsigned i;
 
    for (i = 0; i < NumBuffers; i++) {
@@ -134,6 +177,16 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,                                    
       Resource *res = CastResource(phBuffers[i]);
       struct pipe_stream_output_target *so_target =
          res ? res->so_target : NULL;
+
+      ResourceEvent(RESOURCE_EVENT_SET_VERTEX_BUFFER,
+                    (uint64_t)(uintptr_t)(phBuffers ? phBuffers[i].pDrvPrivate
+                                                    : NULL),
+                    res,
+                    resource,
+                    PipeResourceRefCount(resource),
+                    StartBuffer + i,
+                    pStrides ? pStrides[i] : 0,
+                    pOffsets ? pOffsets[i] : 0);
 
       if (so_target && pDevice->draw_so_target != so_target) {
          if (pDevice->draw_so_target) {
@@ -144,6 +197,11 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,                                    
       }
 
       if (resource) {
+         velems_changed |=
+            pDevice->vertex_strides[StartBuffer + i] != pStrides[i];
+         vbuffers_changed |= vb->is_user_buffer ||
+                             vb->buffer.resource != resource ||
+                             vb->buffer_offset != pOffsets[i];
          pDevice->vertex_strides[StartBuffer + i] = pStrides[i];
          vb->buffer_offset = pOffsets[i];
          if (vb->is_user_buffer) {
@@ -153,6 +211,10 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,                                    
          pipe_resource_reference(&vb->buffer.resource, resource);
       }
       else {
+         velems_changed |= pDevice->vertex_strides[StartBuffer + i] != 0;
+         vbuffers_changed |= !vb->is_user_buffer ||
+                             vb->buffer.user != NULL ||
+                             vb->buffer_offset != 0;
          pDevice->vertex_strides[StartBuffer + i] = 0;
          vb->buffer_offset = 0;
          if (!vb->is_user_buffer) {
@@ -163,22 +225,12 @@ IaSetVertexBuffers(D3D10DDI_HDEVICE hDevice,                                    
       }
    }
 
-   for (i = 0; i < PIPE_MAX_ATTRIBS; ++i) {
-      struct pipe_vertex_buffer *vb = &pDevice->vertex_buffers[i];
-
-      /* XXX this is odd... */
-      if (!vb->is_user_buffer && !vb->buffer.resource) {
-         pDevice->vertex_strides[i] = 0;
-         vb->buffer_offset = 0;
-         vb->is_user_buffer = true;
-         vb->buffer.user = NULL;
-      }
+   if (velems_changed) {
+      pDevice->velems_changed = true;
+      pDevice->vbuffers_changed = true;
    }
-
-   /* Resubmit old and new vertex buffers.
-    */
-   pDevice->velems_changed = true;
-   pDevice->vbuffers_changed = true;
+   if (vbuffers_changed)
+      pDevice->vbuffers_changed = true;
 }
 
 
@@ -203,6 +255,15 @@ IaSetIndexBuffer(D3D10DDI_HDEVICE hDevice,   // IN
 
    Device *pDevice = CastDevice(hDevice);
    struct pipe_resource *resource = CastPipeResource(hBuffer);
+
+   ResourceEvent(RESOURCE_EVENT_SET_INDEX_BUFFER,
+                 (uint64_t)(uintptr_t)hBuffer.pDrvPrivate,
+                 CastResource(hBuffer),
+                 resource,
+                 PipeResourceRefCount(resource),
+                 Format,
+                 0,
+                 Offset);
 
    if (resource) {
       pDevice->ib_offset = Offset;

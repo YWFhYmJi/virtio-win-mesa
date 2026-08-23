@@ -70,6 +70,8 @@ typedef struct _VIOGPU_ADAPTERINFO {
 #define VIOGPU_RES_MAP_BLOB                               0x102
 #define VIOGPU_RES_UNMAP_BLOB                             0x103
 #define VIOGPU_RES_CREATE_BLOB                            0x104
+#define VIOGPU_RES_SET_SCANOUT_BLOB                       0x105
+#define VIOGPU_RES_ATTACH_WAIT                            0x106
 
 #define VIOGPU_CTX_INIT                                   0x200
 #define VIOGPU_SUBMIT_CMD                                 0x300
@@ -133,6 +135,27 @@ typedef struct _VIOGPU_RES_UNMAP_BLOB_REQ {
 }VIOGPU_RES_UNMAP_BLOB_REQ;
 #pragma pack()
 
+#pragma pack(1)
+typedef struct _VIOGPU_RES_SET_SCANOUT_BLOB_REQ {
+    D3DKMT_HANDLE ResHandle;
+    ULONG ScanoutId;
+    ULONG Width;
+    ULONG Height;
+    ULONG X;
+    ULONG Y;
+    ULONG Format;
+    ULONG Stride;
+    ULONG Offset;
+}VIOGPU_RES_SET_SCANOUT_BLOB_REQ;
+#pragma pack()
+
+#pragma pack(1)
+typedef struct _VIOGPU_RES_ATTACH_WAIT_REQ {
+    D3DKMT_HANDLE ResHandle;
+    ULONG Id;
+}VIOGPU_RES_ATTACH_WAIT_REQ;
+#pragma pack()
+
 
 #pragma pack(1)
 typedef struct _VIOGPU_CTX_INIT_REQ {
@@ -148,7 +171,6 @@ typedef struct _VIOGPU_SUBMIT_CMD_REQ {
 } VIOGPU_SUBMIT_CMD_REQ;
 #pragma pack()
 
-
 #pragma pack(1)
 typedef struct  _VIOGPU_ESCAPE{
     USHORT      Type;
@@ -163,6 +185,8 @@ typedef struct  _VIOGPU_ESCAPE{
         VIOGPU_RES_BUSY_REQ ResourceBusy;
         VIOGPU_RES_MAP_BLOB_REQ ResourceMapBlob;
         VIOGPU_RES_UNMAP_BLOB_REQ ResourceUnmapBlob;
+        VIOGPU_RES_SET_SCANOUT_BLOB_REQ ResourceSetScanoutBlob;
+        VIOGPU_RES_ATTACH_WAIT_REQ ResourceAttachWait;
         
         VIOGPU_CTX_INIT_REQ CtxInit;
     } DUMMYUNIONNAME;
@@ -198,6 +222,8 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE {
     ULONGLONG BlobId;
     ULONG BlobMem;
     ULONG BlobFlags;
+    ULONG Stride;
+    ULONG ScanoutOffset;
 } VIOGPU_CREATE_ALLOCATION_EXCHANGE;
 #pragma pack()
 
@@ -207,6 +233,7 @@ typedef struct _VIOGPU_CREATE_ALLOCATION_EXCHANGE {
 #define VIOGPU_CMD_SUBMIT                       0x1 // Submit Command to virgl
 #define VIOGPU_CMD_TRANSFER_TO_HOST             0x2 // Transfer resource to host
 #define VIOGPU_CMD_TRANSFER_FROM_HOST           0x3 // Transfer resource to host
+#define VIOGPU_CMD_PRESENT_FLIP                 0x4 // Flip scanout to a resource
 
 #pragma pack(1)
 typedef struct _VIOGPU_COMMAND_HDR {
@@ -229,7 +256,20 @@ typedef struct _VIOGPU_TRANSFER_CMD {
 } VIOGPU_TRANSFER_CMD;
 #pragma pack()
 
-
+#pragma pack(1)
+typedef struct _VIOGPU_PRESENT_FLIP_CMD {
+    ULONG scan_id;
+    ULONG res_id;
+    ULONG width;
+    ULONG height;
+    ULONG x;
+    ULONG y;
+    ULONG is_blob;
+    ULONG format;
+    ULONG stride;
+    ULONG offset;
+} VIOGPU_PRESENT_FLIP_CMD;
+#pragma pack()
 
 #define BASE_NAMED_OBJECTS    L"\\BaseNamedObjects\\"
 #define GLOBAL_OBJECTS    L"Global\\"
