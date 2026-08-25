@@ -1020,8 +1020,8 @@ virtgpu_d3dkmt_map(struct virtgpu *gpu,
 {
    uint32_t map_info = 0;
    void *user_va = NULL;
-   if (virtgpu_d3dkmt_resource_map_blob(gpu, alloc_handle, 0, size, &map_info,
-                                       placed_addr, &user_va)) {
+   if (virtgpu_d3dkmt_resource_map_blob(gpu, alloc_handle, 0, size, placed_addr,
+                                       &map_info, &user_va)) {
       vn_log(gpu->instance,"virtgpu_d3dkmt_resource_map_blob failed");
       return NULL;
    }
