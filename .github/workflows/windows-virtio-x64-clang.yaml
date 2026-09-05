@@ -27,7 +27,7 @@ jobs:
       shell: powershell
       run: |
         # .\.github\workflows\llvm-mingw-configure.ps1
-        curl https://github.com/YWFhYmJi/d3d10umd-winddk-headers/releases/download/llvm-mingw/llvm-mingw-msvcrt-x86_64.7z -O llvm-mingw-msvcrt-x86_64.7z
+        curl https://github.com/YWFhYmJi/d3d10umd-winddk-headers/releases/download/llvm-mingw-20260826/llvm-mingw-msvcrt-x86_64.7z -O llvm-mingw-msvcrt-x86_64.7z
         7z x -o"$PWD\llvm-mingw-msvcrt-x86_64" llvm-mingw-msvcrt-x86_64.7z
 
     - name: Install Python modules
