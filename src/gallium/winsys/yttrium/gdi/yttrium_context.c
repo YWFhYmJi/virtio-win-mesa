@@ -15,6 +15,7 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
+#include "util/u_atomic.h"
 
 #include "yttrium_draw.h"
 #include "yttrium_gdi_public.h"
@@ -469,7 +470,7 @@ yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
    issuance->state = YTTRIUM_FLUSH_ISSUANCE_PENDING;
    issuance->device = yttrium_screen(ctx->screen)->device;
    issuance->id =
-      (uint64_t)InterlockedIncrement64(&yttrium_next_flush_issuance_id);
+      (uint64_t)p_atomic_inc_return(&yttrium_next_flush_issuance_id);
 
    if (ctx->flush != yttrium_flush) {
       if (!yttrium_threaded_queue_flush_label(
@@ -597,7 +598,7 @@ yttrium_gdi_flush_async_present(
 
    ticket->publish = *publish;
    ticket->id =
-      (uint64_t)InterlockedIncrement64(&yttrium_next_present_ticket_id);
+      (uint64_t)p_atomic_inc_return(&yttrium_next_present_ticket_id);
 
    struct yttrium_gdi_flush_issuance *issuance = NULL;
    if (issued) {
@@ -609,7 +610,7 @@ yttrium_gdi_flush_async_present(
       issuance->references = 2;
       issuance->state = YTTRIUM_FLUSH_ISSUANCE_PENDING;
       issuance->device = yttrium_screen(ctx->screen)->device;
-      issuance->id = (uint64_t)InterlockedIncrement64(&yttrium_next_flush_issuance_id);
+      issuance->id = (uint64_t)p_atomic_inc_return(&yttrium_next_flush_issuance_id);
    }
 
    if (ctx->flush != yttrium_flush) {
