@@ -1855,7 +1855,11 @@ main(int argc, char *argv[])
              * buffers until something flushes them, so without this fence the
              * timer stops before the bus has seen the data and WC memory looks
              * as fast as cached memory. */
+#if defined(__aarch64__)
+            __asm__ __volatile__("dmb ishst" ::: "memory");
+#else
             _mm_sfence();
+#endif
             QueryPerformanceCounter(&t2);
 
             pDeviceContext->Unmap(pUploadBuffer.Get(), 0);
