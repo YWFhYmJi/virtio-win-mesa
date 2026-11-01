@@ -395,6 +395,7 @@ struct Shader_xlate {
    struct Shader_resource resources[SHADER_MAX_RESOURCES];
    struct Shader_image images[SHADER_MAX_IMAGES];
    uint8_t counter_image_slots[SHADER_MAX_IMAGES];
+   uint64_t typed_buffer_image_mask;
    struct ureg_src counter_images[SHADER_MAX_IMAGES];
    struct Shader_tgsm tgsm[SHADER_MAX_TGSM];
    struct ureg_src shared_memory;
@@ -3139,7 +3140,8 @@ sample_i_buffer_dwords_ureg_emit(struct ureg_program *ureg,
                                  struct ureg_dst dst,
                                  struct ureg_src coord,
                                  struct ureg_src resource,
-                                 enum tgsi_texture_type target)
+                                 enum tgsi_texture_type target,
+                                 const D3D10_SB_4_COMPONENT_NAME *swizzle)
 {
    struct ureg_dst base = ureg_DECL_temporary(ureg);
    struct ureg_dst fetch_coord = ureg_DECL_temporary(ureg);
@@ -3155,10 +3157,13 @@ sample_i_buffer_dwords_ureg_emit(struct ureg_program *ureg,
       if (scalar_dst.WriteMask == TGSI_WRITEMASK_NONE)
          continue;
 
-      if (chan) {
+      /* The write mask selects destination registers; the resource swizzle
+       * selects DWORDs relative to the byte offset. */
+      const unsigned component = swizzle[chan];
+      if (component) {
          ureg_UADD(ureg, fetch_coord,
                    ureg_scalar(ureg_src(base), TGSI_SWIZZLE_X),
-                   ureg_imm1u(ureg, chan));
+                   ureg_imm1u(ureg, component));
       } else {
          ureg_MOV(ureg, fetch_coord,
                   ureg_scalar(ureg_src(base), TGSI_SWIZZLE_X));
@@ -3394,7 +3399,7 @@ emit_raw_buffer_bufinfo(struct ureg_program *ureg, struct ureg_dst dst,
 
 static void
 emit_structured_buffer_bufinfo(struct ureg_program *ureg, struct ureg_dst dst,
-                               struct ureg_src query, unsigned stride,
+                               struct ureg_src query,
                                unsigned count_divisor)
 {
    struct ureg_dst value = ureg_DECL_temporary(ureg);
@@ -3402,13 +3407,8 @@ emit_structured_buffer_bufinfo(struct ureg_program *ureg, struct ureg_dst dst,
    ureg_UDIV(ureg, ureg_writemask(value, TGSI_WRITEMASK_X),
              ureg_scalar(query, TGSI_SWIZZLE_X),
              ureg_imm1u(ureg, MAX2(count_divisor, 1)));
-   ureg_MOV(ureg, ureg_writemask(value, TGSI_WRITEMASK_Y),
-            ureg_imm1u(ureg, stride));
-   ureg_MOV(ureg, ureg_writemask(value, TGSI_WRITEMASK_Z),
-            ureg_imm1u(ureg, 0));
-   ureg_MOV(ureg, ureg_writemask(value, TGSI_WRITEMASK_W),
-            ureg_imm1u(ureg, 1));
-   ureg_MOV(ureg, dst, ureg_src(value));
+   ureg_MOV(ureg, dst,
+            ureg_scalar(ureg_src(value), TGSI_SWIZZLE_X));
    ureg_release_temporary(ureg, value);
 }
 
@@ -3430,9 +3430,12 @@ emit_dynamic_buffer_bufinfo(struct Shader_xlate *sx, struct ureg_dst dst,
 {
    declare_driver_constants(sx);
 
+   /* BUFINFO broadcasts the element count to every selected component. */
    ureg_MOV(sx->ureg, dst,
-            ureg_src_dimension(ureg_src_register(TGSI_FILE_CONSTANT, record),
-                               D3D10UMD_DRIVER_BUFINFO_CB_SLOT));
+            ureg_scalar(ureg_src_dimension(
+                           ureg_src_register(TGSI_FILE_CONSTANT, record),
+                           D3D10UMD_DRIVER_BUFINFO_CB_SLOT),
+                        TGSI_SWIZZLE_X));
 }
 
 static void
@@ -3739,7 +3742,8 @@ Shader_tgsi_translate(const unsigned *code,
                       const D3D10DDIARG_STAGE_IO_SIGNATURES *stage_signatures,
                       struct pipe_shader_sampler_binding_map *
                       sampler_binding_map,
-                      uint8_t *counter_image_slots)
+                      uint8_t *counter_image_slots,
+                      uint64_t *typed_buffer_image_mask)
 {
    struct Shader_xlate *sx;
    struct Shader_parser parser;
@@ -3750,6 +3754,9 @@ Shader_tgsi_translate(const unsigned *code,
    bool shader_dumped = false;
    bool inside_sub = false;
    uint i, j;
+
+   if (typed_buffer_image_mask)
+      *typed_buffer_image_mask = 0;
 
    /* DWM can translate shaders on threads with only a 128 KiB stack.
     * Keep the large scratch context off the caller's stack and private to
@@ -3956,9 +3963,25 @@ Shader_tgsi_translate(const unsigned *code,
          ureg_property(ureg, TGSI_PROPERTY_CS_FIXED_BLOCK_DEPTH,
                        opcode.specific.dcl_thread_group.z);
          break;
-      case DX10_SM5_OPCODE_SYNC:
-         ureg_BARRIER(ureg);
+      case DX10_SM5_OPCODE_SYNC: {
+         const unsigned flags = opcode.specific.sync_flags;
+         unsigned memory = 0;
+         if (flags & D3D11_SB_SYNC_THREAD_GROUP_SHARED_MEMORY)
+            memory |= TGSI_MEMBAR_SHARED;
+         if (flags & (D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP |
+                      D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL)) {
+            memory |= TGSI_MEMBAR_SHADER_BUFFER |
+                      TGSI_MEMBAR_ATOMIC_BUFFER |
+                      TGSI_MEMBAR_SHADER_IMAGE;
+         }
+         if (!(flags & D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL))
+            memory |= TGSI_MEMBAR_THREAD_GROUP;
+         ureg_MEMBAR(ureg, ureg_imm1u(ureg, memory));
+         /* Only _t synchronizes execution; memory fences may be divergent. */
+         if (flags & D3D11_SB_SYNC_THREADS_IN_GROUP)
+            ureg_BARRIER(ureg);
          break;
+      }
       case DX10_SM5_OPCODE_DCL_TGSM_RAW:
       case DX10_SM5_OPCODE_DCL_TGSM_STRUCTURED: {
          unsigned slot = 0;
@@ -4303,7 +4326,8 @@ Shader_tgsi_translate(const unsigned *code,
          sample_i_buffer_dwords_ureg_emit(
             ureg, &opcode,
             translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
-            srcreg[0], srcreg[1], sx->resources[resource].target);
+            srcreg[0], srcreg[1], sx->resources[resource].target,
+            opcode.src[1].swizzle);
          ureg_release_temporary(ureg, coord);
          break;
       }
@@ -4454,7 +4478,8 @@ Shader_tgsi_translate(const unsigned *code,
          sample_i_buffer_dwords_ureg_emit(
             ureg, &opcode,
             translate_dst_operand(sx, &opcode.dst[0], opcode.saturate),
-            srcreg[0], srcreg[1], sx->resources[resource].target);
+            srcreg[0], srcreg[1], sx->resources[resource].target,
+            opcode.src[2].swizzle);
          ureg_release_temporary(ureg, byte_offset);
          ureg_release_temporary(ureg, coord);
          break;
@@ -4686,7 +4711,6 @@ Shader_tgsi_translate(const unsigned *code,
                              sx->images[image_index].format);
             if (sx->images[image_index].structured_stride) {
                emit_structured_buffer_bufinfo(ureg, dstreg, ureg_src(tmp),
-                                              sx->images[image_index].structured_stride,
                                               sx->images[image_index].structured_stride);
             } else if (sx->images[image_index].raw) {
                emit_raw_buffer_bufinfo(ureg, dstreg, ureg_src(tmp));
@@ -4734,7 +4758,6 @@ Shader_tgsi_translate(const unsigned *code,
                      ureg_imm1u(ureg, 0), sampler);
             if (sx->resources[resource].structured_stride) {
                emit_structured_buffer_bufinfo(ureg, dstreg, ureg_src(tmp),
-                                              sx->resources[resource].structured_stride,
                                               sx->resources[resource].structured_stride /
                                               sizeof(uint32_t));
             } else if (sx->resources[resource].raw) {
@@ -5509,6 +5532,8 @@ Shader_tgsi_translate(const unsigned *code,
 
          target = translate_resource_dimension(opcode.specific.dcl_resource_dimension);
          sx->images[image_index].target = target;
+         if (target == TGSI_TEXTURE_BUFFER)
+            sx->typed_buffer_image_mask |= 1ull << image_index;
          sx->images[image_index].structured_stride = 0;
          sx->images[image_index].raw = false;
          sx->images[image_index].format =
@@ -6117,7 +6142,13 @@ Shader_tgsi_translate(const unsigned *code,
                           &load, 1, src, ARRAY_SIZE(src), 0,
                           sx->images[image_index].target,
                           sx->images[image_index].format);
-         ureg_MOV(ureg, dst, ureg_src(load));
+         /* The UAV operand swizzles the fetched value before the dst mask. */
+         ureg_MOV(ureg, dst,
+                  ureg_swizzle(ureg_src(load),
+                               opcode.src[1].swizzle[0],
+                               opcode.src[1].swizzle[1],
+                               opcode.src[1].swizzle[2],
+                               opcode.src[1].swizzle[3]));
          ureg_release_temporary(ureg, load);
          break;
       }
@@ -6709,6 +6740,9 @@ Shader_tgsi_translate(const unsigned *code,
    if (counter_image_slots)
       memcpy(counter_image_slots, sx->counter_image_slots,
              sizeof(sx->counter_image_slots));
+
+   if (typed_buffer_image_mask)
+      *typed_buffer_image_mask = sx->typed_buffer_image_mask;
 
    tokens = ureg_get_tokens(ureg, &nr_tokens);
    assert(tokens);

@@ -66,6 +66,8 @@ struct hash_table_u64;
    "D3D10UMD_YTTRIUM_RING_BUFFER_SIZE"
 #define YTTRIUM_VENUS_REPLY_SIZE (1024 * 1024)
 #define YTTRIUM_VENUS_RING_IDLE_TIMEOUT_NS (1000 * 1000)
+/* Internal completion waits use these intervals for progress warnings and
+ * finite host-wait slices, without abandoning work merely because it is late. */
 #define YTTRIUM_VENUS_FENCE_WAIT_MS 5000u
 #define YTTRIUM_VENUS_RING_WAIT_HEADROOM_MS 10000u
 #define YTTRIUM_VENUS_RING_WAIT_MS \
@@ -73,9 +75,6 @@ struct hash_table_u64;
 #define YTTRIUM_VENUS_FENCE_WAIT_NS \
    (YTTRIUM_VENUS_FENCE_WAIT_MS * 1000ull * 1000ull)
 #define YTTRIUM_VENUS_TIMING_SLOW_US 1000
-#define YTTRIUM_VENUS_SYNC_WAIT_DIAG_WINDOW_US 1000000
-#define YTTRIUM_VENUS_SYNC_WAIT_DIAG_MAX_COUNT 1024
-#define YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS 8
 #define YTTRIUM_VENUS_MAX_PHYSICAL_DEVICES 16
 #define YTTRIUM_VENUS_ASYNC_BATCH_ENV "D3D10UMD_YTTRIUM_ASYNC_BATCH"
 #define YTTRIUM_VENUS_GROUP_QUEUE_SUBMITS_ENV \
@@ -107,8 +106,6 @@ struct hash_table_u64;
    "D3D10UMD_YTTRIUM_DIRECT_CPU_VERTEX_UPLOAD"
 #define YTTRIUM_VENUS_DEVICE_LOCAL_STATIC_DRAW_BUFFERS_ENV \
    "D3D10UMD_YTTRIUM_DEVICE_LOCAL_STATIC_DRAW_BUFFERS"
-#define YTTRIUM_VENUS_TEST_FAIL_AFTER_DRAW_MIRROR_COPY_ONCE_ENV \
-   "D3D10UMD_YTTRIUM_TEST_FAIL_AFTER_DRAW_MIRROR_COPY_ONCE"
 #define YTTRIUM_VENUS_DRAW_ARENA_BAR_ENV \
    "D3D10UMD_YTTRIUM_DRAW_ARENA_BAR"
 #define YTTRIUM_VENUS_DIRECT_UBO_UPLOAD_ENV \
@@ -154,33 +151,6 @@ enum yttrium_venus_sync_wait_kind {
    YTTRIUM_VENUS_SYNC_WAIT_RING_SPACE = 1,
    YTTRIUM_VENUS_SYNC_WAIT_RING_SEQNO = 2,
    YTTRIUM_VENUS_SYNC_WAIT_BATCH_COMPLETION = 3,
-};
-
-struct yttrium_venus_sync_wait_diag {
-   struct {
-      uint32_t command_type;
-      uint32_t count;
-      uint32_t command_size;
-      uint32_t reply_size;
-      uint64_t wait_us;
-      uint64_t max_wait_us;
-   } commands[YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS];
-   uint64_t window_start_us;
-   uint64_t total_wait_us;
-   uint64_t max_wait_us;
-   uint32_t total_count;
-   uint32_t raw_submit_count;
-   uint32_t ring_space_count;
-   uint32_t ring_seqno_count;
-   uint32_t timeout_count;
-   uint32_t last_kind;
-   uint32_t last_status;
-   const char *last_label;
-   uint32_t last_a;
-   uint32_t last_b;
-   uint32_t last_command_type;
-   uint32_t last_command_size;
-   uint32_t last_reply_size;
 };
 
 struct yttrium_venus_bo {
@@ -422,6 +392,12 @@ struct yttrium_venus_draw_mirror_update {
    bool previous_pending_valid;
 };
 
+struct yttrium_venus_primary_writes {
+   D3DKMT_HANDLE *allocations;
+   uint32_t count;
+   uint32_t capacity;
+};
+
 struct yttrium_venus_batch {
    struct yttrium_venus_object command_buffer_obj;
    struct yttrium_venus_object feedback_command_buffer_obj;
@@ -445,6 +421,9 @@ struct yttrium_venus_batch {
    struct pipe_resource
       *resource_refs[YTTRIUM_VENUS_CMD_BATCH_PENDING_RESOURCE_REF_LIMIT];
    uint32_t resource_count;
+   /* Capture physical allocation identities when recording commands. The
+    * resource_refs above keep their backing alive through batch completion. */
+   struct yttrium_venus_primary_writes primary_writes;
    struct yttrium_pipeline
       *pipelines[YTTRIUM_VENUS_CMD_BATCH_PENDING_PIPELINE_REF_LIMIT];
    uint32_t pipeline_count;
@@ -640,6 +619,10 @@ struct yttrium_venus_compact_draw_packet {
 struct yttrium_venus {
    struct gdikmt_device *device;
    struct gdikmt_context *kmt_ctx;
+   struct yttrium_venus_external_image *external_images;
+   bool shared_image_supported;
+   bool image_drm_format_modifier;
+   bool retain_unretired_resources;
 
    uint64_t next_id;
    struct vn_ring vn_ring;
@@ -686,6 +669,16 @@ struct yttrium_venus {
    uint64_t ubo_upload_buffer_generation;
    VkDeviceSize ubo_arena_bytes;
    VkDeviceSize uniform_buffer_offset_alignment;
+   VkDeviceSize texel_buffer_offset_alignment;
+   VkDeviceSize uniform_texel_buffer_alignment;
+   VkDeviceSize storage_texel_buffer_alignment;
+   bool texel_buffer_alignment;
+   bool uniform_texel_buffer_single_texel_alignment;
+   bool storage_texel_buffer_single_texel_alignment;
+   uint32_t max_texel_buffer_elements;
+   bool robust_buffer_access2;
+   bool null_descriptor;
+   uint8_t compute_sampled_buffer_formats[PIPE_FORMAT_COUNT];
    VkPhysicalDeviceMemoryProperties memory_props;
    VkSampleCountFlags framebuffer_sample_counts;
    VkSampleCountFlags framebuffer_no_attachments_sample_counts;
@@ -697,7 +690,6 @@ struct yttrium_venus {
    uint32_t mipmap_precision_bits;
    uint32_t instance_version;
    uint32_t queue_family_index;
-   struct yttrium_venus_sync_wait_diag sync_wait_diag;
    struct yttrium_venus_batch **batches;
    struct yttrium_venus_batch **pending_submit_batches;
    uint32_t batch_count;
@@ -715,6 +707,10 @@ struct yttrium_venus {
    struct yttrium_venus_resource null_sampled_buffer;
    VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback_props;
    bool depth_bias_control;
+   bool depth_bias_exact;
+   bool depth_bias_float;
+   bool depth_bias_force_unorm;
+   bool depth_bias_clamp;
    bool depth_clamp;
    bool dual_src_blend;
    bool independent_blend;
@@ -731,7 +727,12 @@ struct yttrium_venus {
    bool storage_image_write_without_format;
    /* Immutable per-device format support: 0 unknown, 1 unsupported, 2 supported. */
    uint8_t storage_image_formatless_formats[PIPE_FORMAT_COUNT];
+   uint8_t storage_buffer_formatless_formats[PIPE_FORMAT_COUNT];
    bool multisampled_render_to_single_sampled;
+   bool depth_stencil_resolve;
+   VkResolveModeFlags depth_resolve_modes;
+   VkResolveModeFlags stencil_resolve_modes;
+   bool independent_resolve_none;
    bool transform_feedback;
    bool vertex_attribute_instance_rate_divisor;
    bool vertex_attribute_instance_rate_zero_divisor;
@@ -782,6 +783,9 @@ struct yttrium_venus {
       *cmd_batch_pending_pipelines[YTTRIUM_VENUS_CMD_BATCH_PENDING_PIPELINE_REF_LIMIT];
    uint32_t cmd_batch_pending_resource_count;
    uint32_t cmd_batch_pending_pipeline_count;
+   struct yttrium_venus_primary_writes cmd_batch_primary_writes;
+   struct yttrium_venus_primary_writes submit_primary_writes;
+   bool cmd_batch_primary_writes_failed;
    struct yttrium_venus_draw_mirror_update *cmd_batch_draw_mirror_updates;
    uint32_t cmd_batch_draw_mirror_update_count;
    uint32_t cmd_batch_draw_mirror_update_capacity;
@@ -837,8 +841,6 @@ struct yttrium_venus {
    bool physical_device_initialized;
    bool initialized;
    bool failed;
-   bool test_fail_after_draw_mirror_copy_once;
-   bool test_fail_after_draw_mirror_copy_consumed;
 };
 
 #define YTTRIUM_VENUS_DISPLAY_COPY_BATCH_LIMIT 64
@@ -1007,7 +1009,7 @@ yttrium_venus2_storage_image_without_format_supported(
 bool
 yttrium_venus2_storage_image_formatless_format_supported(
    struct yttrium_venus *venus, enum pipe_format format,
-   bool read, bool write);
+   bool read, bool write, bool buffer);
 
 bool
 yttrium_venus2_transform_feedback_draw_enabled(
@@ -1068,6 +1070,34 @@ yttrium_venus2_create_display_image(struct yttrium_venus *venus,
                                     uint64_t min_allocation_size,
                                     uint64_t *out_memory_id,
                                     uint64_t *out_allocation_size);
+
+bool
+yttrium_venus2_create_optimal_shared_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format,
+   unsigned bind, struct yttrium_optimal_image_data *data,
+   uint64_t *out_memory_id, uint64_t *out_allocation_size);
+
+bool
+yttrium_venus2_import_optimal_shared_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_optimal_image_data *data);
+
+bool
+yttrium_venus2_publish_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   const char *label);
+
+bool
+yttrium_venus2_create_presentable_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format, unsigned bind,
+   uint64_t *out_endpoint_memory_id, uint64_t *out_endpoint_allocation_size);
+
+bool
+yttrium_venus2_import_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_display_endpoint_data *data);
 
 bool
 yttrium_venus2_create_color_attachment_image(
@@ -1268,6 +1298,22 @@ yttrium_venus_choose_memory_type(struct yttrium_venus *venus,
                                  VkMemoryPropertyFlags required,
                                  VkMemoryPropertyFlags preferred);
 
+/* force_sync preserves callers that already require a host reply.  The
+ * SYNC_ALLOCATIONS diagnostic option also waits in otherwise async callers.
+ * On failure, memory is cleared and must not be bound or freed by the caller.
+ */
+VkResult
+yttrium_venus_allocate_memory(struct yttrium_venus *venus,
+                              const VkMemoryAllocateInfo *info,
+                              const VkMemoryRequirements *requirements,
+                              VkDeviceMemory *memory,
+                              uint64_t memory_id,
+                              const char *owner,
+                              bool force_sync);
+
+void
+yttrium_venus2_retain_on_teardown(struct yttrium_venus *venus);
+
 bool
 yttrium_venus_ensure_initialized(struct yttrium_venus *venus);
 
@@ -1289,6 +1335,11 @@ yttrium_venus_drain_batches(struct yttrium_venus *venus, const char *label);
 
 bool
 yttrium_venus_cmd_batch_track_resource(
+   struct yttrium_venus *venus,
+   struct yttrium_venus_resource *resource);
+
+bool
+yttrium_venus_cmd_batch_track_write(
    struct yttrium_venus *venus,
    struct yttrium_venus_resource *resource);
 
@@ -1417,6 +1468,10 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
                                   const char *label);
 
 bool
+yttrium_venus_initialize_shared_public_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource);
+
+bool
 yttrium_venus_pipeline_ubo_footprint(
    struct yttrium_venus *venus,
    struct yttrium_pipeline *pipeline,
@@ -1517,6 +1572,10 @@ struct yttrium_venus_batch *
 yttrium_venus_find_latest_pipeline_batch(
    struct yttrium_venus *venus,
    const struct yttrium_pipeline *pipeline);
+
+bool
+yttrium_venus_resource_batches_ready(struct yttrium_venus *venus,
+                                   struct yttrium_venus_resource *resource);
 
 bool
 yttrium_venus_wait_resource_batches(struct yttrium_venus *venus,

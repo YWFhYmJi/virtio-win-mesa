@@ -214,7 +214,7 @@ gdikmt_d3dddi_record_status(struct gdikmt_device *device,
          callback ? callback : "<unknown>", (unsigned long)status,
          GetCurrentProcessId(), GetCurrentThreadId());
    }
-   gdikmt_device_report_reset(device, PIPE_UNKNOWN_CONTEXT_RESET);
+   gdikmt_device_report_removal(device);
    return status;
 }
 
@@ -232,6 +232,7 @@ gdikmt_is_known_viogpu_escape_type(USHORT type)
    case VIOGPU_RES_CREATE_BLOB:
    case VIOGPU_RES_SET_SCANOUT_BLOB:
    case VIOGPU_RES_ATTACH_WAIT:
+   case VIOGPU_CHECK_DIRECT_FLIP:
    case VIOGPU_CTX_INIT:
    case VIOGPU_SUBMIT_CMD:
    case VIOGPU_QUERY_TIMELINE_SUBMIT:
@@ -337,11 +338,46 @@ gdikmt_d3dddi_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
    return gdikmt_d3dddi_record_status(_device, status, "pfnEscapeCb");
 }
 
+static NTSTATUS
+gdikmt_d3dddi_querydevicestate(struct gdikmt_device *_device,
+                               D3DKMT_DEVICEEXECUTION_STATE *state)
+{
+   struct gdikmt_device_d3dddi *device = gdikmt_device_d3dddi(_device);
+   D3DDDI_EXECUTIONSTATEESCAPE query = {};
+   D3DDDICB_ESCAPE escape = {};
+   escape.hDevice = device->hRTDevice;
+   escape.Flags.DeviceStatusQuery = 1;
+   escape.pPrivateDriverData = &query;
+   escape.PrivateDriverDataSize = sizeof(query);
+
+   /* The runtime handles this query; it is not a private KMD escape. No
+    * context is supplied because this observes the device, not a queue. */
+   const NTSTATUS status = gdikmt_d3dddi_record_status(
+      _device, device->KTCallbacks.pfnEscapeCb(device->hRTAdapter, &escape),
+      "pfnEscapeCb(DeviceStatusQuery)");
+   if (NT_SUCCESS(status)) {
+      static_assert(
+         (int)D3DDDI_DEVICEEXECUTION_ACTIVE == (int)D3DKMT_DEVICEEXECUTION_ACTIVE &&
+         (int)D3DDDI_DEVICEEXECUTION_RESET == (int)D3DKMT_DEVICEEXECUTION_RESET &&
+         (int)D3DDDI_DEVICEEXECUTION_HUNG == (int)D3DKMT_DEVICEEXECUTION_HUNG &&
+         (int)D3DDDI_DEVICEEXECUTION_STOPPED == (int)D3DKMT_DEVICEEXECUTION_STOPPED &&
+         (int)D3DDDI_DEVICEEXECUTION_ERROR_OUTOFMEMORY == (int)D3DKMT_DEVICEEXECUTION_ERROR_OUTOFMEMORY &&
+         (int)D3DDDI_DEVICEEXECUTION_ERROR_DMAFAULT == (int)D3DKMT_DEVICEEXECUTION_ERROR_DMAFAULT,
+         "DDI and KMT execution states must match");
+      *state = (D3DKMT_DEVICEEXECUTION_STATE)query.State;
+   }
+   return status;
+}
+
 NTSTATUS
 gdikmt_d3dddi_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
 {
    struct gdikmt_context_d3dddi *ctx = gdikmt_context_d3dddi(_ctx);
    struct gdikmt_device_d3dddi *dev = gdikmt_device_d3dddi(ctx->base.device);
+
+   /* A removed runtime device may return S_OK without submitting anything. */
+   if (gdikmt_device_get_reset_status(&dev->base) != PIPE_NO_RESET)
+      return (NTSTATUS)D3DDDIERR_DEVICEREMOVED;
 
    D3DDDICB_RENDER render;
    memset(&render, 0, sizeof(render));
@@ -387,6 +423,11 @@ gdikmt_d3dddi_render(struct gdikmt_context *_ctx, struct gdikmt_render *options)
                             render.NewCommandBufferSize,
                             render.NewAllocationListSize,
                             render.NewPatchLocationListSize);
+   if (gdikmt_device_get_reset_status(&dev->base) != PIPE_NO_RESET)
+      return (NTSTATUS)D3DDDIERR_DEVICEREMOVED;
+   if (!NT_SUCCESS(Status))
+      return Status;
+
    if (options->CompletionEvent) {
       NTSTATUS signal_status;
       if (dev->use_legacy_signal_sync) {
@@ -1119,6 +1160,7 @@ gdikmt_d3dddi_fill_basefuncs(struct gdikmt_device_d3dddi *device)
    device->base.destroy = gdikmt_d3dddi_destroy;
    device->base.queryAdapterInfo = gdikmt_d3dddi_queryadapterinfo;
    device->base.escape = gdikmt_d3dddi_escape;
+   device->base.queryDeviceState = gdikmt_d3dddi_querydevicestate;
 
    device->base.createContext = gdikmt_d3dddi_createcontext;
 

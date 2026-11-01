@@ -388,7 +388,7 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
    if (!wsi_device->sw && wsi && wsi->dxgi.factory && wsi->dxgi.dcomp &&
        (wsi_device->win32.get_d3d12_command_queue
 #if defined(HAVE_YTTRIUM)
-        || wsi_device->win32.create_image_memory_from_win32_handle
+        || wsi_device->win32.create_image_and_memory_from_win32_handle
 #endif
        )) {
       /* DXGI doesn't support random presenting order (images need to
@@ -422,6 +422,13 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
       VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
 
    caps->supportedUsageFlags = wsi_caps_get_image_usage();
+#if defined(HAVE_YTTRIUM)
+   if (wsi_device->win32.create_image_and_memory_from_win32_handle &&
+       !wsi_device->win32.get_d3d12_command_queue) {
+      /* The shared-image descriptor does not include input attachment usage. */
+      caps->supportedUsageFlags &= ~VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+   }
+#endif
 
    VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
    if (pdevice->supported_extensions.EXT_attachment_feedback_loop_layout)
@@ -513,9 +520,19 @@ static const struct {
 };
 
 
-static void
+static uint32_t
 get_sorted_vk_formats(struct wsi_device *wsi_device, VkFormat *sorted_formats)
 {
+#if defined(HAVE_YTTRIUM)
+   if (wsi_device->win32.create_image_and_memory_from_win32_handle &&
+       !wsi_device->win32.get_d3d12_command_queue) {
+      /* The shared D3D11 texture exports UNORM storage. Only advertise a
+       * swapchain base format that the Vulkan alias can reproduce exactly.
+       */
+      sorted_formats[0] = VK_FORMAT_B8G8R8A8_UNORM;
+      return 1;
+   }
+#endif
    for (unsigned i = 0; i < ARRAY_SIZE(available_surface_formats); i++)
       sorted_formats[i] = available_surface_formats[i].format;
 
@@ -528,6 +545,8 @@ get_sorted_vk_formats(struct wsi_device *wsi_device, VkFormat *sorted_formats)
          }
       }
    }
+
+   return ARRAY_SIZE(available_surface_formats);
 }
 
 static VkResult
@@ -539,9 +558,9 @@ wsi_win32_surface_get_formats(VkIcdSurfaceBase *icd_surface,
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
 
    VkFormat sorted_formats[ARRAY_SIZE(available_surface_formats)];
-   get_sorted_vk_formats(wsi_device, sorted_formats);
+   const uint32_t count = get_sorted_vk_formats(wsi_device, sorted_formats);
 
-   for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
+   for (uint32_t i = 0; i < count; i++) {
       vk_outarray_append_typed(VkSurfaceFormatKHR, &out, f) {
          f->format = sorted_formats[i];
          f->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
@@ -561,9 +580,9 @@ wsi_win32_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
 
    VkFormat sorted_formats[ARRAY_SIZE(available_surface_formats)];
-   get_sorted_vk_formats(wsi_device, sorted_formats);
+   const uint32_t count = get_sorted_vk_formats(wsi_device, sorted_formats);
 
-   for (unsigned i = 0; i < ARRAY_SIZE(sorted_formats); i++) {
+   for (uint32_t i = 0; i < count; i++) {
       vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, f) {
          assert(f->sType == VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR);
          f->surfaceFormat.format = sorted_formats[i];
@@ -601,7 +620,7 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
    if (wsi_device->sw || !wsi || !wsi->dxgi.factory || !wsi->dxgi.dcomp ||
        (!wsi_device->win32.get_d3d12_command_queue
 #if defined(HAVE_YTTRIUM)
-        && !wsi_device->win32.create_image_memory_from_win32_handle
+        && !wsi_device->win32.create_image_and_memory_from_win32_handle
 #endif
        )) {
       array = present_modes_gdi;
@@ -730,9 +749,9 @@ wsi_dxgi_format_from_vk(VkFormat format)
 }
 
 static VkResult
-wsi_create_dxgi_shared_image_mem(const struct wsi_swapchain *drv_chain,
-                                 const struct wsi_image_info *info,
-                                 struct wsi_image *image)
+wsi_create_dxgi_shared_image_and_memory(const struct wsi_swapchain *drv_chain,
+                                        const struct wsi_image_info *info,
+                                        struct wsi_image *image)
 {
    struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)drv_chain;
    const struct wsi_device *wsi = chain->base.wsi;
@@ -740,7 +759,7 @@ wsi_create_dxgi_shared_image_mem(const struct wsi_swapchain *drv_chain,
       container_of(image, struct wsi_win32_image, base);
 
    if (!chain->d3d11_device ||
-       !wsi->win32.create_image_memory_from_win32_handle)
+       !wsi->win32.create_image_and_memory_from_win32_handle)
       return VK_ERROR_INITIALIZATION_FAILED;
 
    const DXGI_FORMAT format = wsi_dxgi_format_from_vk(info->create.format);
@@ -756,6 +775,8 @@ wsi_create_dxgi_shared_image_mem(const struct wsi_swapchain *drv_chain,
    desc.SampleDesc.Count = 1;
    desc.Usage = D3D11_USAGE_DEFAULT;
    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+   if (info->create.usage & VK_IMAGE_USAGE_STORAGE_BIT)
+      desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
 
    HRESULT hr = chain->d3d11_device->CreateTexture2D(
@@ -787,14 +808,11 @@ wsi_create_dxgi_shared_image_mem(const struct wsi_swapchain *drv_chain,
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
-   VkMemoryRequirements reqs;
-   wsi->GetImageMemoryRequirements(chain->base.device, image->image, &reqs);
-
-   VkResult result = wsi->win32.create_image_memory_from_win32_handle(
-      chain->base.device, image->image, handle, reqs.size, &chain->base.alloc,
-      &image->memory);
+   VkResult result = wsi->win32.create_image_and_memory_from_win32_handle(
+      chain->base.device, &info->create, handle, &chain->base.alloc,
+      &image->image, &image->memory);
    if (result != VK_SUCCESS)
-      mesa_logw("wsi/win32: DXGI_SHARED shared-memory import failed "
+      mesa_logw("wsi/win32: DXGI_SHARED shared-image import failed "
                 "(VkResult %d)", (int)result);
    return result;
 }
@@ -847,30 +865,10 @@ wsi_dxgi_shared_configure_image(const struct wsi_swapchain *chain,
    if (result != VK_SUCCESS)
       return result;
 
-   info->create_mem = wsi_create_dxgi_shared_image_mem;
-
-   /* This image aliases the memory of the D3D11 texture created in
-    * wsi_create_dxgi_shared_image_mem, so the two must agree on the layout of
-    * that one allocation.  Vulkan only defines aliasing between images created
-    * with VK_IMAGE_CREATE_ALIAS_BIT and otherwise identical parameters, so
-    * match what yttrium uses for a PIPE_BIND_SHARED texture.
-    *
-    * Tiling must be LINEAR on both sides.  With OPTIMAL, each driver picks a
-    * swizzle variant from its own heuristics; RADV chose different ones for
-    * the two images even with identical format, extent, usage and flags, and
-    * the sizes matched exactly (589824 is both a linear 384x384x4 surface and
-    * nine 64KB tiles) so the disagreement was invisible in the memory
-    * requirements.  Only ~78% of the two surfaces overlapped, and the
-    * presented image was scrambled at tile granularity.
+   /* Create the D3D11 texture first. Its shared descriptor determines the
+    * Vulkan alias's modifier, plane layouts and image creation parameters.
     */
-   info->create.tiling = VK_IMAGE_TILING_LINEAR;
-   info->create.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                        VK_IMAGE_USAGE_SAMPLED_BIT |
-                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-   info->create.flags &= ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
-                           VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
-   info->create.flags |= VK_IMAGE_CREATE_ALIAS_BIT;
+   info->create_image_and_memory = wsi_create_dxgi_shared_image_and_memory;
 
    return VK_SUCCESS;
 }
@@ -886,7 +884,7 @@ wsi_win32_image_init(VkDevice device_h,
    VkResult result = wsi_create_image(&chain->base, &chain->base.image_info,
                                       &image->base);
    if (result != VK_SUCCESS) {
-      /* create_mem may already have created the native half of an imported
+      /* Image creation may already have created the native half of an imported
        * image before Vulkan image creation or binding failed.  This slot is
        * not counted in base.image_count, so swapchain destruction will not
        * visit it.
@@ -1538,7 +1536,7 @@ wsi_win32_surface_create_swapchain_internal(
       !wsi_device->sw &&
       (wsi_device->win32.get_d3d12_command_queue
 #if defined(HAVE_YTTRIUM)
-       || wsi_device->win32.create_image_memory_from_win32_handle
+       || wsi_device->win32.create_image_and_memory_from_win32_handle
 #endif
       );
    if (has_hardware_present && (!wsi->dxgi.factory || !wsi->dxgi.dcomp)) {
@@ -1592,7 +1590,7 @@ wsi_win32_surface_create_swapchain_internal(
    bool supports_dxgi_shared =
       wsi->dxgi.factory &&
       wsi->dxgi.dcomp &&
-      wsi->wsi->win32.create_image_memory_from_win32_handle;
+      wsi->wsi->win32.create_image_and_memory_from_win32_handle;
 #endif
    struct wsi_base_image_params *image_params =
       supports_dxgi_d3d12 ? &dxgi_image_params.base :

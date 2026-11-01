@@ -12,15 +12,6 @@
 extern "C" {
 #endif
 
-void
-yttrium_init_screen_options(struct yttrium_screen *screen);
-
-void
-yttrium_log_screen_config_and_options(const struct yttrium_screen *screen);
-
-void
-yttrium_free_screen_options(struct yttrium_screen *screen);
-
 const char *
 yttrium_get_name(struct pipe_screen *screen);
 

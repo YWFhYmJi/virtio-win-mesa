@@ -1039,27 +1039,6 @@ yttrium_trace_ring_kick(uint64_t elapsed_us,
 }
 
 void
-yttrium_trace_sync_wait_summary(const char *message)
-{
-   wchar_t wide_message[512];
-
-   if (!message || !yttrium_trace_verbose_etw_text_enabled() ||
-       !yttrium_trace_is_enabled())
-      return;
-
-   TraceLoggingWrite(
-      yttrium_tracelogging_provider,
-      "SyncWaitSummary",
-      TraceLoggingLevel(5),
-      TraceLoggingString(message, "message"));
-
-   MultiByteToWideChar(CP_UTF8, 0, message, -1, wide_message,
-                       ARRAY_SIZE(wide_message));
-   wide_message[ARRAY_SIZE(wide_message) - 1] = L'\0';
-   yttrium_trace_write_verbose_string(wide_message);
-}
-
-void
 yttrium_trace_screen_create(uint32_t supports_3d,
                             uint32_t has_resource_blob,
                             uint32_t has_host_visible,

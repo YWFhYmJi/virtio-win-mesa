@@ -9,7 +9,6 @@ endif
 libyttriumgdi = static_library(
   'yttriumgdi',
   [
-    'yttrium_capture.c',
     'yttrium_context.c',
     'yttrium_draw.c',
     'yttrium_gdi_winsys.c',

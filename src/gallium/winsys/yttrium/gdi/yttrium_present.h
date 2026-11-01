@@ -27,12 +27,6 @@ yttrium_ensure_display_mapped(struct pipe_context *ctx,
                               struct yttrium_resource *res);
 
 void
-yttrium_format_indexed_path(char *dst,
-                            size_t dst_size,
-                            const char *path,
-                            unsigned index);
-
-void
 yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
                           struct pipe_context *ctx,
                           struct pipe_resource *resource,

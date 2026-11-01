@@ -19,6 +19,14 @@ struct pipe_context;
 struct pipe_resource;
 struct winsys_handle;
 
+static inline bool
+yttrium_resource_is_legacy_optimal_present(
+   const struct yttrium_resource *res)
+{
+   return res && res->optimal_present_image && res->venus.cpu_readback &&
+          !res->primary_target;
+}
+
 void
 yttrium_resource_init_screen(struct yttrium_screen *screen);
 

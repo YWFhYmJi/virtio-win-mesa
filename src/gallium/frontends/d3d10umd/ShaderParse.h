@@ -268,6 +268,7 @@ struct Shader_opcode {
       unsigned dcl_tess_output_primitive;
       unsigned dcl_hs_max_tessfactor_bits;
       unsigned dcl_hs_phase_instance_count;
+      unsigned sync_flags;
       unsigned sample_pos_compatibility;
    } specific;
    D3D10_SB_NAME dcl_siv_name;
@@ -321,7 +322,8 @@ Shader_tgsi_translate(const unsigned *code,
                       const D3D10DDIARG_STAGE_IO_SIGNATURES *stage_signatures,
                       struct pipe_shader_sampler_binding_map *
                       sampler_binding_map,
-                      uint8_t *counter_image_slots);
+                      uint8_t *counter_image_slots,
+                      uint64_t *typed_buffer_image_mask);
 
 
 #ifdef __cplusplus

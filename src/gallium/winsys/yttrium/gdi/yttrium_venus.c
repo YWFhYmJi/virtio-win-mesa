@@ -176,6 +176,15 @@ yttrium_venus_destroy(struct yttrium_venus *venus)
    FREE(venus);
 }
 
+void
+yttrium_venus_retain_on_teardown(struct yttrium_venus *venus)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   if (backend && backend->retain_on_teardown)
+      backend->retain_on_teardown(venus->ctx);
+}
+
 bool
 yttrium_venus_create_shader_module(struct yttrium_venus *venus,
                                    struct yttrium_venus_object *obj,
@@ -341,7 +350,7 @@ yttrium_venus_storage_image_without_format_supported(
 bool
 yttrium_venus_storage_image_formatless_format_supported(
    struct yttrium_venus *venus, enum pipe_format format,
-   bool read, bool write)
+   bool read, bool write, bool buffer)
 {
    static volatile LONG missing_capability_warned;
    const struct yttrium_venus_backend *backend =
@@ -358,7 +367,8 @@ yttrium_venus_storage_image_formatless_format_supported(
 
    return backend->storage_image_formatless_format_supported(venus->ctx,
                                                               format,
-                                                              read, write);
+                                                              read, write,
+                                                              buffer);
 }
 
 bool
@@ -774,6 +784,16 @@ yttrium_venus_wait_resource(struct yttrium_venus *venus,
 }
 
 bool
+yttrium_venus_resource_ready(struct yttrium_venus *venus,
+                              struct yttrium_venus_resource *resource)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   return backend && backend->resource_ready &&
+      backend->resource_ready(venus->ctx, resource);
+}
+
+bool
 yttrium_venus_blit_display_image(struct yttrium_venus *venus,
                                  struct yttrium_venus_resource *src,
                                  struct yttrium_venus_resource *dst,
@@ -1034,6 +1054,74 @@ yttrium_venus_create_display_image(struct yttrium_venus *venus,
    return backend && backend->create_display_image(
       venus->ctx, resource, width, height, pipe_format, min_allocation_size,
       out_memory_id, out_allocation_size);
+}
+
+bool
+yttrium_venus_create_optimal_shared_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format,
+   unsigned bind, struct yttrium_optimal_image_data *data,
+   uint64_t *out_memory_id, uint64_t *out_allocation_size)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   if (!backend || !backend->create_optimal_shared_image) {
+      YTTRIUM_WARN("yttrium: ERROR optimal shared image create failed owner=venus-router reason=backend-missing-optimal-shared-image action=fail-allocation\n");
+      return false;
+   }
+   return backend->create_optimal_shared_image(
+      venus->ctx, resource, width, height, pipe_format, bind, data,
+      out_memory_id, out_allocation_size);
+}
+
+bool
+yttrium_venus_import_optimal_shared_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_optimal_image_data *data)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   if (!backend || !backend->import_optimal_shared_image) {
+      YTTRIUM_WARN("yttrium: ERROR optimal shared image import failed owner=venus-router reason=backend-missing-optimal-shared-image action=fail-import\n");
+      return false;
+   }
+   return backend->import_optimal_shared_image(
+      venus->ctx, resource, resource_id, data);
+}
+
+bool
+yttrium_venus_create_presentable_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format, unsigned bind,
+   uint64_t *out_endpoint_memory_id, uint64_t *out_endpoint_allocation_size)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   return backend && backend->create_presentable_image && backend->create_presentable_image(
+      venus->ctx, resource, width, height, pipe_format, bind,
+      out_endpoint_memory_id, out_endpoint_allocation_size);
+}
+
+bool
+yttrium_venus_import_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_display_endpoint_data *data)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   return backend && backend->import_display_endpoint && backend->import_display_endpoint(
+      venus->ctx, resource, resource_id, data);
+}
+
+bool
+yttrium_venus_publish_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   const char *label)
+{
+   const struct yttrium_venus_backend *backend =
+      yttrium_venus_backend_or_null(venus);
+   return backend && backend->publish_display_endpoint && backend->publish_display_endpoint(
+      venus->ctx, resource, label);
 }
 
 bool

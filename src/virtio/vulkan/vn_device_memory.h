@@ -64,11 +64,15 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
                                 int fd);
 
 #if defined(HAVE_YTTRIUM)
+struct yttrium_optimal_image_data;
+struct vn_renderer_bo;
+
+/* Takes ownership of bo only on success. The returned memory is not bound. */
 VkResult
-vn_device_memory_import_win32_handle(struct vn_device *dev,
-                                     struct vn_device_memory *mem,
-                                     const VkMemoryAllocateInfo *alloc_info,
-                                     void *handle);
+vn_device_memory_import_win32_image(
+   struct vn_device *dev, VkImage image, struct vn_renderer_bo *bo,
+   const struct yttrium_optimal_image_data *data,
+   const VkAllocationCallbacks *alloc, VkDeviceMemory *out);
 #endif
 
 VkResult

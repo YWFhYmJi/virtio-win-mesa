@@ -24,33 +24,16 @@ static HRESULT APIENTRY
 D3D9SetPixelShader(HANDLE hDevice, HANDLE shader)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetPixelShader shader=%p\n", shader);
    if (!device)
       return E_INVALIDARG;
    device->pixel_shader = shader;
    return S_OK;
 }
 
-static void
-D3D9TraceVertexElements(UINT count, const D3DDDIVERTEXELEMENT *elements)
-{
-   if (!elements)
-      return;
-
-   for (UINT i = 0; i < count; ++i) {
-      D3D9Tracef("  elem[%u] stream=%u offset=%u type=%u method=%u "
-                 "usage=%u usage_index=%u\n",
-                 i, elements[i].Stream, elements[i].Offset,
-                 elements[i].Type, elements[i].Method, elements[i].Usage,
-                 elements[i].UsageIndex);
-   }
-}
-
 static HRESULT APIENTRY
 D3D9SetVertexShaderFunc(HANDLE hDevice, HANDLE shader)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetVertexShaderFunc shader=%p\n", shader);
    if (!device)
       return E_INVALIDARG;
    device->vertex_shader_func = shader;
@@ -61,7 +44,6 @@ static HRESULT APIENTRY
 D3D9SetVertexShaderDecl(HANDLE hDevice, HANDLE decl)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetVertexShaderDecl decl=%p\n", decl);
    if (!device)
       return E_INVALIDARG;
    device->vertex_shader_decl = decl;
@@ -74,7 +56,6 @@ D3D9SetIndicesUm(HANDLE hDevice, UINT stride, const void *indices)
    D3D9Device *device = (D3D9Device *)hDevice;
    if (!device)
       return E_INVALIDARG;
-   D3D9Tracef("SetIndicesUm stride=%u ptr=%p\n", stride, indices);
    device->index_buffer = NULL;
    device->index_sysmem = indices;
    device->index_stride = stride;
@@ -204,16 +185,6 @@ D3D9SetRenderState(HANDLE hDevice, const D3DDDIARG_RENDERSTATE *data)
       break;
    case D3DDDIRS_DEPTHBIAS:
    case D3DDDIRS_SLOPESCALEDEPTHBIAS:
-      if (data->Value & 0x7fffffffu) {
-         static volatile LONG logged;
-         D3D9WarnOncef(
-            &logged,
-            "unsupported D3D9 depth bias owner=d3d9-state "
-            "reason=d3d9-depth-bias-scaling-not-implemented "
-            "fallback=ignore-state-for-runtime-cap-compatibility "
-            "state=%u value=0x%08x\n",
-            data->State, data->Value);
-      }
       break;
    case D3DDDIRS_MULTISAMPLEANTIALIAS:
       if (data->Value > TRUE)
@@ -665,9 +636,6 @@ static HRESULT APIENTRY
 D3D9SetViewport(HANDLE hDevice, const D3DDDIARG_VIEWPORTINFO *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetViewport x=%u y=%u w=%u h=%u\n",
-              data ? data->X : 0, data ? data->Y : 0,
-              data ? data->Width : 0, data ? data->Height : 0);
    if (!device || !data)
       return E_INVALIDARG;
    device->viewport = *data;
@@ -678,8 +646,6 @@ static HRESULT APIENTRY
 D3D9SetZRange(HANDLE hDevice, const D3DDDIARG_ZRANGE *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetZRange min=%f max=%f\n",
-              data ? data->MinZ : 0.0f, data ? data->MaxZ : 0.0f);
    if (!device || !data)
       return E_INVALIDARG;
    if (data->MinZ > data->MaxZ)
@@ -886,9 +852,6 @@ static HRESULT APIENTRY
 D3D9SetDisplayMode(HANDLE hDevice, const D3DDDIARG_SETDISPLAYMODE *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetDisplayMode resource=%p sub=%u\n",
-              data ? data->hResource : NULL,
-              data ? data->SubResourceIndex : 0);
 
    if (!device || !data || !data->hResource)
       return E_INVALIDARG;
@@ -909,8 +872,6 @@ D3D9SetDisplayMode(HANDLE hDevice, const D3DDDIARG_SETDISPLAYMODE *data)
 
    HRESULT hr = device->gdi_device.base.setDisplayMode(&device->gdi_device.base,
                                                        sub->allocation);
-   D3D9Tracef("SetDisplayMode allocation=0x%lx hr=0x%08lx\n",
-              (unsigned long)sub->allocation, hr);
    return hr;
 }
 
@@ -992,8 +953,6 @@ static HRESULT APIENTRY
 D3D9SetIndices(HANDLE hDevice, const D3DDDIARG_SETINDICES *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetIndices index=%p stride=%u\n",
-              data ? data->hIndexBuffer : NULL, data ? data->Stride : 0);
    if (!device || !data)
       return E_INVALIDARG;
 
@@ -1007,9 +966,6 @@ static HRESULT APIENTRY
 D3D9SetStreamSource(HANDLE hDevice, const D3DDDIARG_SETSTREAMSOURCE *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("SetStreamSource stream=%u vb=%p offset=%u stride=%u\n",
-              data ? data->Stream : 0, data ? data->hVertexBuffer : NULL,
-              data ? data->Offset : 0, data ? data->Stride : 0);
    if (!device || !data || data->Stream >= ARRAYSIZE(device->streams))
       return E_INVALIDARG;
 
@@ -1058,8 +1014,6 @@ D3D9SetStreamSourceUm(HANDLE hDevice,
    if (!device || !data || data->Stream >= ARRAYSIZE(device->streams))
       return E_INVALIDARG;
 
-   D3D9Tracef("SetStreamSourceUm stream=%u stride=%u ptr=%p\n",
-              data->Stream, data->Stride, sysmem);
    device->streams[data->Stream].vertex_buffer = NULL;
    device->streams[data->Stream].sysmem = sysmem;
    device->streams[data->Stream].offset = 0;
@@ -1073,11 +1027,8 @@ D3D9CreateVertexShaderDecl(HANDLE hDevice,
                            const D3DDDIVERTEXELEMENT *elements)
 {
    (void)hDevice;
-   D3D9Tracef("CreateVertexShaderDecl data=%p elements=%p count=%u\n",
-              data, elements, data ? data->NumVertexElements : 0);
    if (!data || (data->NumVertexElements && !elements))
       return E_INVALIDARG;
-   D3D9TraceVertexElements(data->NumVertexElements, elements);
 
    const D3DDDIVERTEXELEMENT decl_end = {
       0xff, 0, D3DDECLTYPE_UNUSED, 0, 0, 0
@@ -1106,7 +1057,6 @@ D3D9CreateVertexShaderDecl(HANDLE hDevice,
       return E_OUTOFMEMORY;
 
    data->ShaderHandle = decl;
-   D3D9Tracef("CreateVertexShaderDecl handle=%p\n", decl);
    return S_OK;
 }
 
@@ -1116,8 +1066,6 @@ D3D9CreateVertexShaderFunc(HANDLE hDevice,
                            const UINT *tokens)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("CreateVertexShaderFunc data=%p tokens=%p size=%u\n",
-              data, tokens, data ? data->Size : 0);
    if (!device || !data || (data->Size && !tokens))
       return E_INVALIDARG;
 
@@ -1136,7 +1084,6 @@ D3D9CreateVertexShaderFunc(HANDLE hDevice,
    }
 
    data->ShaderHandle = shader;
-   D3D9Tracef("CreateVertexShaderFunc handle=%p\n", shader);
    return S_OK;
 }
 
@@ -1145,8 +1092,6 @@ D3D9CreatePixelShader(HANDLE hDevice, D3DDDIARG_CREATEPIXELSHADER *data,
                       const UINT *tokens)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("CreatePixelShader data=%p tokens=%p size=%u\n",
-              data, tokens, data ? data->CodeSize : 0);
    if (!device || !data || (data->CodeSize && !tokens))
       return E_INVALIDARG;
 
@@ -1165,7 +1110,6 @@ D3D9CreatePixelShader(HANDLE hDevice, D3DDDIARG_CREATEPIXELSHADER *data,
    }
 
    data->ShaderHandle = shader;
-   D3D9Tracef("CreatePixelShader handle=%p\n", shader);
    return S_OK;
 }
 
@@ -1384,14 +1328,25 @@ static HRESULT APIENTRY
 D3D9Flush(HANDLE hDevice)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("Flush hDevice=%p pipe=%p\n", hDevice,
-              device ? device->pipe : NULL);
    if (!device)
       return E_INVALIDARG;
 
-   if (device->pipe)
+   if (device->pipe) {
+      const char *screen_name =
+         device->screen && device->screen->get_name ?
+         device->screen->get_name(device->screen) : NULL;
+      if (screen_name && strcmp(screen_name, "yttrium") == 0) {
+         for (D3D9Resource *resource = device->resources; resource;
+              resource = resource->next) {
+            if (resource->pipe_resource && !D3D9PublishResource(device, resource))
+               return E_FAIL;
+         }
+         return yttrium_gdi_flush_handoff(device->pipe, "D3D9 DDI Flush") ?
+            S_OK : D3DDDIERR_DEVICEREMOVED;
+      }
       yttrium_gdi_flush_labeled(device->pipe, NULL, PIPE_FLUSH_ASYNC,
                                 "D3D9 DDI Flush");
+   }
    return S_OK;
 }
 
@@ -1405,6 +1360,15 @@ D3D9DestroyDevice(HANDLE hDevice)
    /* Match the D3D10/11 teardown rule for device-associated scratch
     * allocations released by Gallium below. */
    device->gdi_device.base.runtime_destroying = true;
+
+   /* Detach surviving wrappers before the device storage is released. */
+   while (device->resources) {
+      D3D9Resource *resource = device->resources;
+      device->resources = resource->next;
+      resource->device = NULL;
+      resource->previous = NULL;
+      resource->next = NULL;
+   }
 
    D3D9DestroyDrawState(device);
    for (UINT i = 0; i < ARRAYSIZE(device->null_textures); ++i)

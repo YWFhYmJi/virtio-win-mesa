@@ -8,10 +8,12 @@
 #include <d3dukmdt.h>
 #include <winnt.h>
 #include <winternl.h>
+#include "winddk/winddk_compat.h"
 
 struct d3dkmt_callbacks {
    PFND3DKMT_QUERYADAPTERINFO queryAdapterInfo;
    PFND3DKMT_ESCAPE escape;
+   PFND3DKMT_GETDEVICESTATE getDeviceState;
    PFND3DKMT_RENDER render;
    PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2 signalSynchronizationObject2;
    PFND3DKMT_CREATECONTEXT createContext;
@@ -35,6 +37,8 @@ gdikmt_load_callbacks(HINSTANCE gdi32lib, struct d3dkmt_callbacks *cb)
    cb->queryAdapterInfo = (PFND3DKMT_QUERYADAPTERINFO)GetProcAddress(
       gdi32lib, "D3DKMTQueryAdapterInfo");
    cb->escape = (PFND3DKMT_ESCAPE)GetProcAddress(gdi32lib, "D3DKMTEscape");
+   cb->getDeviceState = (PFND3DKMT_GETDEVICESTATE)GetProcAddress(
+      gdi32lib, "D3DKMTGetDeviceState");
    cb->render = (PFND3DKMT_RENDER)GetProcAddress(gdi32lib, "D3DKMTRender");
    cb->signalSynchronizationObject2 =
       (PFND3DKMT_SIGNALSYNCHRONIZATIONOBJECT2)GetProcAddress(
@@ -124,7 +128,25 @@ gdikmt_d3dkmt_escape(struct gdikmt_device *_device, VOID *pPrivateDriverData,
    escape.pPrivateDriverData = pPrivateDriverData;
    escape.PrivateDriverDataSize = PrivateDriverDataSize;
 
-   return device->cb.escape(&escape);
+   const NTSTATUS status = device->cb.escape(&escape);
+   if (status == STATUS_DEVICE_REMOVED)
+      gdikmt_device_report_removal(_device);
+   return status;
+}
+
+static NTSTATUS
+gdikmt_d3dkmt_querydevicestate(struct gdikmt_device *_device,
+                               D3DKMT_DEVICEEXECUTION_STATE *state)
+{
+   struct gdikmt_device_d3dkmt *device = gdikmt_device_d3dkmt(_device);
+   D3DKMT_GETDEVICESTATE query = {0};
+   query.hDevice = device->hDevice;
+   query.StateType = D3DKMT_DEVICESTATE_EXECUTION;
+
+   const NTSTATUS status = device->cb.getDeviceState(&query);
+   if (NT_SUCCESS(status))
+      *state = query.ExecutionState;
+   return status;
 }
 
 static
@@ -456,6 +478,7 @@ gdikmt_create_from_hdc(HDC hDC)
    device->base.destroy = gdikmt_d3dkmt_destroy;
    device->base.queryAdapterInfo = gdikmt_d3dkmt_queryadapterinfo;
    device->base.escape = gdikmt_d3dkmt_escape;
+   device->base.queryDeviceState = gdikmt_d3dkmt_querydevicestate;
 
    device->base.createContext = gdikmt_d3dkmt_createcontext;
 

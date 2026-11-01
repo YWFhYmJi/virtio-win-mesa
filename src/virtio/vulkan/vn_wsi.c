@@ -10,10 +10,16 @@
 
 #include "vn_wsi.h"
 
+#include "util/log.h"
+
 #include "vk_enum_to_str.h"
 #include "wsi_common_entrypoints.h"
 #if defined(HAVE_YTTRIUM)
+#include <winternl.h>
+
 #include "venus-protocol/vn_protocol_driver_image.h"
+#include "venus-protocol/vn_protocol_driver_device.h"
+#include "gallium/winsys/yttrium/gdi/yttrium_shared_image.h"
 #endif
 
 #include "vn_device.h"
@@ -133,42 +139,213 @@ vn_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 
 #if defined(_WIN32) && defined(HAVE_YTTRIUM)
 static VkResult
-vn_wsi_create_image_memory_from_win32_handle(
-   VkDevice device,
-   VkImage image,
-   void *handle,
-   VkDeviceSize min_allocation_size,
-   const VkAllocationCallbacks *alloc,
-   VkDeviceMemory *out)
+vn_wsi_create_image_and_memory_from_win32_handle(
+   VkDevice device, const VkImageCreateInfo *requested, void *handle,
+   const VkAllocationCallbacks *alloc, VkImage *out_image,
+   VkDeviceMemory *out_memory)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_physical_device *physical_dev = dev->physical_device;
+   struct vn_renderer_bo *bo = NULL;
+   struct yttrium_optimal_image_data data;
+   VkImage image = VK_NULL_HANDLE;
+   VkResult result;
+   const char *reason = "resource-open-failed";
+   *out_image = VK_NULL_HANDLE;
+   *out_memory = VK_NULL_HANDLE;
 
-   VkMemoryRequirements reqs;
-   vn_call_vkGetImageMemoryRequirements(dev->primary_ring, device, image,
-                                        &reqs);
-   if (!reqs.memoryTypeBits)
-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   result = vn_renderer_bo_create_from_win32_handle(
+      dev->renderer, 0, handle, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+      &data, &bo);
+   if (result != VK_SUCCESS)
+      goto fail;
 
-   struct wsi_memory_win32_handle_import_info import_info = {
-      .sType = VK_STRUCTURE_TYPE_WSI_MEMORY_WIN32_HANDLE_IMPORT_INFO_MESA,
-      .pNext = NULL,
-      .handle = handle,
-   };
-   VkMemoryDedicatedAllocateInfo dedicated_info = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-      .pNext = &import_info,
-      .image = image,
-      .buffer = VK_NULL_HANDLE,
-   };
-   VkMemoryAllocateInfo memory_info = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .pNext = &dedicated_info,
-      .allocationSize = MAX2(reqs.size, min_allocation_size),
-      .memoryTypeIndex = ffs(reqs.memoryTypeBits) - 1,
-   };
+   reason = "requested-image-does-not-match-shared-descriptor";
+   result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (requested->imageType != VK_IMAGE_TYPE_2D ||
+       requested->format != data.vk_format ||
+       requested->extent.width != data.allocation.ResourceOptions.width ||
+       requested->extent.height != data.allocation.ResourceOptions.height ||
+       requested->extent.depth != 1 || requested->mipLevels != 1 ||
+       requested->arrayLayers != 1 ||
+       requested->samples != VK_SAMPLE_COUNT_1_BIT ||
+       requested->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       (requested->usage & ~data.vk_usage) ||
+       (requested->flags & ~(VK_IMAGE_CREATE_ALIAS_BIT |
+                              VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                              VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) ||
+       data.vk_flags != VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
+      goto fail;
 
-   return vn_AllocateMemory(device, &memory_info, alloc, out);
+   const VkImageFormatListCreateInfo *requested_views =
+      vk_find_struct_const(requested->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   if (requested_views) {
+      for (uint32_t i = 0; i < requested_views->viewFormatCount; i++) {
+         const VkFormat format = requested_views->pViewFormats[i];
+         if (format != data.view_formats[0] &&
+             format != data.view_formats[1])
+            goto fail;
+      }
+   }
+
+   reason = "required-modifier-or-feedback-feature-unavailable";
+   result = VK_ERROR_FEATURE_NOT_PRESENT;
+   if (!physical_dev->renderer_extensions.EXT_image_drm_format_modifier ||
+       ((data.vk_usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) &&
+        !dev->wsi_attachment_feedback_loop_layout))
+      goto fail;
+
+   /* Compare the renderer identities, not Venus's guest-facing UUIDs, which
+    * are intentionally rewritten in vn_physical_device_init_uuids(). */
+   VkPhysicalDeviceIDProperties identity = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
+   };
+   VkPhysicalDeviceProperties2 properties = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+      .pNext = &identity,
+   };
+   vn_call_vkGetPhysicalDeviceProperties2(
+      dev->primary_ring, vn_physical_device_to_handle(physical_dev), &properties);
+   reason = "renderer-device-or-driver-identity-mismatch";
+   result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   if (memcmp(data.device_uuid, identity.deviceUUID, VK_UUID_SIZE) ||
+       memcmp(data.driver_uuid, identity.driverUUID, VK_UUID_SIZE))
+      goto fail;
+
+   const VkFormat views[2] = {data.view_formats[0], data.view_formats[1]};
+   const VkImageFormatListCreateInfo format_list = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+      .viewFormatCount = yttrium_optimal_image_view_count(&data),
+      .pViewFormats = views,
+   };
+   const VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier_query = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+      .pNext = &format_list,
+      .drmFormatModifier = data.drm_modifier,
+      .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+   };
+   const VkPhysicalDeviceExternalImageFormatInfo external_query = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+      .pNext = &modifier_query,
+      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+   };
+   const VkPhysicalDeviceImageFormatInfo2 format_query = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .pNext = &external_query,
+      .format = data.vk_format,
+      .type = VK_IMAGE_TYPE_2D,
+      .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+      .usage = data.vk_usage,
+      .flags = data.vk_flags,
+   };
+   VkExternalImageFormatProperties external_properties = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+   };
+   VkImageFormatProperties2 format_properties = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+      .pNext = &external_properties,
+   };
+   reason = "exact-external-image-descriptor-unavailable";
+   result = vn_call_vkGetPhysicalDeviceImageFormatProperties2(
+      dev->primary_ring, vn_physical_device_to_handle(physical_dev),
+      &format_query, &format_properties);
+   if (result != VK_SUCCESS)
+      goto fail;
+   const VkImageFormatProperties *limits =
+      &format_properties.imageFormatProperties;
+   const VkExternalMemoryFeatureFlags external_features =
+      external_properties.externalMemoryProperties.externalMemoryFeatures;
+   if (!(external_features & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) ||
+       ((external_features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) &&
+        !data.dedicated) ||
+       requested->extent.width > limits->maxExtent.width ||
+       requested->extent.height > limits->maxExtent.height ||
+       !(limits->sampleCounts & VK_SAMPLE_COUNT_1_BIT)) {
+      result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      goto fail;
+   }
+
+   VkSubresourceLayout planes[YTTRIUM_OPTIMAL_IMAGE_MAX_DRM_PLANES] = {0};
+   for (uint32_t i = 0; i < data.drm_plane_count; i++) {
+      planes[i].offset = data.drm_planes[i].offset;
+      planes[i].rowPitch = data.drm_planes[i].row_pitch;
+   }
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT modifier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+      .drmFormatModifier = data.drm_modifier,
+      .drmFormatModifierPlaneCount = data.drm_plane_count,
+      .pPlaneLayouts = planes,
+   };
+   VkImageFormatListCreateInfo alias_views = format_list;
+   alias_views.pNext = &modifier;
+   const VkExternalMemoryImageCreateInfo external_image = {
+      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+      .pNext = &alias_views,
+      .handleTypes = data.handle_types,
+   };
+   const struct wsi_image_create_info wsi_info = {
+      .sType = VK_STRUCTURE_TYPE_WSI_IMAGE_CREATE_INFO_MESA,
+      .pNext = &external_image,
+   };
+   VkImageCreateInfo create = *requested;
+   create.pNext = &wsi_info;
+   create.flags = data.vk_flags;
+   create.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   create.usage = data.vk_usage;
+   create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+   reason = "exact-shared-image-create-failed";
+   result = vn_CreateImage(device, &create, alloc, &image);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+   /* Validate the accepted layout as well as the descriptor. Matching byte
+    * size alone does not establish compatible tiled storage. */
+   VkImageDrmFormatModifierPropertiesEXT actual_modifier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
+   };
+   reason = "accepted-modifier-or-plane-layout-mismatch";
+   result = vn_call_vkGetImageDrmFormatModifierPropertiesEXT(
+      dev->primary_ring, device, image, &actual_modifier);
+   if (result != VK_SUCCESS)
+      goto fail;
+   if (actual_modifier.drmFormatModifier != data.drm_modifier) {
+      result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      goto fail;
+   }
+   for (uint32_t i = 0; i < data.drm_plane_count; i++) {
+      const VkImageSubresource subresource = {
+         .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT << i,
+      };
+      VkSubresourceLayout layout;
+      vn_call_vkGetImageSubresourceLayout(dev->primary_ring, device, image,
+                                           &subresource, &layout);
+      if (layout.offset != planes[i].offset ||
+          layout.rowPitch != planes[i].rowPitch) {
+         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         goto fail;
+      }
+   }
+
+   reason = "shared-allocation-import-failed";
+   result = vn_device_memory_import_win32_image(dev, image, bo, &data, alloc,
+                                                 out_memory);
+   if (result != VK_SUCCESS)
+      goto fail;
+   /* Memory now owns the one opened BO. Common WSI binds it to image. */
+   *out_image = image;
+   return VK_SUCCESS;
+
+fail:
+   mesa_loge("venus: Win32 WSI image import failed owner=venus-wsi "
+             "reason=%s result=%d action=fail-swapchain", reason, result);
+   if (image != VK_NULL_HANDLE)
+      vn_DestroyImage(device, image, alloc);
+   if (bo)
+      vn_renderer_bo_unref(dev->renderer, bo);
+   return result;
 }
+
 #endif
 
 VkResult
@@ -181,7 +358,7 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
     * software.  That in turn makes wsi_win32_init() skip creating the DXGI
     * factory, which disables both win32 present paths and silently forces the
     * GDI cpu map+blit path.  The win32 WSI instead presents through a shared
-    * D3D11 texture imported via create_image_memory_from_win32_handle below.
+    * D3D11 texture imported via create_image_and_memory_from_win32_handle below.
     */
    const bool use_sw_device = false;
 #else
@@ -245,8 +422,8 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
    physical_dev->wsi_device.supports_modifiers =
       physical_dev->base.vk.supported_extensions.EXT_image_drm_format_modifier;
 #if defined(_WIN32) && defined(HAVE_YTTRIUM)
-   physical_dev->wsi_device.win32.create_image_memory_from_win32_handle =
-      vn_wsi_create_image_memory_from_win32_handle;
+   physical_dev->wsi_device.win32.create_image_and_memory_from_win32_handle =
+      vn_wsi_create_image_and_memory_from_win32_handle;
 #endif
    physical_dev->base.vk.wsi_device = &physical_dev->wsi_device;
 

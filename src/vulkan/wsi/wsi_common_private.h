@@ -132,6 +132,11 @@ struct wsi_image_info {
 
    uint8_t *(*alloc_shm)(struct wsi_image *image, unsigned size);
 
+   /* External image handles may define the image layout as well as memory. */
+   VkResult (*create_image_and_memory)(const struct wsi_swapchain *chain,
+                                      const struct wsi_image_info *info,
+                                      struct wsi_image *image);
+
    VkResult (*create_mem)(const struct wsi_swapchain *chain,
                           const struct wsi_image_info *info,
                           struct wsi_image *image);

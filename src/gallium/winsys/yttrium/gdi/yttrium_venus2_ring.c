@@ -11,6 +11,10 @@
 #include "yttrium_venus2_private.h"
 #include "yttrium_venus2_ring.h"
 
+#include <d3d9types.h>
+#include <d3dumddi.h>
+#include "winddk_compat.h"
+
 #include "venus-protocol/vn_protocol_driver_transport.h"
 
 #define YTTRIUM_VENUS_RING_PAUSE_BACKOFF_ITERS 4096
@@ -178,6 +182,13 @@ yttrium_venus_from_ring(struct yttrium_venus_ring *ring)
                  NULL;
 }
 
+static bool
+yttrium_venus_ring_cancelled(const struct yttrium_venus *venus)
+{
+   return !venus || venus->failed ||
+          gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET;
+}
+
 static void ATTRIBUTE_NOINLINE
 yttrium_venus_mark_ring_failed(struct yttrium_venus *venus,
                                const char *reason)
@@ -310,7 +321,8 @@ yttrium_venus_ring_snapshot(struct yttrium_venus_ring *ring,
                             uint32_t *tail,
                             uint32_t *status)
 {
-   if (!yttrium_venus_ring_ready(ring))
+   if (yttrium_venus_ring_cancelled(yttrium_venus_from_ring(ring)) ||
+       !yttrium_venus_ring_ready(ring))
       return false;
 
    if (head && !yttrium_venus_ring_load_dword("head", ring->head, head))
@@ -321,7 +333,7 @@ yttrium_venus_ring_snapshot(struct yttrium_venus_ring *ring,
        !yttrium_venus_ring_load_dword("status", ring->status, status))
       return false;
 
-   return true;
+   return !yttrium_venus_ring_cancelled(yttrium_venus_from_ring(ring));
 }
 
 static uint32_t
@@ -329,7 +341,7 @@ yttrium_venus_ring_head_or_zero(struct yttrium_venus *venus)
 {
    uint32_t head = 0;
 
-   if (venus && venus->ring.head)
+   if (!yttrium_venus_ring_cancelled(venus) && venus->ring.head)
       yttrium_venus_ring_load_dword("head", venus->ring.head, &head);
 
    return head;
@@ -339,15 +351,23 @@ bool
 yttrium_venus_ring_probe(struct yttrium_venus *venus,
                          const char *failure_reason)
 {
-   uint32_t head;
+   uint32_t head, status;
 
    if (!venus || venus->failed ||
        gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET)
       return false;
 
    if (!yttrium_venus_ring_ready(&venus->ring) ||
-       !yttrium_venus_ring_load_dword("head", venus->ring.head, &head)) {
+       !yttrium_venus_ring_load_dword("head", venus->ring.head, &head) ||
+       !yttrium_venus_ring_load_dword("status", venus->ring.status, &status)) {
       yttrium_venus_mark_ring_failed(venus, failure_reason);
+      return false;
+   }
+
+   if (status & VK_RING_STATUS_FATAL_BIT_MESA) {
+      YTTRIUM_WARN("yttrium: ERROR: renderer reported fatal ring status owner=venus2-ring status=0x%x reason=%s\n",
+                   status, failure_reason ? failure_reason : "<unknown>");
+      yttrium_venus_mark_ring_failed(venus, "renderer-fatal-status");
       return false;
    }
 
@@ -360,10 +380,15 @@ yttrium_venus_ring_seqno_complete(struct yttrium_venus *venus,
 {
    uint32_t head = 0;
 
-   if (!venus || !yttrium_venus_ring_dependency_valid(dependency) ||
+   if (yttrium_venus_ring_cancelled(venus) ||
+       !yttrium_venus_ring_dependency_valid(dependency) ||
        !yttrium_venus_ring_ready(&venus->ring))
       return false;
-   if (!yttrium_venus_ring_load_dword("head", venus->ring.head, &head))
+   if (!yttrium_venus_ring_load_dword("head", venus->ring.head, &head)) {
+      yttrium_venus_mark_ring_failed(venus, "seqno-completion-head");
+      return false;
+   }
+   if (yttrium_venus_ring_cancelled(venus))
       return false;
 
    return yttrium_venus_ring_dependency_reached(head, dependency);
@@ -409,6 +434,76 @@ yttrium_venus_ring_publish_for_submit(struct yttrium_venus *venus, uint32_t *seq
    return true;
 }
 
+/* A mapped ring can remain readable after PnP stop. Query the OS only on
+ * long waits so loss of the original device cancels the obsolete transport.
+ * An active device can stall indefinitely without losing queued work. */
+static bool
+yttrium_venus_ring_check_device(struct yttrium_venus *venus)
+{
+   D3DKMT_DEVICEEXECUTION_STATE state = 0;
+   const NTSTATUS status =
+      venus->device->queryDeviceState(venus->device, &state);
+   if (status == (NTSTATUS)D3DDDIERR_DEVICEREMOVED ||
+       status == STATUS_DEVICE_REMOVED) {
+      yttrium_venus_mark_ring_failed(venus, "wait-device-removed");
+      return false;
+   }
+   if (gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET)
+      return false;
+
+   if (!NT_SUCCESS(status)) {
+      /* A failed query is not itself proof of device loss. */
+      YTTRIUM_WARN("yttrium: device execution-state query failed owner=venus2-ring reason=device-state-query-failed status=0x%lx action=continue-wait\n",
+                    (unsigned long)status);
+      return true;
+   }
+
+   switch (state) {
+   case D3DKMT_DEVICEEXECUTION_ACTIVE:
+      return true;
+   case D3DKMT_DEVICEEXECUTION_RESET:
+   case D3DKMT_DEVICEEXECUTION_HUNG:
+   case D3DKMT_DEVICEEXECUTION_STOPPED:
+   case D3DKMT_DEVICEEXECUTION_ERROR_OUTOFMEMORY:
+   case D3DKMT_DEVICEEXECUTION_ERROR_DMAFAULT:
+   case D3DKMT_DEVICEEXECUTION_ERROR_DMAPAGEFAULT:
+      YTTRIUM_WARN("yttrium: device cannot continue owner=venus2-ring reason=device-execution-state state=%u action=report-device-removal\n",
+                    (unsigned)state);
+      yttrium_venus_mark_ring_failed(venus, "wait-device-execution-state");
+      return false;
+   default:
+      YTTRIUM_WARN("yttrium: unknown device execution state owner=venus2-ring reason=unknown-device-state state=%u action=continue-wait\n",
+                    (unsigned)state);
+      return true;
+   }
+}
+
+static bool
+yttrium_venus_ring_load_head_for_write(struct yttrium_venus_ring *ring,
+                                       uint32_t *head)
+{
+   struct yttrium_venus *venus = yttrium_venus_from_ring(ring);
+   if (yttrium_venus_ring_cancelled(venus))
+      return false;
+
+   if (!yttrium_venus_ring_load_dword("head", ring->head, head)) {
+      yttrium_venus_mark_ring_failed(venus, "wait-space-head");
+      return false;
+   }
+
+   /* The producer is serialized, so the consumer cannot be ahead of cur or
+    * more than one ring behind it, including across 32-bit cursor wrap. */
+   const uint32_t used = ring->cur - *head;
+   if (used <= ring->buffer_size)
+      return true;
+
+   YTTRIUM_WARN("yttrium: ERROR: invalid Venus ring occupancy owner=venus2-ring reason=invalid-occupancy cur=%u head=%u used=%u capacity=%u published=%u action=report-device-removal\n",
+                 ring->cur, *head, used, ring->buffer_size,
+                 ring->published_cur);
+   yttrium_venus_mark_ring_failed(venus, "wait-space-invalid-occupancy");
+   return false;
+}
+
 static bool
 yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
                               uint32_t size,
@@ -419,6 +514,7 @@ yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
 {
    struct yttrium_venus *venus = yttrium_venus_from_ring(ring);
    const uint64_t start = GetTickCount64();
+   uint64_t last_warning_ms = start;
    const uint64_t start_us =
       yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
    uint64_t wait_start_us = 0;
@@ -441,8 +537,10 @@ yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
       return false;
    }
 
-   if (!yttrium_venus_ring_load_dword("head", ring->head, &head)) {
-      yttrium_venus_mark_ring_failed(venus, "wait-space-head");
+   if (!yttrium_venus_ring_probe(venus, "wait-space-ring"))
+      return false;
+
+   if (!yttrium_venus_ring_load_head_for_write(ring, &head)) {
       yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_RING_WAIT_SPACE,
                                  4, start_us, NULL, size, ring->buffer_size,
                                  ring->cur, 0);
@@ -468,8 +566,7 @@ yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
       if (!yttrium_venus_ring_flush_notify_if_idle(
              venus, "ring high-watermark", false))
          return false;
-      if (!yttrium_venus_ring_load_dword("head", ring->head, &head)) {
-         yttrium_venus_mark_ring_failed(venus, "wait-space-head");
+      if (!yttrium_venus_ring_load_head_for_write(ring, &head)) {
          yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_RING_WAIT_SPACE,
                                     4, start_us, NULL, size, ring->buffer_size,
                                     ring->cur, 0);
@@ -487,27 +584,26 @@ yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
       if (!yttrium_venus_ring_publish_tail(
              venus, "ring transaction partial", false))
          return false;
-      if (!yttrium_venus_ring_load_dword("head", ring->head, &head)) {
-         yttrium_venus_mark_ring_failed(venus, "wait-space-head");
+      if (!yttrium_venus_ring_load_head_for_write(ring, &head)) {
          return false;
       }
    }
 
    while (ring->cur + size - head > ring->buffer_size) {
+      if (!yttrium_venus_ring_probe(venus, "wait-space-ring"))
+         return false;
       if (!wait_start_us)
          wait_start_us = yttrium_trace_now_us();
-      if (GetTickCount64() - start > YTTRIUM_VENUS_RING_WAIT_MS) {
-         YTTRIUM_LOG("yttrium: Venus ring space wait timed out cur=%u head=%u size=%u capacity=%u\n",
-                      ring->cur, head, size, ring->buffer_size);
-         yttrium_venus_debug_sync_wait(
-            venus, YTTRIUM_VENUS_SYNC_WAIT_RING_SPACE,
-            yttrium_trace_now_us() - wait_start_us, 2, label, size, head,
-            command_type, command_size, reply_size);
-         yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_RING_WAIT_SPACE,
-                                    2, start_us, NULL, size, ring->buffer_size,
-                                    ring->cur, head);
-         yttrium_venus_mark_ring_failed(venus, "wait-space-timeout");
-         return false;
+      const uint64_t now = GetTickCount64();
+      if (now - last_warning_ms >= YTTRIUM_VENUS_RING_WAIT_MS) {
+         if (!yttrium_venus_ring_check_device(venus))
+            return false;
+         YTTRIUM_WARN("yttrium: Venus ring still pending owner=venus2-ring reason=awaiting-space elapsed_ms=%llu cur=%u head=%u size=%u capacity=%u command=%s(%u) label=%s\n",
+                      (unsigned long long)(now - start), ring->cur, head,
+                      size, ring->buffer_size,
+                      yttrium_venus_command_type_name(command_type),
+                      command_type, label ? label : "<unknown>");
+         last_warning_ms = now;
       }
       if (!(wait_backoff_iters & 0xffu) && venus &&
           venus->ring_notify_pending &&
@@ -515,8 +611,7 @@ yttrium_venus_ring_wait_space(struct yttrium_venus_ring *ring,
              venus, "ring space idle transition", false))
          return false;
       yttrium_venus_ring_wait_backoff(&wait_backoff_iters);
-      if (!yttrium_venus_ring_load_dword("head", ring->head, &head)) {
-         yttrium_venus_mark_ring_failed(venus, "wait-space-head");
+      if (!yttrium_venus_ring_load_head_for_write(ring, &head)) {
          yttrium_venus_debug_sync_wait(
             venus, YTTRIUM_VENUS_SYNC_WAIT_RING_SPACE,
             wait_start_us ? yttrium_trace_now_us() - wait_start_us : 0,
@@ -589,6 +684,7 @@ yttrium_venus_ring_wait_seqno(struct yttrium_venus_ring *ring,
 {
    struct yttrium_venus *venus = yttrium_venus_from_ring(ring);
    const uint64_t start = GetTickCount64();
+   uint64_t last_warning_ms = start;
    const uint64_t start_us =
       yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
    uint64_t wait_start_us = 0;
@@ -597,12 +693,9 @@ yttrium_venus_ring_wait_seqno(struct yttrium_venus_ring *ring,
    uint32_t status = 0;
    uint32_t wait_backoff_iters = 0;
 
-   /* A ring timeout is terminal for this Venus instance.  Device removal has
-    * already been reported by the first failing waiter, so later (or
-    * concurrent) waits must fail immediately instead of each consuming the
-    * full timeout again.
-    */
-   if (!venus || venus->failed)
+   /* Keep the dependency alive while the host is delayed. A reported failure
+    * or device reset still terminates the wait. */
+   if (yttrium_venus_ring_cancelled(venus))
       return false;
 
    ring->current_wait_command_count =
@@ -638,26 +731,23 @@ yttrium_venus_ring_wait_seqno(struct yttrium_venus_ring *ring,
                                  3, start_us, NULL, seqno, 0, 0, 0);
       return false;
    }
+   if (!yttrium_venus_ring_probe(venus, "wait-seqno-ring"))
+      return false;
 
    while (!yttrium_venus_ring_cursor_reached(head, seqno)) {
-      if (venus->failed)
-         return false;
       if (!wait_start_us)
          wait_start_us = yttrium_trace_now_us();
-      if (GetTickCount64() - start > YTTRIUM_VENUS_RING_WAIT_MS) {
-         YTTRIUM_WARN("yttrium: FATAL: Venus ring wait-seqno timeout wait_ms=%llu head=%u tail=%u seqno=%u status=0x%x command=%s(%u) command_size=%u reply_size=%u ring_cur=%u\n",
-                      (unsigned long long)YTTRIUM_VENUS_RING_WAIT_MS,
+      const uint64_t now = GetTickCount64();
+      if (now - last_warning_ms >= YTTRIUM_VENUS_RING_WAIT_MS) {
+         if (!yttrium_venus_ring_check_device(venus))
+            return false;
+         YTTRIUM_WARN("yttrium: Venus ring still pending owner=venus2-ring reason=awaiting-seqno elapsed_ms=%llu head=%u tail=%u seqno=%u status=0x%x command=%s(%u) command_size=%u reply_size=%u ring_cur=%u label=%s\n",
+                      (unsigned long long)(now - start),
                       head, tail, seqno, status,
                       yttrium_venus_command_type_name(command_type),
-                      command_type, command_size, reply_size, ring->cur);
-         yttrium_venus_debug_sync_wait(
-            venus, YTTRIUM_VENUS_SYNC_WAIT_RING_SEQNO,
-            yttrium_trace_now_us() - wait_start_us, 1, label, seqno, head,
-            command_type, command_size, reply_size);
-         yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_RING_WAIT_SEQNO,
-                                    1, start_us, NULL, seqno, status, head, tail);
-         yttrium_venus_mark_ring_failed(venus, "wait-seqno-timeout");
-         return false;
+                      command_type, command_size, reply_size, ring->cur,
+                      label ? label : "<unknown>");
+         last_warning_ms = now;
       }
       yttrium_venus_ring_wait_backoff(&wait_backoff_iters);
       if (!yttrium_venus_ring_snapshot(ring, &head, &tail, &status)) {
@@ -671,6 +761,8 @@ yttrium_venus_ring_wait_seqno(struct yttrium_venus_ring *ring,
                                     3, start_us, NULL, seqno, 0, 0, 0);
          return false;
       }
+      if (!yttrium_venus_ring_probe(venus, "wait-seqno-ring"))
+         return false;
    }
 
    if (wait_start_us) {
@@ -689,7 +781,8 @@ yttrium_venus_ring_wait_for_seqno(struct yttrium_venus *venus,
                                   const struct yttrium_venus_ring_dependency *dependency,
                                   const char *label)
 {
-   if (!venus || !yttrium_venus_ring_dependency_valid(dependency))
+   if (yttrium_venus_ring_cancelled(venus) ||
+       !yttrium_venus_ring_dependency_valid(dependency))
       return false;
 
    /* The command may have been published as a reply-free asynchronous
@@ -741,10 +834,16 @@ yttrium_venus_ring_flush_notify(struct yttrium_venus *venus,
     * below owns the pending-notify state, and callers may already hold this
     * recursive CRITICAL_SECTION when forcing a high-watermark flush.
     */
-   if (!venus || !venus->ring_notify_pending)
+   if (yttrium_venus_ring_cancelled(venus))
+      return false;
+   if (!venus->ring_notify_pending)
       return true;
 
    yttrium_venus_ring_lock(venus);
+   if (yttrium_venus_ring_cancelled(venus)) {
+      yttrium_venus_ring_unlock(venus);
+      return false;
+   }
    if (!venus->ring_notify_pending) {
       yttrium_venus_ring_unlock(venus);
       return true;
@@ -783,7 +882,9 @@ yttrium_venus_ring_flush_notify_if_idle(struct yttrium_venus *venus,
                                         const char *label,
                                         bool blocking)
 {
-   if (!venus || !venus->ring_notify_pending)
+   if (yttrium_venus_ring_cancelled(venus))
+      return false;
+   if (!venus->ring_notify_pending)
       return true;
 
    uint32_t status = 0;
@@ -916,7 +1017,8 @@ yttrium_venus_drain_ring(struct yttrium_venus *venus, const char *label)
    uint32_t tail = 0;
    uint32_t status = 0;
 
-   if (!venus || venus->failed || !yttrium_venus_ring_ready(&venus->ring))
+   if (yttrium_venus_ring_cancelled(venus) ||
+       !yttrium_venus_ring_ready(&venus->ring))
       return false;
 
    yttrium_venus_ring_lock(venus);

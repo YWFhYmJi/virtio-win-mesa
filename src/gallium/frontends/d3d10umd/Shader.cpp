@@ -1888,7 +1888,8 @@ CreateVertexShader(D3D10DDI_HDEVICE hDevice,                                  //
    pShader->state.tokens =
       Shader_tgsi_translate(pCode, pShader->output_mapping, NULL, NULL,
                             NULL, NULL, pSignatures, sampler_binding_map,
-                            pShader->counter_image_slots);
+                            pShader->counter_image_slots,
+                            &pShader->state.typed_buffer_image_mask);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=vs "
                    "reason=tgsi_translation_failed shader=%p\n",
@@ -2053,7 +2054,8 @@ CreateGeometryShader(D3D10DDI_HDEVICE hDevice,                                //
    pShader->state.tokens =
       Shader_tgsi_translate(pShaderCode, pShader->output_mapping, NULL, NULL,
                             NULL, NULL, pSignatures, sampler_binding_map,
-                            pShader->counter_image_slots);
+                            pShader->counter_image_slots,
+                            &pShader->state.typed_buffer_image_mask);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=gs "
                    "reason=tgsi_translation_failed shader=%p\n",
@@ -2304,7 +2306,8 @@ CreateGeometryShaderWithStreamOutput(
       pShader->state.tokens =
          Shader_tgsi_translate(pData->pShaderCode, pShader->output_mapping,
                                NULL, NULL, NULL, NULL, pSignatures,
-                               sampler_binding_map, pShader->counter_image_slots);
+                               sampler_binding_map, pShader->counter_image_slots,
+                               &pShader->state.typed_buffer_image_mask);
       if (!pShader->state.tokens) {
          YTTRIUM_WARN("yttrium: d3d10umd geometry stream-output shader translation failed; creation rejected\n");
          SetError(hDevice, E_FAIL);
@@ -2571,7 +2574,8 @@ CreatePixelShader(D3D10DDI_HDEVICE hDevice,                                // IN
    pShader->state.tokens =
       Shader_tgsi_translate(pShaderCode, pShader->output_mapping, NULL, NULL,
                             NULL, NULL, NULL, sampler_binding_map,
-                            pShader->counter_image_slots);
+                            pShader->counter_image_slots,
+                            &pShader->state.typed_buffer_image_mask);
 
    /*
     * A NULL here is the translator telling us it could not handle this
@@ -3147,7 +3151,8 @@ InitD3D11TessellationShader(
                             pShader->tessellation_has_signatures ?
                                &signatures : NULL,
                             NULL, NULL, sampler_binding_map,
-                            pShader->counter_image_slots);
+                            pShader->counter_image_slots,
+                            &pShader->state.typed_buffer_image_mask);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: d3d10umd hull shader translation failed\n");
       FREE(pShader->tessellation_code);
@@ -3203,7 +3208,8 @@ RecreateTessEvalState(
                             pShader->tessellation_has_signatures ?
                                &signatures : NULL,
                             properties, NULL, sampler_binding_map,
-                            pShader->counter_image_slots);
+                            pShader->counter_image_slots,
+                            &pShader->state.typed_buffer_image_mask);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: d3d10umd domain shader translation failed\n");
       return false;
@@ -3437,7 +3443,8 @@ CreateComputeShader(D3D10DDI_HDEVICE hDevice,
    pShader->state.tokens =
       Shader_tgsi_translate(pCode, NULL, pShader->thread_group_size,
                             &static_shared_mem, NULL, NULL, NULL,
-                            sampler_binding_map, pShader->counter_image_slots);
+                            sampler_binding_map, pShader->counter_image_slots,
+                            &pShader->state.typed_buffer_image_mask);
    if (!pShader->state.tokens) {
       YTTRIUM_WARN("yttrium: shader creation failed owner=d3d10umd stage=cs "
                    "reason=tgsi_translation_failed shader=%p\n",
@@ -3450,6 +3457,8 @@ CreateComputeShader(D3D10DDI_HDEVICE hDevice,
    pShader->compute_state.prog = pShader->state.tokens;
    pShader->compute_state.static_shared_mem = static_shared_mem;
    pShader->compute_state.sampler_binding_map = sampler_binding_map;
+   pShader->compute_state.typed_buffer_image_mask =
+      pShader->state.typed_buffer_image_mask;
 
    pShader->handle =
       pipe->create_compute_state(pipe, &pShader->compute_state);

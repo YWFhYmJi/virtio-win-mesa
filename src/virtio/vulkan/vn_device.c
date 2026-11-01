@@ -12,6 +12,8 @@
 
 #include "util/disk_cache.h"
 #include "util/hex.h"
+#include "util/log.h"
+#include "vk_enum_to_str.h"
 #include "venus-protocol/vn_protocol_driver_device.h"
 
 #include "vn_android.h"
@@ -259,6 +261,15 @@ vn_device_fix_create_info(const struct vn_device *dev,
       app_exts->KHR_swapchain || app_exts->ANDROID_native_buffer ||
       app_exts->ANDROID_external_memory_android_hardware_buffer;
    if (has_wsi) {
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+      /* The D3D11 exporter records its exact image usage, including optional
+       * feedback-loop usage. Importing it cannot remove that bit. */
+      if (physical_dev->base.vk.supported_features.attachmentFeedbackLoopLayout &&
+          renderer_exts->EXT_attachment_feedback_loop_layout &&
+          !app_exts->EXT_attachment_feedback_loop_layout)
+         extra_exts[extra_count++] =
+            VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME;
+#endif
       if (renderer_exts->EXT_image_drm_format_modifier &&
           !app_exts->EXT_image_drm_format_modifier) {
          extra_exts[extra_count++] =
@@ -467,6 +478,63 @@ vn_get_timestamp(struct vk_device *device, uint64_t *timestamp)
                                                &device_max_deviation);
 }
 
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+static void
+vn_device_free_feature_prefix(const VkAllocationCallbacks *alloc,
+                              struct VkBaseOutStructure *prefix,
+                              const void *end)
+{
+   while (prefix && prefix != end) {
+      struct VkBaseOutStructure *next = prefix->pNext;
+      vk_free(alloc, prefix);
+      prefix = next;
+   }
+}
+
+/* Copy only the nodes before the feature being replaced. Payload pointers in
+ * these synchronous vkCreateDevice inputs stay owned by the application. */
+static VkResult
+vn_device_copy_feature_prefix(const VkAllocationCallbacks *alloc,
+                              const void *head, const void *end,
+                              struct VkBaseOutStructure *replacement,
+                              struct VkBaseOutStructure **out)
+{
+   struct VkBaseOutStructure *prefix = NULL;
+   struct VkBaseOutStructure **next = &prefix;
+   const struct VkBaseInStructure *node = head;
+   VkResult result = VK_SUCCESS;
+   for (; node != end; node = node->pNext) {
+      /* The generated size helper is unreachable for unknown enum values.
+       * Reject them before calling it; never infer a struct's byte size. */
+      if (!node || !strcmp(vk_StructureType_to_str(node->sType),
+                           "Unknown VkStructureType value.")) {
+         mesa_loge("venus: WSI device features rejected owner=venus-device "
+                   "reason=unknown-feature-prefix-structure action=fail-device");
+         result = VK_ERROR_FEATURE_NOT_PRESENT;
+         goto fail;
+      }
+      const size_t size = vk_structure_type_size(node);
+      struct VkBaseOutStructure *copy =
+         vk_alloc(alloc, size, 8, VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+      if (!copy) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+      memcpy(copy, node, size);
+      copy->pNext = NULL;
+      *next = copy;
+      next = &copy->pNext;
+   }
+   *next = replacement;
+   *out = prefix;
+   return VK_SUCCESS;
+
+fail:
+   vn_device_free_feature_prefix(alloc, prefix, NULL);
+   return result;
+}
+#endif
+
 static VkResult
 vn_device_init(struct vn_device *dev,
                struct vn_physical_device *physical_dev,
@@ -513,8 +581,40 @@ vn_device_init(struct vn_device *dev,
          break;
       }
    }
-   result = vn_call_vkCreateDevice(dev->primary_ring, physical_dev_handle,
-                                   &final_create_info, NULL, &dev_handle);
+   result = VK_SUCCESS;
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+   struct VkBaseOutStructure *wsi_feature_prefix = NULL;
+   VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT wsi_feedback = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT,
+      .attachmentFeedbackLoopLayout = true,
+   };
+   if (dev->base.vk.enabled_extensions.KHR_swapchain &&
+       physical_dev->base.vk.supported_features.attachmentFeedbackLoopLayout) {
+      const VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT *app_feedback =
+         vk_find_struct_const(final_create_info.pNext,
+                               PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT);
+      if (!app_feedback) {
+         wsi_feedback.pNext = (void *)final_create_info.pNext;
+         final_create_info.pNext = &wsi_feedback;
+      } else if (!app_feedback->attachmentFeedbackLoopLayout) {
+         wsi_feedback.pNext = app_feedback->pNext;
+         result = vn_device_copy_feature_prefix(
+            alloc, final_create_info.pNext, app_feedback,
+            (struct VkBaseOutStructure *)&wsi_feedback, &wsi_feature_prefix);
+         if (result == VK_SUCCESS)
+            final_create_info.pNext = wsi_feature_prefix;
+      }
+      /* This host-only feature is required by the exporter's descriptor.
+       * The application's enabled_features remain exactly as requested. */
+      dev->wsi_attachment_feedback_loop_layout = result == VK_SUCCESS;
+   }
+#endif
+   if (result == VK_SUCCESS)
+      result = vn_call_vkCreateDevice(dev->primary_ring, physical_dev_handle,
+                                      &final_create_info, NULL, &dev_handle);
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+   vn_device_free_feature_prefix(alloc, wsi_feature_prefix, &wsi_feedback);
+#endif
    STACK_ARRAY_FINISH(queue_infos);
 
    /* free the fixed extensions here since no longer needed below */

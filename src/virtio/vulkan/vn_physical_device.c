@@ -426,6 +426,18 @@ vn_physical_device_init_features(struct vn_physical_device *physical_dev)
    struct vk_features *feats = &physical_dev->base.vk.supported_features;
    vk_set_physical_device_features(feats, &feats2);
 
+   /* The extension feature structs omit the flags promoted from extension
+    * presence to Vulkan 1.2 features.
+    */
+   if (renderer_version < VK_API_VERSION_1_2) {
+      feats->samplerMirrorClampToEdge = exts->KHR_sampler_mirror_clamp_to_edge;
+      feats->drawIndirectCount = exts->KHR_draw_indirect_count;
+      feats->descriptorIndexing = exts->EXT_descriptor_indexing;
+      feats->samplerFilterMinmax = exts->EXT_sampler_filter_minmax;
+      feats->shaderOutputViewportIndex = exts->EXT_shader_viewport_index_layer;
+      feats->shaderOutputLayer = exts->EXT_shader_viewport_index_layer;
+   }
+
    /* Enable features for extensions natively implemented in Venus driver.
     * See vn_physical_device_get_native_extensions.
     */

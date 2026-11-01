@@ -4,10 +4,7 @@
  */
 
 #include <stdint.h>
-#include <stdio.h>
-#include <string.h>
 
-#include "util/u_math.h"
 #include "yttrium_options.h"
 #include "yttrium_trace.h"
 #include "yttrium_venus2_private.h"
@@ -150,76 +147,6 @@ yttrium_venus_command_type_name(uint32_t command_type)
    }
 }
 
-static void
-yttrium_venus_debug_sync_wait_record_command(
-   struct yttrium_venus_sync_wait_diag *diag,
-   enum yttrium_venus_sync_wait_kind kind,
-   uint64_t elapsed_us,
-   uint32_t command_type,
-   uint32_t command_size,
-   uint32_t reply_size)
-{
-   if (kind != YTTRIUM_VENUS_SYNC_WAIT_RING_SEQNO ||
-       command_type == UINT32_MAX)
-      return;
-
-   uint32_t slot = YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS;
-   uint32_t empty_slot = YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS;
-   uint32_t min_slot = 0;
-   for (uint32_t i = 0; i < YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS; i++) {
-      if (diag->commands[i].command_type == command_type) {
-         slot = i;
-         break;
-      }
-      if (!diag->commands[i].count &&
-          empty_slot == YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS)
-         empty_slot = i;
-      if (diag->commands[i].count < diag->commands[min_slot].count)
-         min_slot = i;
-   }
-
-   if (slot == YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS)
-      slot = empty_slot != YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS ?
-         empty_slot : min_slot;
-
-   if (!diag->commands[slot].count ||
-       diag->commands[slot].command_type != command_type) {
-      memset(&diag->commands[slot], 0, sizeof(diag->commands[slot]));
-      diag->commands[slot].command_type = command_type;
-   }
-
-   diag->commands[slot].count++;
-   diag->commands[slot].wait_us += elapsed_us;
-   diag->commands[slot].max_wait_us =
-      MAX2(diag->commands[slot].max_wait_us, elapsed_us);
-   diag->commands[slot].command_size = command_size;
-   diag->commands[slot].reply_size = reply_size;
-}
-
-static void
-yttrium_venus_debug_sync_wait_top_commands(
-   const struct yttrium_venus_sync_wait_diag *diag,
-   uint32_t out[3])
-{
-   out[0] = out[1] = out[2] = YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS;
-
-   for (uint32_t i = 0; i < YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS; i++) {
-      if (!diag->commands[i].count)
-         continue;
-
-      for (uint32_t rank = 0; rank < 3; rank++) {
-         if (out[rank] != YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS &&
-             diag->commands[out[rank]].wait_us >= diag->commands[i].wait_us)
-            continue;
-
-         for (uint32_t move = 2; move > rank; move--)
-            out[move] = out[move - 1];
-         out[rank] = i;
-         break;
-      }
-   }
-}
-
 void
 yttrium_venus_debug_sync_wait(struct yttrium_venus *venus,
                               enum yttrium_venus_sync_wait_kind kind,
@@ -248,8 +175,6 @@ yttrium_venus_debug_sync_wait(struct yttrium_venus *venus,
       kind == YTTRIUM_VENUS_SYNC_WAIT_RING_SEQNO ?
          venus->ring.current_wait_queue_submit_count : 0;
 
-   struct yttrium_venus_sync_wait_diag *diag = &venus->sync_wait_diag;
-   const uint64_t now_us = yttrium_trace_now_us();
    yttrium_trace_sync_wait(kind,
                            yttrium_venus_sync_wait_kind_name(kind),
                            status,
@@ -264,95 +189,4 @@ yttrium_venus_debug_sync_wait(struct yttrium_venus *venus,
                            owner,
                            a,
                            b);
-   if (!diag->window_start_us)
-      diag->window_start_us = now_us;
-
-   diag->total_count++;
-   diag->total_wait_us += elapsed_us;
-   diag->max_wait_us = MAX2(diag->max_wait_us, elapsed_us);
-   diag->timeout_count += status ? 1 : 0;
-   diag->last_kind = kind;
-   diag->last_status = status;
-   diag->last_label = owner;
-   diag->last_a = a;
-   diag->last_b = b;
-   diag->last_command_type = command_type;
-   diag->last_command_size = command_size;
-   diag->last_reply_size = reply_size;
-
-   yttrium_venus_debug_sync_wait_record_command(
-      diag, kind, elapsed_us, command_type, command_size, reply_size);
-
-   switch (kind) {
-   case YTTRIUM_VENUS_SYNC_WAIT_RAW_SUBMIT:
-      diag->raw_submit_count++;
-      break;
-   case YTTRIUM_VENUS_SYNC_WAIT_RING_SPACE:
-      diag->ring_space_count++;
-      break;
-   case YTTRIUM_VENUS_SYNC_WAIT_RING_SEQNO:
-      diag->ring_seqno_count++;
-      break;
-   default:
-      break;
-   }
-
-   const uint64_t window_us = now_us - diag->window_start_us;
-   if (window_us < YTTRIUM_VENUS_SYNC_WAIT_DIAG_WINDOW_US &&
-       diag->total_count < YTTRIUM_VENUS_SYNC_WAIT_DIAG_MAX_COUNT)
-      return;
-
-   if (!yttrium_trace_verbose_etw_text_enabled()) {
-      memset(diag, 0, sizeof(*diag));
-      return;
-   }
-
-   const uint64_t wait_permille =
-      window_us ? (diag->total_wait_us * 1000ull) / window_us : 0;
-   uint32_t top[3];
-   yttrium_venus_debug_sync_wait_top_commands(diag, top);
-#define YTTRIUM_SYNC_CMD_FIELD(rank, field) \
-   (top[(rank)] == YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS ? \
-    0 : diag->commands[top[(rank)]].field)
-#define YTTRIUM_SYNC_CMD_TYPE(rank) \
-   (top[(rank)] == YTTRIUM_VENUS_SYNC_WAIT_DIAG_CMD_SLOTS ? \
-    UINT32_MAX : diag->commands[top[(rank)]].command_type)
-   char msg[512];
-   snprintf(msg, sizeof(msg),
-            "yttrium: Venus sync wait diag window_us=%llu wait_us=%llu wait_pct=%llu.%u count=%u raw=%u space=%u seqno=%u timeout=%u max_us=%llu last=%s status=%u label=%s a=%u b=%u last_cmd=%s(%u) cmd_size=%u reply_size=%u top0=%s(%u):%u/%llu top1=%s(%u):%u/%llu top2=%s(%u):%u/%llu\n",
-            (unsigned long long)window_us,
-            (unsigned long long)diag->total_wait_us,
-            (unsigned long long)(wait_permille / 10),
-            (unsigned)(wait_permille % 10),
-            diag->total_count,
-            diag->raw_submit_count,
-            diag->ring_space_count,
-            diag->ring_seqno_count,
-            diag->timeout_count,
-            (unsigned long long)diag->max_wait_us,
-            yttrium_venus_sync_wait_kind_name(diag->last_kind),
-            diag->last_status,
-            diag->last_label ? diag->last_label : "",
-            diag->last_a,
-            diag->last_b,
-            yttrium_venus_command_type_name(diag->last_command_type),
-            diag->last_command_type,
-            diag->last_command_size,
-            diag->last_reply_size,
-            yttrium_venus_command_type_name(YTTRIUM_SYNC_CMD_TYPE(0)),
-            YTTRIUM_SYNC_CMD_TYPE(0),
-            YTTRIUM_SYNC_CMD_FIELD(0, count),
-            (unsigned long long)YTTRIUM_SYNC_CMD_FIELD(0, wait_us),
-            yttrium_venus_command_type_name(YTTRIUM_SYNC_CMD_TYPE(1)),
-            YTTRIUM_SYNC_CMD_TYPE(1),
-            YTTRIUM_SYNC_CMD_FIELD(1, count),
-            (unsigned long long)YTTRIUM_SYNC_CMD_FIELD(1, wait_us),
-            yttrium_venus_command_type_name(YTTRIUM_SYNC_CMD_TYPE(2)),
-            YTTRIUM_SYNC_CMD_TYPE(2),
-            YTTRIUM_SYNC_CMD_FIELD(2, count),
-            (unsigned long long)YTTRIUM_SYNC_CMD_FIELD(2, wait_us));
-#undef YTTRIUM_SYNC_CMD_FIELD
-#undef YTTRIUM_SYNC_CMD_TYPE
-   yttrium_trace_sync_wait_summary(msg);
-   memset(diag, 0, sizeof(*diag));
 }

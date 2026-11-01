@@ -50,6 +50,8 @@
 
 #include "gdikmt/gdikmt.h"
 #include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
+#include "frontend/winsys_handle.h"
+#include "virtio/wddm/viogpu_wddm_driver.h"
 
 EXTERN_C struct pipe_screen *
 d3d10_create_screen(gdikmt_device *device);
@@ -62,6 +64,7 @@ static void APIENTRY RelocateDeviceFuncs1(D3D10DDI_HDEVICE hDevice,
 static void APIENTRY RelocateDeviceFuncs11(D3D10DDI_HDEVICE hDevice,
                                 __in struct D3D11DDI_DEVICEFUNCS *pDeviceFunctions);
 static void APIENTRY Flush(D3D10DDI_HDEVICE hDevice);
+static bool FlushDevice(D3D10DDI_HDEVICE hDevice);
 static void APIENTRY CheckFormatSupport(D3D10DDI_HDEVICE hDevice, DXGI_FORMAT Format,
                                __out UINT *pFormatCaps);
 static void APIENTRY CheckMultisampleQualityLevels(D3D10DDI_HDEVICE hDevice,
@@ -142,8 +145,7 @@ FeatureLevelFromCreateDevice(const D3D10DDIARG_CREATEDEVICE *pCreateData)
 static BOOL APIENTRY
 Flush11_1(D3D10DDI_HDEVICE hDevice, UINT FlushFlags)
 {
-   Flush(hDevice);
-   return TRUE;
+   return FlushDevice(hDevice) ? TRUE : FALSE;
 }
 
 static void APIENTRY
@@ -657,8 +659,44 @@ CheckDirectFlipSupport11_1(D3D10DDI_HDEVICE hDevice,
                            UINT CheckDirectFlipFlags,
                            __out BOOL *pSupported)
 {
-   if (pSupported)
-      *pSupported = FALSE;
+   if (!pSupported)
+      return;
+   *pSupported = FALSE;
+
+   Device *device = CastDevice(hDevice);
+   if (!device || !device->screen || !device->screen->get_name ||
+       strcmp(device->screen->get_name(device->screen), "yttrium") ||
+       !device->screen->resource_get_handle)
+      return;
+
+   Resource *resources[] = {CastResource(hResource1), CastResource(hResource2)};
+   struct winsys_handle handles[2] = {};
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!resources[i] || !resources[i]->resource)
+         return;
+      /* The kernel's legacy width*4 pitch does not describe opaque optimal
+       * storage. Keep these shared inputs in composition, even after import. */
+      if (yttrium_gdi_resource_is_optimal_shared(resources[i]->resource))
+         return;
+      handles[i].type = WINSYS_HANDLE_TYPE_D3DKMT_ALLOC;
+      if (!device->screen->resource_get_handle(device->screen, device->pipe,
+             resources[i]->resource, &handles[i], 0))
+         return;
+   }
+
+   /* Validate the actual allocation layouts, including foreign Y12 buffers
+    * opened by DWM. A texture's D3D bind flags alone do not prove scanout. */
+   VIOGPU_ESCAPE escape = {};
+   escape.Type = VIOGPU_CHECK_DIRECT_FLIP;
+   escape.DataLength = sizeof(escape.CheckDirectFlip);
+   escape.CheckDirectFlip.ApplicationAllocation = (D3DKMT_HANDLE)(uintptr_t)handles[0].handle;
+   escape.CheckDirectFlip.DesktopAllocation = (D3DKMT_HANDLE)(uintptr_t)handles[1].handle;
+   escape.CheckDirectFlip.Flags = CheckDirectFlipFlags;
+   NTSTATUS status = device->device.base.escape(&device->device.base, &escape, sizeof(escape));
+   if (NT_SUCCESS(status))
+      *pSupported = escape.CheckDirectFlip.Supported;
+   else
+      yttrium_gdi_user_logf("WARNING: d3d10umd DirectFlip query failed owner=KMD status=0x%lx; retaining composition\n", status);
 }
 
 static void APIENTRY
@@ -891,15 +929,6 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
 {
    LOG_ENTRYPOINT();
 
-   if (0) {
-      DebugPrintf("hAdapter = %p\n", hAdapter);
-      DebugPrintf("pKTCallbacks = %p\n", pCreateData->pKTCallbacks);
-      DebugPrintf("p10_1DeviceFuncs = %p\n", pCreateData->p10_1DeviceFuncs);
-      DebugPrintf("hDrvDevice = %p\n", pCreateData->hDrvDevice);
-      DebugPrintf("DXGIBaseDDI = %p\n", pCreateData->DXGIBaseDDI);
-      DebugPrintf("hRTCoreLayer = %p\n", pCreateData->hRTCoreLayer);
-      DebugPrintf("pUMCallbacks = %p\n", pCreateData->pUMCallbacks);
-   }
 
    switch (pCreateData->Interface) {
    case D3D10_0_DDI_INTERFACE_VERSION:
@@ -1035,9 +1064,6 @@ CreateDevice(D3D10DDI_HADAPTER hAdapter,                 // IN
 
    pDevice->draw_so_target = NULL;
 
-   if (0) {
-      DebugPrintf("pDevice = %p\n", pDevice);
-   }
 
    st_debug_parse();
    
@@ -1523,8 +1549,8 @@ RelocateDeviceFuncs11(D3D10DDI_HDEVICE hDevice,
  * ----------------------------------------------------------------------
  */
 
-void APIENTRY
-Flush(D3D10DDI_HDEVICE hDevice)  // IN
+static bool
+FlushDevice(D3D10DDI_HDEVICE hDevice)
 {
    LOG_ENTRYPOINT();
 
@@ -1533,12 +1559,25 @@ Flush(D3D10DDI_HDEVICE hDevice)  // IN
    const char *screen_name =
       pipe->screen && pipe->screen->get_name ?
       pipe->screen->get_name(pipe->screen) : NULL;
-   const unsigned flush_flags =
-      screen_name && strcmp(screen_name, "yttrium") == 0 ?
-      PIPE_FLUSH_ASYNC : 0;
+   /* Issue public DDI Flush work before the runtime hands shared storage to
+    * another consumer. Internal batch rollover remains asynchronous. */
+   if (screen_name && strcmp(screen_name, "yttrium") == 0) {
+      if (!yttrium_gdi_flush_handoff(pipe, "D3D10 DDI Flush")) {
+         SetError(hDevice, D3DDDIERR_DEVICEREMOVED);
+         return false;
+      }
+      return true;
+   }
 
-   yttrium_gdi_flush_labeled(pipe, NULL, flush_flags,
+   yttrium_gdi_flush_labeled(pipe, NULL, 0,
                              "D3D10 DDI Flush");
+   return true;
+}
+
+void APIENTRY
+Flush(D3D10DDI_HDEVICE hDevice)  // IN
+{
+   FlushDevice(hDevice);
 }
 
 

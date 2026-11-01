@@ -41,23 +41,10 @@
 #include "util/u_framebuffer.h"
 #include "util/format/u_format.h"
 #include "util/blend.h"
-#include "util/u_debug.h"
 #include "util/u_math.h"
 
 #include <stdlib.h>
 #include <string.h>
-
-extern "C" void
-yttrium_gdi_resource_debug_log(struct pipe_resource *resource,
-                               const char *label);
-
-/*
- * debug_get_bool_option() calls getenv() every time, and this knob is read
- * from GetPipeRenderTargetView(), which runs per render target per
- * SetRenderTargets and on every clear.  It showed up in the profile as a
- * per-draw walk of the environment block to re-answer a constant.
- */
-DEBUG_GET_ONCE_BOOL_OPTION(rt_trace, "D3D10UMD_DEBUG_RT_TRACE", false)
 
 static inline struct pipe_surface *
 GetPipeRenderTargetView(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
@@ -70,14 +57,6 @@ GetPipeRenderTargetView(D3D10DDI_HRENDERTARGETVIEW hRenderTargetView)
    struct pipe_surface *currentSurface = &pRenderTargetView->surface;
    Resource *res = pRenderTargetView->resource;
    if (currentSurface->texture != res->resource) {
-      if (debug_get_option_rt_trace()) {
-         debug_printf("d3d10umd: rtv update view=%p old=%p new=%p resource=%p\n",
-                      pRenderTargetView,
-                      currentSurface->texture,
-                      res->resource,
-                      res);
-         yttrium_gdi_resource_debug_log(res->resource, "RTV update");
-      }
       pipe_resource_reference(&currentSurface->texture, res->resource);
    }
    return &pRenderTargetView->surface;
@@ -341,16 +320,6 @@ CreateRenderTargetView(
    RenderTargetView *pRTView = CastRenderTargetView(hRenderTargetView);
    pRTView->resource = CastResource(pCreateRenderTargetView->hDrvResource);
 
-   if (debug_get_option_rt_trace()) {
-      debug_printf("d3d10umd: CreateRenderTargetView view=%p hDrvResource=%p resource=%p pipe=%p format=%u dim=%u\n",
-                   pRTView,
-                   (void *)pCreateRenderTargetView->hDrvResource.pDrvPrivate,
-                   pRTView->resource,
-                   resource,
-                   pCreateRenderTargetView->Format,
-                   pCreateRenderTargetView->ResourceDimension);
-      yttrium_gdi_resource_debug_log(resource, "CreateRenderTargetView");
-   }
 
    struct pipe_surface desc;
 
@@ -1282,17 +1251,6 @@ SetRenderTargetsImpl(D3D10DDI_HDEVICE hDevice,                              // I
                     RTargets,
                     ClearTargets);
       if (psurf && psurf->texture) {
-         if (debug_get_option_rt_trace()) {
-            debug_printf("d3d10umd: SetRenderTargets[%u] view=%p surface_tex=%p rtv_resource=%p\n",
-                         i,
-                         phRenderTargetView[i].pDrvPrivate,
-                         psurf->texture,
-                         CastRenderTargetView(phRenderTargetView[i]) ?
-                            CastRenderTargetView(phRenderTargetView[i])->resource :
-                            NULL);
-            yttrium_gdi_resource_debug_log(psurf->texture,
-                                           "SetRenderTargets cbuf");
-         }
          pDevice->fb.nr_cbufs = i + 1;
          pDevice->fb.cbufs[i] = *psurf;
       }

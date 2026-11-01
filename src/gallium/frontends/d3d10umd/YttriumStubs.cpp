@@ -79,6 +79,20 @@ yttrium_gdi_resource_has_runtime_allocation(struct pipe_resource *resource)
 }
 
 bool
+yttrium_gdi_resource_is_optimal_shared(struct pipe_resource *resource)
+{
+   (void)resource;
+   return false;
+}
+
+bool
+yttrium_gdi_resource_is_optimal_present(struct pipe_resource *resource)
+{
+   (void)resource;
+   return false;
+}
+
+bool
 yttrium_gdi_resource_rotate_runtime_handles(
    struct pipe_resource *const *resources, unsigned count)
 {
@@ -94,14 +108,6 @@ yttrium_gdi_pipeline_invalidate_resource(
    (void)ctx;
    (void)resource;
    return 0;
-}
-
-void
-yttrium_gdi_resource_debug_log(struct pipe_resource *resource,
-                               const char *label)
-{
-   (void)resource;
-   (void)label;
 }
 
 const char *

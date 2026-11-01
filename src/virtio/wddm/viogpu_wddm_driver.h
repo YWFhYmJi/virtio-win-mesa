@@ -73,6 +73,7 @@ typedef struct _VIOGPU_ADAPTERINFO {
 #define VIOGPU_RES_CREATE_BLOB                            0x104
 #define VIOGPU_RES_SET_SCANOUT_BLOB                       0x105
 #define VIOGPU_RES_ATTACH_WAIT                            0x106
+#define VIOGPU_CHECK_DIRECT_FLIP                          0x107
 
 #define VIOGPU_CTX_INIT                                   0x200
 #define VIOGPU_SUBMIT_CMD                                 0x300
@@ -111,6 +112,15 @@ typedef struct _VIOGPU_RES_INFO_REQ {
     D3DKMT_HANDLE ResHandle;
     ULONG Id;
 }VIOGPU_RES_INFO_REQ;
+#pragma pack()
+
+#pragma pack(1)
+typedef struct _VIOGPU_CHECK_DIRECT_FLIP_REQ {
+    D3DKMT_HANDLE ApplicationAllocation;
+    D3DKMT_HANDLE DesktopAllocation;
+    UINT Flags;
+    BOOL Supported;
+} VIOGPU_CHECK_DIRECT_FLIP_REQ;
 #pragma pack()
 
 
@@ -185,6 +195,7 @@ typedef struct  _VIOGPU_ESCAPE{
         VIOGPU_CAPSET_REQ Capset;
 
         VIOGPU_RES_INFO_REQ ResourceInfo;
+        VIOGPU_CHECK_DIRECT_FLIP_REQ CheckDirectFlip;
         VIOGPU_RES_BUSY_REQ ResourceBusy;
         VIOGPU_RES_MAP_BLOB_REQ ResourceMapBlob;
         VIOGPU_RES_UNMAP_BLOB_REQ ResourceUnmapBlob;

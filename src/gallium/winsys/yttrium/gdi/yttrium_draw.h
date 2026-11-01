@@ -15,12 +15,6 @@ struct pipe_draw_info;
 struct pipe_draw_indirect_info;
 struct pipe_draw_start_count_bias;
 
-/* Diagnostic only: lets the RT stats sampler count frames.  See
- * yttrium_report_rt_stats.
- */
-void
-yttrium_rt_stats_frame_advance(void);
-
 void
 yttrium_draw_vbo(struct pipe_context *ctx,
                  const struct pipe_draw_info *info,

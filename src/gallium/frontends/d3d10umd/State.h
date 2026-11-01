@@ -227,6 +227,17 @@ SetErrorAt(D3D10DDI_HDEVICE hDevice, HRESULT hr,
             "d3d10umd: pfnSetErrorCb hr=0x%08x caller=%s:%u device=%p",
             (unsigned)hr, function, line, pDevice);
       }
+      /* These errors are fatal in the DDIs reporting them here. Windows
+       * removes the device, but its RenderCB can still return S_OK while
+       * discarding submissions. Stop backend waits before entering the
+       * callback; neither OOM nor ordinary query/counter errors imply loss.
+       * This callback itself reports removal, so do not notify it again from
+       * a worker observing the reset status.
+       */
+      if (hr == E_FAIL || hr == E_INVALIDARG ||
+          hr == D3DDDIERR_DEVICEREMOVED) {
+         gdikmt_device_record_runtime_reset(&pDevice->device.base);
+      }
       pDevice->UMCallbacks.pfnSetErrorCb(pDevice->hRTCoreLayer, hr);
    }
 }

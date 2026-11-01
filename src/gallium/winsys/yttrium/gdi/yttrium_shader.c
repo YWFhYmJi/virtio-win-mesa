@@ -17,7 +17,6 @@
 #include "compiler/nir/nir_xfb_info.h"
 #include "nir/nir_to_tgsi_info.h"
 #include "nir/tgsi_to_nir.h"
-#include "tgsi/tgsi_dump.h"
 #include "tgsi/tgsi_info.h"
 #include "tgsi/tgsi_parse.h"
 #include "tgsi/tgsi_strings.h"
@@ -36,7 +35,6 @@
 
 static volatile LONG yttrium_shader_sequence;
 
-#define YTTRIUM_SHADER_DUMP_DIR "C:\\ProgramData\\Yttrium\\Shaders"
 
 struct yttrium_spirv_probe {
    bool well_formed;
@@ -258,35 +256,6 @@ yttrium_shader_sampled_texture_mask(
 }
 
 static void
-yttrium_shader_trace_sampler_info(const struct yttrium_shader_state *shader,
-                                  const char *phase)
-{
-   if (!shader)
-      return;
-
-   const uint32_t declared =
-      yttrium_shader_info_sampled_texture_mask(&shader->info);
-   const uint32_t used = shader->sampler_used_mask;
-
-   for (unsigned i = 0; i < MIN2(PIPE_MAX_SHADER_SAMPLER_VIEWS, 32); i++) {
-      if (!(declared & (1u << i)) && !(used & (1u << i)))
-         continue;
-
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_sampler_info phase=%s stage=%s id=%u slot=%u declared=%u used=%u sampler_mask=0x%x tgsi_target=%u tgsi_return=%u",
-         phase ? phase : "unknown",
-         yttrium_shader_stage_name(shader->stage),
-         shader->id,
-         i,
-         (declared & (1u << i)) != 0,
-         (used & (1u << i)) != 0,
-         declared | used,
-         shader->info.sampler_targets[i],
-         shader->info.sampler_type[i]);
-   }
-}
-
-static void
 yttrium_shader_init_sampler_binding_map(struct yttrium_shader_state *shader)
 {
    if (!shader)
@@ -381,6 +350,7 @@ yttrium_shader_copy_sampler_binding_map(
    if (!dst || !src)
       return;
 
+   dst->typed_buffer_image_mask = src->typed_buffer_image_mask;
    dst->sampler_binding_valid_mask = src->sampler_binding_valid_mask;
    dst->sampler_mixed_return_mask = src->sampler_mixed_return_mask;
    memcpy(dst->sampler_view_index, src->sampler_view_index,
@@ -434,75 +404,6 @@ yttrium_shader_scan_sampler_view_map(struct yttrium_shader_state *shader)
    }
 
    tgsi_parse_free(&parse);
-}
-
-static void
-yttrium_shader_trace_io_info(const struct yttrium_shader_state *shader,
-                             const char *phase)
-{
-   if (!shader)
-      return;
-
-   for (unsigned i = 0; i < shader->info.num_inputs; i++) {
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_io phase=%s stage=%s id=%u input=%u semantic=%u index=%u usage=0x%x interp=%u loc=%u",
-         phase ? phase : "<none>",
-         yttrium_shader_stage_name(shader->stage),
-         shader->id,
-         i,
-         shader->info.input_semantic_name[i],
-         shader->info.input_semantic_index[i],
-         shader->info.input_usage_mask[i],
-         shader->info.input_interpolate[i],
-         shader->info.input_interpolate_loc[i]);
-   }
-
-   for (unsigned i = 0; i < shader->info.num_outputs; i++) {
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_io phase=%s stage=%s id=%u output=%u semantic=%u index=%u usage=0x%x streams=0x%x",
-         phase ? phase : "<none>",
-         yttrium_shader_stage_name(shader->stage),
-         shader->id,
-         i,
-         shader->info.output_semantic_name[i],
-         shader->info.output_semantic_index[i],
-         shader->info.output_usagemask[i],
-         shader->info.output_streams[i]);
-   }
-}
-
-static void
-yttrium_shader_trace_nir_samplers(const struct yttrium_shader_state *shader,
-                                  const char *phase)
-{
-   if (!shader || !shader->nir)
-      return;
-
-   nir_foreach_variable_with_modes(var, shader->nir, nir_var_uniform) {
-      const struct glsl_type *type = glsl_without_array(var->type);
-      if (!glsl_type_is_sampler(type))
-         continue;
-
-      const uint32_t binding = var->data.binding;
-      unsigned raw_slot = binding;
-      (void)yttrium_shader_sampler_binding_decode(binding, NULL, &raw_slot);
-
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_nir_sampler phase=%s stage=%s id=%u name=%s binding=%u raw_slot=%u descriptor_set=%u explicit=%u dim=%u result=%u array=%u shadow=%u type=%p",
-         phase ? phase : "unknown",
-         yttrium_shader_stage_name(shader->stage),
-         shader->id,
-         var->name ? var->name : "",
-         binding,
-         raw_slot,
-         var->data.descriptor_set,
-         var->data.explicit_binding,
-         glsl_get_sampler_dim(type),
-         glsl_get_sampler_result_type(type),
-         glsl_sampler_type_is_array(type),
-         glsl_sampler_type_is_shadow(type),
-         type);
-   }
 }
 
 static uint32_t
@@ -670,211 +571,6 @@ yttrium_shader_probe_spirv(const struct yttrium_shader_state *shader,
    return true;
 }
 
-static void
-yttrium_shader_log_spirv_probe(const struct yttrium_shader_state *shader,
-                               const struct yttrium_spirv_probe *probe)
-{
-   if (!shader || !probe)
-      return;
-
-   YTTRIUM_LOG("yttrium: shader_spirv_probe stage=%s id=%u valid=%u failure=%s words=%u version=0x%x generator=0x%x bound=%u instructions=%u caps=%u memory_model=%u/%u has_memory_model=%u entries=%u first_model=%u expected_model=%u has_stage_entry=%u exec_modes=%u locations=%u vars(input=%u output=%u uniform=%u uniform_constant=%u push=%u private=%u) bad(offset=%u words=%u opcode=%u) spirv_hash=0x%llx token_hash=0x%llx\n",
-               yttrium_shader_stage_name(shader->stage),
-               shader->id,
-               probe->well_formed,
-               probe->failure ? probe->failure : "none",
-               shader->spirv_word_count,
-               probe->version,
-               probe->generator,
-               probe->bound,
-               probe->instructions,
-               probe->capabilities,
-               probe->memory_addressing_model,
-               probe->memory_model,
-               probe->has_memory_model,
-               probe->entry_points,
-               probe->first_execution_model,
-               probe->expected_execution_model,
-               probe->has_stage_entry,
-               probe->execution_modes,
-               probe->location_decorations,
-               probe->input_variables,
-               probe->output_variables,
-               probe->uniform_variables,
-               probe->uniform_constant_variables,
-               probe->push_constant_variables,
-               probe->private_variables,
-               probe->bad_word_offset,
-               probe->bad_word_count,
-               probe->bad_opcode,
-               (unsigned long long)shader->spirv_hash,
-               (unsigned long long)shader->token_hash);
-}
-
-static void
-yttrium_shader_dump_spirv_failure(const struct yttrium_shader_state *shader,
-                                  const char *reason,
-                                  int result)
-{
-   char path[MAX_PATH];
-   FILE *file;
-
-   if (!shader || !shader->spirv || !shader->spirv->words ||
-       !shader->spirv->num_words)
-      return;
-
-   CreateDirectoryA("C:\\ProgramData\\Yttrium", NULL);
-   CreateDirectoryA(YTTRIUM_SHADER_DUMP_DIR, NULL);
-
-   snprintf(path, sizeof(path),
-            YTTRIUM_SHADER_DUMP_DIR
-            "\\yttrium_%s_id%u_result%d_%016llx.spv",
-            yttrium_shader_stage_name(shader->stage),
-            shader->id,
-            result,
-            (unsigned long long)shader->spirv_hash);
-   path[sizeof(path) - 1] = '\0';
-
-   file = fopen(path, "wb");
-   if (!file) {
-      YTTRIUM_WARN("yttrium: shader_spirv_dump failed stage=%s id=%u reason=%s path=%s\n",
-                   yttrium_shader_stage_name(shader->stage),
-                   shader->id,
-                   reason ? reason : "unknown",
-                   path);
-      return;
-   }
-
-   fwrite(shader->spirv->words, sizeof(uint32_t), shader->spirv->num_words,
-          file);
-   fclose(file);
-
-   YTTRIUM_WARN("yttrium: shader_spirv_dump wrote stage=%s id=%u reason=%s result=%d path=%s words=%u spirv_hash=0x%llx\n",
-                yttrium_shader_stage_name(shader->stage),
-                shader->id,
-                reason ? reason : "unknown",
-                result,
-                path,
-                shader->spirv_word_count,
-                (unsigned long long)shader->spirv_hash);
-}
-
-static void
-yttrium_shader_dump_sampled_success(const struct yttrium_shader_state *shader)
-{
-   char path[MAX_PATH];
-   FILE *file;
-   const uint32_t declared_mask =
-      shader ? yttrium_shader_info_sampled_texture_mask(&shader->info) : 0;
-   const uint32_t used_mask =
-      shader ? shader->sampler_used_mask : 0;
-   const uint32_t sampler_mask = declared_mask | used_mask;
-   bool has_buffer_sampler = false;
-   const DWORD pid = GetCurrentProcessId();
-
-   if (!yttrium_gdi_debug_get_bool_option(
-          "D3D10UMD_YTTRIUM_SHADER_DUMP_SAMPLED_SUCCESS", false))
-      return;
-
-   if (shader) {
-      for (unsigned i = 0; i < MIN2(PIPE_MAX_SHADER_SAMPLER_VIEWS, 32); i++) {
-         if (!(sampler_mask & (1u << i)))
-            continue;
-         if (shader->info.sampler_targets[i] == TGSI_TEXTURE_BUFFER) {
-            has_buffer_sampler = true;
-            break;
-         }
-      }
-   }
-
-   if (!shader ||
-       (!has_buffer_sampler && !shader->sampled_texture_only) ||
-       !shader->spirv || !shader->spirv->words || !shader->spirv->num_words)
-      return;
-
-   CreateDirectoryA("C:\\ProgramData\\Yttrium", NULL);
-   CreateDirectoryA(YTTRIUM_SHADER_DUMP_DIR, NULL);
-
-   snprintf(path, sizeof(path),
-            YTTRIUM_SHADER_DUMP_DIR
-            "\\yttrium_%s_pid%lu_id%u_sampled_%016llx.spv",
-            yttrium_shader_stage_name(shader->stage),
-            (unsigned long)pid,
-            shader->id,
-            (unsigned long long)shader->spirv_hash);
-   path[sizeof(path) - 1] = '\0';
-   file = fopen(path, "wb");
-   if (file) {
-      fwrite(shader->spirv->words, sizeof(uint32_t), shader->spirv->num_words,
-             file);
-      fclose(file);
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_sampled_dump wrote stage=%s pid=%lu id=%u kind=spirv path=%s words=%u hash=0x%llx declared_mask=0x%x used_mask=0x%x buffer_sampler=%u",
-         yttrium_shader_stage_name(shader->stage),
-         (unsigned long)pid,
-         shader->id,
-         path,
-         shader->spirv_word_count,
-         (unsigned long long)shader->spirv_hash,
-         declared_mask,
-         used_mask,
-         has_buffer_sampler);
-   }
-
-   if (shader->tokens) {
-      snprintf(path, sizeof(path),
-               YTTRIUM_SHADER_DUMP_DIR
-               "\\yttrium_%s_pid%lu_id%u_sampled_%016llx.tgsi",
-               yttrium_shader_stage_name(shader->stage),
-               (unsigned long)pid,
-               shader->id,
-               (unsigned long long)shader->spirv_hash);
-      path[sizeof(path) - 1] = '\0';
-      file = fopen(path, "w");
-      if (file) {
-         yttrium_write_shader_capture_metadata(file, shader);
-         tgsi_dump_to_file(shader->tokens, 0, file);
-         fclose(file);
-         yttrium_trace_debug_stringf(
-            "yttrium: shader_sampled_dump wrote stage=%s pid=%lu id=%u kind=tgsi path=%s hash=0x%llx declared_mask=0x%x used_mask=0x%x buffer_sampler=%u",
-            yttrium_shader_stage_name(shader->stage),
-            (unsigned long)pid,
-            shader->id,
-            path,
-            (unsigned long long)shader->spirv_hash,
-            declared_mask,
-            used_mask,
-            has_buffer_sampler);
-      }
-   }
-
-   if (shader->nir) {
-      snprintf(path, sizeof(path),
-               YTTRIUM_SHADER_DUMP_DIR
-               "\\yttrium_%s_pid%lu_id%u_sampled_%016llx.nir",
-               yttrium_shader_stage_name(shader->stage),
-               (unsigned long)pid,
-               shader->id,
-               (unsigned long long)shader->spirv_hash);
-      path[sizeof(path) - 1] = '\0';
-      file = fopen(path, "w");
-      if (file) {
-         yttrium_write_shader_capture_metadata(file, shader);
-         nir_print_shader(shader->nir, file);
-         fclose(file);
-         yttrium_trace_debug_stringf(
-            "yttrium: shader_sampled_dump wrote stage=%s pid=%lu id=%u kind=nir path=%s hash=0x%llx declared_mask=0x%x used_mask=0x%x buffer_sampler=%u",
-            yttrium_shader_stage_name(shader->stage),
-            (unsigned long)pid,
-            shader->id,
-            path,
-            (unsigned long long)shader->spirv_hash,
-            declared_mask,
-            used_mask,
-            has_buffer_sampler);
-      }
-   }
-}
-
 bool
 yttrium_shader_pipeline_enabled(void)
 {
@@ -975,9 +671,15 @@ yttrium_shader_token_hash(const struct yttrium_shader_state *shader)
    if (!shader || !shader->tokens || !shader->token_count)
       return 0;
 
-   return yttrium_fnv1a_bytes(shader->tokens,
-                              (size_t)shader->token_count *
-                              sizeof(struct tgsi_token));
+   uint64_t hash = yttrium_fnv1a_bytes(shader->tokens,
+                                       (size_t)shader->token_count *
+                                       sizeof(struct tgsi_token));
+   /* Identical TGSI can represent either typed or DWORD buffer images. */
+   if (shader->typed_buffer_image_mask) {
+      hash ^= shader->typed_buffer_image_mask;
+      hash *= 1099511628211ull;
+   }
+   return hash;
 }
 
 static uint64_t
@@ -2814,17 +2516,6 @@ yttrium_shader_make_nir(struct pipe_context *ctx,
       return false;
    }
 
-   YTTRIUM_LOG("yttrium: shader_compile_nir begin stage=%s id=%u ir=%u tokens=%p token_count=%u token_processor=%u screen=%p stage_options=%u token_options=%u finalize_nir=%u\n",
-               yttrium_shader_stage_name(shader->stage),
-               shader->id,
-               state->type,
-               shader->tokens,
-               shader->token_count,
-               token_processor,
-               screen,
-               stage_options,
-               token_options,
-               screen && screen->finalize_nir);
 
    if (state->type == PIPE_SHADER_IR_TGSI) {
       const struct tgsi_token *tokens;
@@ -2915,20 +2606,6 @@ yttrium_shader_make_nir(struct pipe_context *ctx,
    nir_shader_gather_info(shader->nir,
                           nir_shader_get_entrypoint(shader->nir));
    nir_tgsi_scan_shader(shader->nir, &shader->info, true);
-   yttrium_shader_trace_sampler_info(shader, "post_nir_scan");
-   yttrium_shader_trace_nir_samplers(shader, "post_nir_scan");
-   YTTRIUM_LOG("yttrium: shader_compile_nir success stage=%s id=%u nir=%p nir_stage=%u inputs=%u outputs=%u textures=%u ubos=%u ssbos=%u images=%u writes_memory=%u\n",
-               yttrium_shader_stage_name(shader->stage),
-               shader->id,
-               shader->nir,
-               shader->nir->info.stage,
-               shader->info.num_inputs,
-               shader->info.num_outputs,
-               shader->nir->info.num_textures,
-               shader->nir->info.num_ubos,
-               shader->nir->info.num_ssbos,
-               shader->nir->info.num_images,
-               shader->nir->info.writes_memory);
    return true;
 }
 
@@ -2939,7 +2616,6 @@ yttrium_shader_rebind_samplers(struct yttrium_shader_state *shader)
       return false;
 
    nir_shader *nir = shader->nir;
-   yttrium_shader_trace_nir_samplers(shader, "pre_sampler_rebind");
    nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
       const struct glsl_type *type = glsl_without_array(var->type);
       if (!glsl_type_is_sampler(type))
@@ -2964,7 +2640,6 @@ yttrium_shader_rebind_samplers(struct yttrium_shader_state *shader)
    }
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-   yttrium_shader_trace_nir_samplers(shader, "post_sampler_rebind");
    return true;
 }
 
@@ -3384,6 +3059,7 @@ yttrium_shader_create_cull_distance_vs(struct pipe_context *ctx,
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = vs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_VERTEX);
@@ -3644,6 +3320,7 @@ yttrium_shader_create_a8_rt_fs(struct pipe_context *ctx,
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = fs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
@@ -3800,6 +3477,7 @@ yttrium_shader_create_alpha_test_fs(struct pipe_context *ctx,
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = fs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
@@ -3871,6 +3549,7 @@ yttrium_shader_create_dual_source_fs(struct pipe_context *ctx,
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = fs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
@@ -4058,6 +3737,7 @@ yttrium_shader_create_forced_sample_interlock_fs(
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = fs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
@@ -4143,6 +3823,7 @@ yttrium_shader_create_forced_sample_mask_fs(
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = fs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
@@ -4237,6 +3918,7 @@ yttrium_shader_create_sample_mask_expand_fs(
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = nir;
+   state.typed_buffer_image_mask = fs->typed_buffer_image_mask;
 
    struct yttrium_shader_state *shader =
       yttrium_shader_state_create(ctx, &state, MESA_SHADER_FRAGMENT);
@@ -4323,189 +4005,6 @@ yttrium_shader_stream_output_location(nir_shader *nir,
    return true;
 }
 
-static void
-yttrium_shader_dump_stream_output_mapping_failure(
-   const struct yttrium_shader_state *shader)
-{
-   static volatile LONG dumped;
-   char path[MAX_PATH];
-   FILE *file;
-
-   if (!shader || InterlockedCompareExchange(&dumped, 1, 0) != 0)
-      return;
-
-   CreateDirectoryA("C:\\ProgramData\\Yttrium", NULL);
-   CreateDirectoryA(YTTRIUM_SHADER_DUMP_DIR, NULL);
-
-   if (shader->tokens) {
-      snprintf(path, sizeof(path),
-               YTTRIUM_SHADER_DUMP_DIR
-               "\\yttrium_%s_pid%lu_so_unmapped_%016llx.tgsi",
-               yttrium_shader_stage_name(shader->stage),
-               (unsigned long)GetCurrentProcessId(),
-               (unsigned long long)shader->token_hash);
-      path[sizeof(path) - 1] = '\0';
-      file = fopen(path, "w");
-      if (file) {
-         yttrium_write_shader_capture_metadata(file, shader);
-         for (unsigned i = 0; i < shader->stream_output.num_outputs; i++) {
-            const struct pipe_stream_output *output =
-               &shader->stream_output.output[i];
-            fprintf(file,
-                    "stream_output[%u] register=%u start=%u count=%u "
-                    "buffer=%u offset=%u stream=%u\n",
-                    i, output->register_index, output->start_component,
-                    output->num_components, output->output_buffer,
-                    output->dst_offset, output->stream);
-         }
-         tgsi_dump_to_file(shader->tokens, 0, file);
-         fclose(file);
-         YTTRIUM_WARN("yttrium: stream-output mapping failure TGSI wrote path=%s\n",
-                      path);
-      }
-   }
-
-   if (shader->nir) {
-      snprintf(path, sizeof(path),
-               YTTRIUM_SHADER_DUMP_DIR
-               "\\yttrium_%s_pid%lu_so_unmapped_%016llx.nir",
-               yttrium_shader_stage_name(shader->stage),
-               (unsigned long)GetCurrentProcessId(),
-               (unsigned long long)shader->token_hash);
-      path[sizeof(path) - 1] = '\0';
-      file = fopen(path, "w");
-      if (file) {
-         yttrium_write_shader_capture_metadata(file, shader);
-         nir_print_shader(shader->nir, file);
-         fclose(file);
-         YTTRIUM_WARN("yttrium: stream-output mapping failure NIR wrote path=%s\n",
-                      path);
-      }
-   }
-}
-
-static void
-yttrium_shader_write_stream_output_metadata(
-   FILE *file, const struct yttrium_shader_state *shader)
-{
-   if (!file || !shader)
-      return;
-
-   for (unsigned i = 0; i < PIPE_MAX_SO_BUFFERS; i++) {
-      fprintf(file, "stream_output_stride[%u]=%u\n", i,
-              shader->stream_output.stride[i]);
-   }
-
-   for (unsigned i = 0; i < shader->stream_output.num_outputs; i++) {
-      const struct pipe_stream_output *output =
-         &shader->stream_output.output[i];
-      fprintf(file,
-              "stream_output[%u] register=%u start=%u count=%u "
-              "buffer=%u offset=%u stream=%u\n",
-              i, output->register_index, output->start_component,
-              output->num_components, output->output_buffer,
-              output->dst_offset, output->stream);
-   }
-}
-
-static void
-yttrium_shader_dump_stream_output_success(
-   const struct yttrium_shader_state *shader)
-{
-   char path[MAX_PATH];
-   FILE *file;
-   const DWORD pid = GetCurrentProcessId();
-
-   if (!yttrium_gdi_debug_get_bool_option(
-          "D3D10UMD_YTTRIUM_SHADER_DUMP_STREAM_OUTPUT_SUCCESS", false))
-      return;
-
-   if (!shader || !shader->stream_output.num_outputs ||
-       (shader->stage != MESA_SHADER_VERTEX &&
-        shader->stage != MESA_SHADER_GEOMETRY) ||
-       !shader->spirv || !shader->spirv->words ||
-       !shader->spirv->num_words)
-      return;
-
-   CreateDirectoryA("C:\\ProgramData\\Yttrium", NULL);
-   CreateDirectoryA(YTTRIUM_SHADER_DUMP_DIR, NULL);
-
-   snprintf(path, sizeof(path),
-            YTTRIUM_SHADER_DUMP_DIR
-            "\\yttrium_%s_pid%lu_id%u_so_%016llx.spv",
-            yttrium_shader_stage_name(shader->stage),
-            (unsigned long)pid, shader->id,
-            (unsigned long long)shader->spirv_hash);
-   path[sizeof(path) - 1] = '\0';
-   file = fopen(path, "wb");
-   if (file) {
-      fwrite(shader->spirv->words, sizeof(uint32_t),
-             shader->spirv->num_words, file);
-      fclose(file);
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_stream_output_dump wrote stage=%s pid=%lu id=%u "
-         "kind=spirv module_id=%llu outputs=%u path=%s token_hash=0x%llx "
-         "spirv_hash=0x%llx",
-         yttrium_shader_stage_name(shader->stage), (unsigned long)pid,
-         shader->id, (unsigned long long)shader->module_obj.id,
-         shader->stream_output.num_outputs, path,
-         (unsigned long long)shader->token_hash,
-         (unsigned long long)shader->spirv_hash);
-   }
-
-   if (shader->tokens) {
-      snprintf(path, sizeof(path),
-               YTTRIUM_SHADER_DUMP_DIR
-               "\\yttrium_%s_pid%lu_id%u_so_%016llx.tgsi",
-               yttrium_shader_stage_name(shader->stage),
-               (unsigned long)pid, shader->id,
-               (unsigned long long)shader->spirv_hash);
-      path[sizeof(path) - 1] = '\0';
-      file = fopen(path, "w");
-      if (file) {
-         yttrium_write_shader_capture_metadata(file, shader);
-         yttrium_shader_write_stream_output_metadata(file, shader);
-         tgsi_dump_to_file(shader->tokens, 0, file);
-         fclose(file);
-         yttrium_trace_debug_stringf(
-            "yttrium: shader_stream_output_dump wrote stage=%s pid=%lu "
-            "id=%u kind=tgsi module_id=%llu outputs=%u path=%s "
-            "token_hash=0x%llx spirv_hash=0x%llx",
-            yttrium_shader_stage_name(shader->stage), (unsigned long)pid,
-            shader->id, (unsigned long long)shader->module_obj.id,
-            shader->stream_output.num_outputs, path,
-            (unsigned long long)shader->token_hash,
-            (unsigned long long)shader->spirv_hash);
-      }
-   }
-
-   if (shader->nir) {
-      snprintf(path, sizeof(path),
-               YTTRIUM_SHADER_DUMP_DIR
-               "\\yttrium_%s_pid%lu_id%u_so_%016llx.nir",
-               yttrium_shader_stage_name(shader->stage),
-               (unsigned long)pid, shader->id,
-               (unsigned long long)shader->spirv_hash);
-      path[sizeof(path) - 1] = '\0';
-      file = fopen(path, "w");
-      if (file) {
-         yttrium_write_shader_capture_metadata(file, shader);
-         yttrium_shader_write_stream_output_metadata(file, shader);
-         nir_print_shader(shader->nir, file);
-         fclose(file);
-         yttrium_trace_debug_stringf(
-            "yttrium: shader_stream_output_dump wrote stage=%s pid=%lu "
-            "id=%u kind=nir module_id=%llu outputs=%u path=%s "
-            "token_hash=0x%llx spirv_hash=0x%llx",
-            yttrium_shader_stage_name(shader->stage), (unsigned long)pid,
-            shader->id, (unsigned long long)shader->module_obj.id,
-            shader->stream_output.num_outputs, path,
-            (unsigned long long)shader->token_hash,
-            (unsigned long long)shader->spirv_hash);
-      }
-   }
-}
-
 static bool
 yttrium_shader_apply_stream_output(struct yttrium_shader_state *shader)
 {
@@ -4562,7 +4061,6 @@ yttrium_shader_apply_stream_output(struct yttrium_shader_state *shader)
                       output->num_components, output->stream,
                       output->register_index, shader->info.num_outputs,
                       (unsigned long long)nir_outputs_written);
-         yttrium_shader_dump_stream_output_mapping_failure(shader);
          ralloc_free(xfb);
          return false;
       }
@@ -4719,8 +4217,9 @@ yttrium_shader_lower_legacy_shadow_for_spirv(nir_shader *nir)
  * view's channel layout.  The TGSI frontend uses R32 as a placeholder for
  * float/int/uint declarations; emitting that as a Vulkan image format loses
  * the other channels of RG/RGBA views.  Keep the image's GLSL numeric type,
- * but use Unknown for non-atomic texture images.  Buffers retain their typed
- * texel addressing, and native NIR helper images retain their exact formats.
+ * but use Unknown for non-atomic texture images and explicitly identified
+ * typed buffer images. Raw/structured DWORD buffers, atomics, and native NIR
+ * helper images retain their exact formats.
  */
 static bool
 yttrium_shader_image_access(nir_intrinsic_instr *intr,
@@ -4790,8 +4289,7 @@ yttrium_shader_lower_formatless_images(struct pipe_context *ctx,
 
    nir_foreach_variable_with_modes(var, shader->nir, nir_var_image) {
       const struct glsl_type *type = glsl_without_array(var->type);
-      if (!glsl_type_is_image(type) ||
-          glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_BUF)
+      if (!glsl_type_is_image(type))
          continue;
       /* Generated graphics variants clone the already lowered NIR.  Scan
        * their Unknown images again, without changing new typed helpers. */
@@ -4808,6 +4306,12 @@ yttrium_shader_lower_formatless_images(struct pipe_context *ctx,
                       binding);
          return false;
       }
+
+      const uint64_t bit =
+         1ull << (binding - YTTRIUM_SHADER_STORAGE_IMAGE_BINDING_BASE);
+      if (glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_BUF &&
+          !(shader->typed_buffer_image_mask & bit))
+         continue;
 
       bool read = false, write = false, atomic = false;
       nir_foreach_function_impl(impl, shader->nir) {
@@ -4859,8 +4363,6 @@ yttrium_shader_lower_formatless_images(struct pipe_context *ctx,
                       binding, numeric_type);
          return false;
       }
-      const uint64_t bit =
-         1ull << (binding - YTTRIUM_SHADER_STORAGE_IMAGE_BINDING_BASE);
       shader->formatless_image_mask |= bit;
       if (read)
          shader->formatless_image_read_mask |= bit;
@@ -4889,9 +4391,7 @@ yttrium_shader_lower_formatless_images(struct pipe_context *ctx,
                continue;
             nir_variable *var =
                nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
-            if (var && var->data.image.format == PIPE_FORMAT_NONE &&
-                glsl_get_sampler_dim(glsl_without_array(var->type)) !=
-                   GLSL_SAMPLER_DIM_BUF)
+            if (var && var->data.image.format == PIPE_FORMAT_NONE)
                nir_intrinsic_set_format(intr, PIPE_FORMAT_NONE);
          }
       }
@@ -4950,6 +4450,299 @@ yttrium_shader_lowered_ubo_mask(const struct yttrium_shader_state *shader)
    }
 
    return mask;
+}
+
+/* TGSI uses float-typed vector registers for integer builtins. Preserve their
+ * raw 32-bit values while exposing scalar integer SPIR-V interfaces. Only
+ * component zero belongs to an output builtin. */
+static bool
+yttrium_shader_scalarize_integer_builtin(nir_shader *nir,
+                                        nir_variable_mode mode,
+                                        gl_varying_slot location)
+{
+   /* Reject unsupported declarations and pointer uses before changing any
+    * variable. The observed TGSI register uses direct load/store derefs. */
+   nir_foreach_variable_with_modes(var, nir, mode) {
+      if (var->data.location != location ||
+          (glsl_type_is_scalar(var->type) &&
+           glsl_type_is_integer(var->type) && glsl_get_bit_size(var->type) == 32))
+         continue;
+      if (!glsl_type_is_vector_or_scalar(var->type) ||
+          glsl_get_bit_size(var->type) != 32 ||
+          glsl_get_components(var->type) > 4 || var->data.location_frac)
+         return false;
+
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_deref)
+                  continue;
+               nir_deref_instr *deref = nir_instr_as_deref(instr);
+               if (nir_deref_instr_get_variable(deref) != var)
+                  continue;
+               if (deref->deref_type != nir_deref_type_var)
+                  return false;
+               nir_foreach_use_including_if(use, &deref->def) {
+                  if (nir_src_is_if(use))
+                     return false;
+                  nir_instr *user = nir_src_parent_instr(use);
+                  if (user->type != nir_instr_type_intrinsic)
+                     return false;
+                  nir_intrinsic_instr *intr = nir_instr_as_intrinsic(user);
+                  if (use != &intr->src[0])
+                     return false;
+                  if (intr->intrinsic == nir_intrinsic_load_deref) {
+                     if (intr->def.bit_size != 32 ||
+                         !intr->def.num_components || intr->def.num_components > 4)
+                        return false;
+                  } else if (intr->intrinsic == nir_intrinsic_store_deref &&
+                             mode == nir_var_shader_out) {
+                     if (intr->src[1].ssa->bit_size != 32 ||
+                         !intr->src[1].ssa->num_components ||
+                         intr->src[1].ssa->num_components > 4)
+                        return false;
+                  } else {
+                     return false;
+                  }
+               }
+            }
+         }
+      }
+   }
+
+   bool progress = false;
+   nir_foreach_variable_with_modes_safe(var, nir, mode) {
+      if (var->data.location != location ||
+          (glsl_type_is_scalar(var->type) &&
+           glsl_type_is_integer(var->type) && glsl_get_bit_size(var->type) == 32))
+         continue;
+
+      nir_variable *scalar_var = nir_variable_clone(var, nir);
+      if (!scalar_var)
+         return false;
+      scalar_var->type = glsl_int_type();
+      scalar_var->data.interpolation = INTERP_MODE_FLAT;
+      nir_shader_add_variable(nir, scalar_var);
+      progress = true;
+
+      nir_foreach_function_impl(impl, nir) {
+         nir_builder b = nir_builder_create(impl);
+         bool impl_progress = false;
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_load_deref &&
+                   intr->intrinsic != nir_intrinsic_store_deref)
+                  continue;
+               if (nir_intrinsic_get_var(intr, 0) != var)
+                  continue;
+               b.cursor = nir_before_instr(instr);
+               nir_deref_instr *scalar = nir_build_deref_var(&b, scalar_var);
+               const enum gl_access_qualifier access = nir_intrinsic_access(intr);
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  nir_def *value = nir_load_deref_with_access(&b, scalar, access);
+                  value = nir_replicate(&b, value, intr->def.num_components);
+                  nir_def_rewrite_uses(&intr->def, value);
+               } else if (nir_intrinsic_write_mask(intr) & 1) {
+                  nir_store_deref_with_access(&b, scalar,
+                     nir_channel(&b, intr->src[1].ssa, 0), 1, access);
+               }
+               nir_instr_remove(instr);
+               impl_progress = true;
+            }
+         }
+         nir_progress(impl_progress, impl, nir_metadata_control_flow);
+      }
+   }
+   if (progress) {
+      nir_remove_dead_derefs(nir);
+      nir_remove_dead_variables(nir, mode, NULL);
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   }
+   return true;
+}
+
+static bool
+yttrium_shader_scalarize_fragment_layer_input(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return true;
+
+   return yttrium_shader_scalarize_integer_builtin(
+      nir, nir_var_shader_in, VARYING_SLOT_LAYER);
+}
+
+static bool
+yttrium_shader_scalarize_viewport_index(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_GEOMETRY &&
+       nir->info.stage != MESA_SHADER_FRAGMENT)
+      return true;
+
+   const nir_variable_mode mode = nir->info.stage == MESA_SHADER_GEOMETRY ?
+      nir_var_shader_out : nir_var_shader_in;
+   return yttrium_shader_scalarize_integer_builtin(
+      nir, mode, VARYING_SLOT_VIEWPORT);
+}
+
+struct yttrium_pow_value_walk {
+   nir_def **pending;
+   BITSET_WORD *visited;
+   unsigned num_pending;
+   unsigned num_defs;
+};
+
+static void
+yttrium_shader_pow_value_enqueue(struct yttrium_pow_value_walk *walk,
+                                 nir_def *def)
+{
+   assert(def->index < walk->num_defs);
+   if (BITSET_TEST(walk->visited, def->index))
+      return;
+
+   BITSET_SET(walk->visited, def->index);
+   assert(walk->num_pending < walk->num_defs);
+   walk->pending[walk->num_pending++] = def;
+}
+
+static bool
+yttrium_shader_preserve_scaled_pow_base(nir_shader *nir)
+{
+   /* Preserve a cancellation before scaling a pow base. Reassociating
+    * (a - b) * c into a fused multiply-add can turn an exact zero into a
+    * negative value: (36 - 36) * float(1 / 36) becomes -2^-27. A subsequent
+    * fractional pow then generates NaNs instead of zero lighting. The same
+    * cancellation can be represented by fadd after negation is propagated.
+    *
+    * Run after ntv_shader_prepare(), which reconstructs pow and can lower
+    * intervening phis to register loads/stores. Follow only multiplies and
+    * value transport back from the base; protect the matched sum/difference
+    * and its constant scale, not the remaining arithmetic or pow exponent.
+    * The visited SSA definitions also bound register/phi cycles. */
+   nir_foreach_function_impl(impl, nir) {
+      struct yttrium_pow_value_walk walk = {0};
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+
+            nir_alu_instr *power = nir_instr_as_alu(instr);
+            if (power->op != nir_op_fpow)
+               continue;
+
+            if (!walk.pending) {
+               walk.num_defs = impl->ssa_alloc;
+               walk.pending = calloc(walk.num_defs, sizeof(*walk.pending));
+               walk.visited = BITSET_CALLOC(walk.num_defs);
+               if (!walk.pending || !walk.visited) {
+                  free(walk.pending);
+                  free(walk.visited);
+                  return false;
+               }
+            }
+            yttrium_shader_pow_value_enqueue(&walk, power->src[0].src.ssa);
+         }
+      }
+
+      while (walk.num_pending) {
+         nir_def *def = walk.pending[--walk.num_pending];
+         nir_instr *instr = nir_def_instr(def);
+         switch (instr->type) {
+         case nir_instr_type_alu: {
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            switch (alu->op) {
+            case nir_op_fmul:
+               for (unsigned i = 0; i < 2; i++) {
+                  if (!nir_src_is_const(alu->src[1 - i].src))
+                     continue;
+                  nir_instr *sum_instr = nir_def_instr(alu->src[i].src.ssa);
+                  if (sum_instr->type != nir_instr_type_alu)
+                     continue;
+                  nir_alu_instr *sum = nir_instr_as_alu(sum_instr);
+                  if (sum->op != nir_op_fsub && sum->op != nir_op_fadd)
+                     continue;
+
+                  sum->fp_math_ctrl |= nir_fp_exact;
+                  alu->fp_math_ctrl |= nir_fp_exact;
+               }
+               yttrium_shader_pow_value_enqueue(&walk, alu->src[0].src.ssa);
+               yttrium_shader_pow_value_enqueue(&walk, alu->src[1].src.ssa);
+               break;
+            case nir_op_mov:
+               yttrium_shader_pow_value_enqueue(&walk, alu->src[0].src.ssa);
+               break;
+            case nir_op_bcsel:
+            case nir_op_b8csel:
+            case nir_op_b16csel:
+            case nir_op_b32csel:
+            case nir_op_fcsel:
+            case nir_op_fcsel_gt:
+            case nir_op_fcsel_ge:
+               yttrium_shader_pow_value_enqueue(&walk, alu->src[1].src.ssa);
+               yttrium_shader_pow_value_enqueue(&walk, alu->src[2].src.ssa);
+               break;
+            default:
+               break;
+            }
+            break;
+         }
+         case nir_instr_type_phi: {
+            nir_phi_instr *phi = nir_instr_as_phi(instr);
+            nir_foreach_phi_src(src, phi)
+               yttrium_shader_pow_value_enqueue(&walk, src->src.ssa);
+            break;
+         }
+         case nir_instr_type_intrinsic: {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic == nir_intrinsic_load_reg &&
+                !nir_intrinsic_base(intr) &&
+                !nir_intrinsic_legacy_fabs(intr) &&
+                !nir_intrinsic_legacy_fneg(intr)) {
+               nir_intrinsic_instr *decl = nir_reg_get_decl(intr->src[0].ssa);
+               if (!nir_intrinsic_num_array_elems(decl))
+                  yttrium_shader_pow_value_enqueue(&walk, &decl->def);
+            } else if (intr->intrinsic == nir_intrinsic_decl_reg) {
+               /* The declaration is visited once even when several loads
+                * use the same phi web. Ignore nontransparent stores. */
+               nir_foreach_reg_store(use, intr) {
+                  nir_intrinsic_instr *store =
+                     nir_instr_as_intrinsic(nir_src_parent_instr(use));
+                  if (store->intrinsic == nir_intrinsic_store_reg &&
+                      !nir_intrinsic_base(store) &&
+                      !nir_intrinsic_legacy_fsat(store))
+                     yttrium_shader_pow_value_enqueue(&walk, store->src[0].ssa);
+               }
+            }
+            break;
+         }
+         default:
+            break;
+         }
+      }
+      free(walk.pending);
+      free(walk.visited);
+   }
+   return true;
+}
+
+static bool
+yttrium_shader_preflight_spirv_phis(const struct yttrium_shader_state *shader)
+{
+   nir_foreach_function_impl(impl, shader->nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_phi)
+               continue;
+            YTTRIUM_WARN("yttrium: shader_compile_spirv rejected owner=yttrium-shader reason=unlowered_phi stage=%s id=%u token_hash=0x%llx action=reject-shader\n",
+                         yttrium_shader_stage_name(shader->stage), shader->id,
+                         (unsigned long long)shader->token_hash);
+            return false;
+         }
+      }
+   }
+   return true;
 }
 
 static bool
@@ -5078,7 +4871,34 @@ yttrium_shader_make_spirv(struct pipe_context *ctx,
       nir_shader_gather_info(shader->nir,
                              nir_shader_get_entrypoint(shader->nir));
 
+   if (!yttrium_shader_scalarize_fragment_layer_input(shader->nir)) {
+      YTTRIUM_ERROR("yttrium: shader_compile_spirv failed stage=%s id=%u "
+                    "owner=integer-builtin-lowering builtin=Layer "
+                    "reason=unsupported_declaration_or_use "
+                    "token_hash=0x%llx action=fail-shader\n",
+                    yttrium_shader_stage_name(shader->stage), shader->id,
+                    (unsigned long long)shader->token_hash);
+      return false;
+   }
+   if (!yttrium_shader_scalarize_viewport_index(shader->nir)) {
+      YTTRIUM_ERROR("yttrium: shader_compile_spirv failed stage=%s id=%u "
+                    "owner=integer-builtin-lowering builtin=ViewportIndex "
+                    "reason=unsupported_declaration_or_use "
+                    "token_hash=0x%llx action=fail-shader\n",
+                    yttrium_shader_stage_name(shader->stage), shader->id,
+                    (unsigned long long)shader->token_hash);
+      return false;
+   }
+
+   /* Preserve a SYNC memory fence and its optional adjacent rendezvous as
+    * one scoped barrier before NTV lowers the shader out of SSA. */
+   nir_opt_combine_barriers(shader->nir, NULL, NULL);
    ntv_shader_prepare(shader->nir);
+   if (!yttrium_shader_preserve_scaled_pow_base(shader->nir)) {
+      YTTRIUM_WARN("yttrium: shader_compile_spirv skipped stage=%s id=%u reason=pow_base_preservation_oom\n",
+                   yttrium_shader_stage_name(shader->stage), shader->id);
+      return false;
+   }
    if (!yttrium_shader_compact_ntv_descriptor_locations(shader)) {
       YTTRIUM_WARN("yttrium: shader_compile_spirv skipped stage=%s id=%u reason=descriptor_driver_location_failed token_hash=0x%llx\n",
                    yttrium_shader_stage_name(shader->stage), shader->id,
@@ -5146,6 +4966,8 @@ yttrium_shader_make_spirv(struct pipe_context *ctx,
       return false;
 
    yttrium_shader_scan_image_arrays(shader);
+   if (!yttrium_shader_preflight_spirv_phis(shader))
+      return false;
 
    shader->spirv = nir_to_spirv(shader->nir, &ntv_info);
    if (!shader->spirv || !shader->spirv->words ||
@@ -5169,7 +4991,6 @@ yttrium_shader_make_spirv(struct pipe_context *ctx,
 
    struct yttrium_spirv_probe probe;
    if (!yttrium_shader_probe_spirv(shader, &probe)) {
-      yttrium_shader_log_spirv_probe(shader, &probe);
       YTTRIUM_WARN("yttrium: shader_compile_spirv skipped stage=%s id=%u reason=malformed_spirv failure=%s words=%u spirv_hash=0x%llx token_hash=0x%llx bad_offset=%u bad_words=%u bad_opcode=%u\n",
                    yttrium_shader_stage_name(shader->stage),
                    shader->id,
@@ -5180,24 +5001,9 @@ yttrium_shader_make_spirv(struct pipe_context *ctx,
                    probe.bad_word_offset,
                    probe.bad_word_count,
                    probe.bad_opcode);
-      yttrium_shader_dump_spirv_failure(shader, "malformed_spirv", 0);
       return false;
    }
-   yttrium_shader_log_spirv_probe(shader, &probe);
 
-   YTTRIUM_LOG("yttrium: shader_compile_spirv stage=%s id=%u spirv_words=%u spirv_hash=0x%llx resource_free=%u ubo_only=%u texture_only=%u sampler_mask=0x%x ubo_mask=0x%x ubo_default=%u ubo_first=%u ubo_count=%u\n",
-                yttrium_shader_stage_name(shader->stage),
-                shader->id,
-                shader->spirv_word_count,
-                (unsigned long long)shader->spirv_hash,
-                shader->resource_free,
-                shader->uniform_buffer_only,
-                shader->sampled_texture_only,
-                shader->sampler_used_mask,
-                shader->ubo_used_mask,
-                shader->ubo_default,
-                shader->ubo_first,
-                shader->ubo_count);
    return true;
 }
 
@@ -5213,7 +5019,6 @@ yttrium_shader_make_module(struct pipe_context *ctx,
    const size_t code_size = shader->spirv->num_words * sizeof(uint32_t);
    struct yttrium_spirv_probe probe;
    if (!yttrium_shader_probe_spirv(shader, &probe)) {
-      yttrium_shader_log_spirv_probe(shader, &probe);
       YTTRIUM_WARN("yttrium: shader_module_preflight failed stage=%s id=%u reason=malformed_spirv failure=%s spirv_words=%u spirv_hash=0x%llx token_hash=0x%llx bad_offset=%u bad_words=%u bad_opcode=%u\n",
                    yttrium_shader_stage_name(shader->stage),
                    shader->id,
@@ -5224,7 +5029,6 @@ yttrium_shader_make_module(struct pipe_context *ctx,
                    probe.bad_word_offset,
                    probe.bad_word_count,
                    probe.bad_opcode);
-      yttrium_shader_dump_spirv_failure(shader, "module_preflight", 0);
       return false;
    }
 
@@ -5272,20 +5076,9 @@ yttrium_shader_make_module(struct pipe_context *ctx,
                    probe.push_constant_variables,
                    probe.private_variables,
                    probe.location_decorations);
-      yttrium_shader_dump_spirv_failure(shader, "venus_create_module", result);
       return false;
    }
 
-   YTTRIUM_LOG("yttrium: shader_module_create stage=%s id=%u module_id=%llu module=%p spirv_words=%u spirv_hash=0x%llx resource_free=%u\n",
-                yttrium_shader_stage_name(shader->stage),
-                shader->id,
-                (unsigned long long)shader->module_obj.id,
-                (void *)shader->module,
-                shader->spirv_word_count,
-                (unsigned long long)shader->spirv_hash,
-                shader->resource_free);
-   yttrium_shader_dump_sampled_success(shader);
-   yttrium_shader_dump_stream_output_success(shader);
    return true;
 }
 
@@ -5321,8 +5114,10 @@ yttrium_shader_state_create_with_shared(struct pipe_context *ctx,
    shader->uses_sample_shading = -1;
    shader->static_shared_mem = static_shared_mem;
    yttrium_shader_init_sampler_binding_map(shader);
-   if (state)
+   if (state) {
       shader->stream_output = state->stream_output;
+      shader->typed_buffer_image_mask = state->typed_buffer_image_mask;
+   }
 
    if (state && state->type == PIPE_SHADER_IR_TGSI && state->tokens) {
       shader->tokens = tgsi_dup_tokens(state->tokens);
@@ -5342,8 +5137,6 @@ yttrium_shader_state_create_with_shared(struct pipe_context *ctx,
             shader);
          return NULL;
       }
-      yttrium_shader_trace_sampler_info(shader, "create_tgsi_scan");
-      yttrium_shader_trace_io_info(shader, "create_tgsi_scan");
       yttrium_trace_debug_stringf(
          "yttrium: shader_create stage=%s id=%u state=%p ir=tgsi token_count=%u token_hash=0x%llx inputs=%u outputs=%u constbufs=0x%x samplers=0x%x instructions=%u writes_z=%u uses_kill=%u",
          yttrium_shader_stage_name(stage),
@@ -5361,9 +5154,6 @@ yttrium_shader_state_create_with_shared(struct pipe_context *ctx,
    } else if (state && state->type == PIPE_SHADER_IR_NIR && state->ir.nir) {
       shader->nir = state->ir.nir;
       nir_tgsi_scan_shader(shader->nir, &shader->info, true);
-      yttrium_shader_trace_sampler_info(shader, "create_nir_scan");
-      yttrium_shader_trace_io_info(shader, "create_nir_scan");
-      yttrium_shader_trace_nir_samplers(shader, "create_nir_scan");
       yttrium_trace_debug_stringf(
          "yttrium: shader_create stage=%s id=%u state=%p ir=nir nir=%p inputs=%u outputs=%u",
          yttrium_shader_stage_name(stage),
@@ -5424,25 +5214,15 @@ yttrium_shader_state_create_with_shared(struct pipe_context *ctx,
       shader->nir->info.shared_size = shader->static_shared_mem;
 
    if (compile_enabled && shader->nir) {
-      yttrium_shader_trace_io_info(shader, "pre_spirv");
       if (!yttrium_shader_make_spirv(ctx, shader)) {
          YTTRIUM_WARN("yttrium: shader_compile_spirv failed stage=%s id=%u ir=%u token_hash=0x%llx; native shader unavailable\n",
                       yttrium_shader_stage_name(stage),
                       shader->id,
                       shader->type,
                       (unsigned long long)shader->token_hash);
-      } else if (module_enabled) {
-         if (yttrium_shader_state_is_placeholder_module(shader)) {
-            YTTRIUM_LOG("yttrium: shader_module_skip stage=%s id=%u reason=placeholder spirv_words=%u inputs=%u outputs=%u instructions=%u writes_z=%u uses_kill=%u\n",
-                        yttrium_shader_stage_name(stage),
-                        shader->id,
-                        shader->spirv_word_count,
-                        shader->info.num_inputs,
-                        shader->info.num_outputs,
-                        shader->info.num_instructions,
-                        shader->info.writes_z,
-                        shader->info.uses_kill);
-         } else if (!yttrium_shader_make_module(ctx, shader)) {
+      } else if (module_enabled &&
+                 !yttrium_shader_state_is_placeholder_module(shader)) {
+         if (!yttrium_shader_make_module(ctx, shader)) {
             YTTRIUM_WARN("yttrium: shader_module_unavailable stage=%s id=%u spirv_words=%u spirv_hash=0x%llx; native shader unavailable\n",
                          yttrium_shader_stage_name(stage),
                          shader->id,
@@ -5764,6 +5544,7 @@ yttrium_create_compute_state(struct pipe_context *ctx,
    struct pipe_shader_state shader_state;
    memset(&shader_state, 0, sizeof(shader_state));
    shader_state.type = state->ir_type;
+   shader_state.typed_buffer_image_mask = state->typed_buffer_image_mask;
    if (state->ir_type == PIPE_SHADER_IR_TGSI) {
       shader_state.tokens = (const struct tgsi_token *)state->prog;
       shader_state.sampler_binding_map = state->sampler_binding_map;
@@ -5823,6 +5604,7 @@ yttrium_get_vs_stream_output_variant(struct pipe_context *ctx,
    memset(&state, 0, sizeof(state));
    state.type = PIPE_SHADER_IR_TGSI;
    state.tokens = base_vs->tokens;
+   state.typed_buffer_image_mask = base_vs->typed_buffer_image_mask;
    state.stream_output = gs->stream_output;
 
    struct yttrium_shader_state *variant =
@@ -6035,85 +5817,4 @@ yttrium_delete_compute_state(struct pipe_context *ctx, void *state)
    if (state)
       yttrium_compute_pipeline_cache_invalidate(yttrium_context(ctx), state);
    yttrium_delete_shader_state(ctx, state);
-}
-
-void
-yttrium_dump_capture_shader(const struct yttrium_shader_state *shader,
-                            const char *path)
-{
-   FILE *file;
-
-   if (!shader || !shader->tokens || !path || !path[0])
-      return;
-
-   file = fopen(path, "w");
-   if (!file) {
-      YTTRIUM_LOG("yttrium: textured draw capture shader fopen failed path=%s\n",
-                   path);
-      return;
-   }
-
-   tgsi_dump_to_file(shader->tokens, 0, file);
-   fclose(file);
-   YTTRIUM_LOG("yttrium: textured draw capture shader wrote path=%s\n",
-                path);
-}
-
-void
-yttrium_write_shader_capture_metadata(FILE *file,
-                                      const struct yttrium_shader_state *shader)
-{
-   if (!file || !shader)
-      return;
-
-   fprintf(file,
-           "shader.%s id=%u state=%p ir=%u tokens=%p token_count=%u token_hash=0x%llx spirv_words=%u spirv_hash=0x%llx inputs=%u outputs=%u constbufs=0x%x samplers=0x%x instructions=%u writes_z=%u uses_kill=%u\n",
-           yttrium_shader_stage_name(shader->stage),
-           shader->id,
-           (const void *)shader,
-           shader->type,
-           (const void *)shader->tokens,
-           shader->token_count,
-           (unsigned long long)shader->token_hash,
-           shader->spirv_word_count,
-           (unsigned long long)shader->spirv_hash,
-           shader->info.num_inputs,
-           shader->info.num_outputs,
-           shader->info.const_buffers_declared,
-           yttrium_shader_info_sampled_texture_mask(&shader->info),
-           shader->info.num_instructions,
-           shader->info.writes_z,
-           shader->info.uses_kill);
-
-   for (unsigned i = 0; i < shader->info.num_inputs; i++) {
-      fprintf(file,
-              "shader.%s.input[%u] semantic=%u index=%u usage=0x%x interp=%u loc=%u\n",
-              yttrium_shader_stage_name(shader->stage), i,
-              shader->info.input_semantic_name[i],
-              shader->info.input_semantic_index[i],
-              shader->info.input_usage_mask[i],
-              shader->info.input_interpolate[i],
-              shader->info.input_interpolate_loc[i]);
-   }
-
-   for (unsigned i = 0; i < shader->info.num_outputs; i++) {
-      fprintf(file,
-              "shader.%s.output[%u] semantic=%u index=%u usage=0x%x streams=0x%x\n",
-              yttrium_shader_stage_name(shader->stage), i,
-              shader->info.output_semantic_name[i],
-              shader->info.output_semantic_index[i],
-              shader->info.output_usagemask[i],
-              shader->info.output_streams[i]);
-   }
-
-   for (unsigned i = 0; i < MIN2(PIPE_MAX_SHADER_SAMPLER_VIEWS, 32); i++) {
-      if (yttrium_shader_info_sampled_texture_mask(&shader->info) &
-          (1u << i)) {
-         fprintf(file,
-                 "shader.%s.sampler[%u] target=%u type=%u\n",
-                 yttrium_shader_stage_name(shader->stage), i,
-                 shader->info.sampler_targets[i],
-                 shader->info.sampler_type[i]);
-      }
-   }
 }

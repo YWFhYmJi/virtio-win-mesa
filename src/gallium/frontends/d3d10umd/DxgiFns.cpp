@@ -31,9 +31,7 @@
  */
 
 #include <stdint.h>
-#include <stdarg.h>
 #include <windows.h>
-#include <stdio.h>
 #include <string.h>
 #include <winerror.h>
 #include <winnt.h>
@@ -51,8 +49,6 @@
 #include "frontend/winsys_handle.h"
 #include "pipe/p_defines.h"
 #include "pipe/p_state.h"
-#include "util/format/u_format.h"
-#include "util/u_debug.h"
 #include "util/u_inlines.h"
 #include "gallium/winsys/yttrium/gdi/yttrium_gdi_public.h"
 
@@ -82,6 +78,14 @@ dxgi_sync_yttrium_primary_identity(Device *device, Resource *resource)
 
    yttrium_gdi_resource_set_primary_target(resource->resource,
                                            resource->yttrium_primary);
+}
+
+static bool
+dxgi_is_optimal_composition_resource(Device *device, Resource *resource)
+{
+   return dxgi_is_yttrium_screen(device) && resource && resource->resource &&
+      (resource->resource->bind & PIPE_BIND_DISPLAY_TARGET) &&
+      yttrium_gdi_resource_is_optimal_shared(resource->resource);
 }
 
 static D3DKMT_HANDLE
@@ -129,183 +133,6 @@ dxgi_flush_frontbuffer(Device *device,
 }
 
 /*
- * Each of these re-reads the environment on every call, and this predicate
- * gates the present path.  The config cannot change after start-up, so answer
- * once and keep it.
- */
-static bool
-dxgi_yttrium_trace_option(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0)
-      enabled = yttrium_gdi_debug_get_bool_option(
-                   "D3D10UMD_YTTRIUM_DXGI_TRACE", false) ? 1 : 0;
-
-   return enabled != 0;
-}
-
-static bool
-dxgi_yttrium_debug_trace_option(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0)
-      enabled = yttrium_gdi_debug_get_bool_option(
-                   "D3D10UMD_DEBUG_DXGI_TRACE", false) ? 1 : 0;
-
-   return enabled != 0;
-}
-
-DEBUG_GET_ONCE_BOOL_OPTION(dxgi_trace, "D3D10UMD_DEBUG_DXGI_TRACE", false)
-
-static bool
-dxgi_trace_enabled(Device *device)
-{
-   if (dxgi_is_yttrium_screen(device)) {
-      static volatile LONG logged_trace_config;
-      const bool yttrium_trace = dxgi_yttrium_trace_option();
-      const bool yttrium_debug_trace = dxgi_yttrium_debug_trace_option();
-      const bool mesa_debug_trace = debug_get_option_dxgi_trace();
-
-      if (InterlockedCompareExchange(&logged_trace_config, 1, 0) == 0) {
-         yttrium_gdi_user_logf(
-            "yttrium: dxgi trace config YTTRIUM_DXGI_TRACE=%u DEBUG_DXGI_TRACE(config/env)=%u DEBUG_DXGI_TRACE(mesa-env)=%u enabled=%u\n",
-            yttrium_trace, yttrium_debug_trace, mesa_debug_trace,
-            yttrium_trace || yttrium_debug_trace || mesa_debug_trace);
-      }
-
-      return yttrium_trace || yttrium_debug_trace || mesa_debug_trace;
-   }
-
-   return debug_get_option_dxgi_trace();
-}
-
-static void
-dxgi_trace_printf(Device *device, const char *format, ...)
-{
-   char message[1024];
-   va_list ap;
-
-   if (!format)
-      return;
-
-   va_start(ap, format);
-   vsnprintf(message, sizeof(message), format, ap);
-   va_end(ap);
-   message[sizeof(message) - 1] = '\0';
-
-   if (dxgi_is_yttrium_screen(device)) {
-      yttrium_gdi_user_logf("%s", message);
-      OutputDebugStringA(message);
-   } else {
-      DebugPrintf("%s", message);
-   }
-}
-
-static void
-dxgi_trace_resource(Device *device, const char *label, Resource *resource)
-{
-   if (!dxgi_trace_enabled(device)) {
-      return;
-   }
-
-   struct pipe_resource *pipe_resource = resource ? resource->resource : NULL;
-   if (!pipe_resource) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi %s resource=%p pipe_resource=%p\n",
-                        label, resource, pipe_resource);
-      return;
-   }
-
-   dxgi_trace_printf(device,
-                     "d3d10umd: dxgi %s resource=%p pipe_resource=%p target=%u %ux%ux%u levels=%u array=%u format=%s bind=0x%x flags=0x%x usage=%u samples=%u\n",
-                     label,
-                     resource,
-                     pipe_resource,
-                     pipe_resource->target,
-                     pipe_resource->width0,
-                     pipe_resource->height0,
-                     pipe_resource->depth0,
-                     pipe_resource->last_level + 1,
-                     pipe_resource->array_size,
-                     util_format_name(pipe_resource->format),
-                     pipe_resource->bind,
-                     pipe_resource->flags,
-                     pipe_resource->usage,
-                     pipe_resource->nr_samples);
-   yttrium_gdi_resource_debug_log(pipe_resource, label);
-}
-
-/*
- * Present model the runtime picked for this present, from the present history
- * token.  Distinguishes the GPU-composited paths (redirected_flip,
- * redirected_composition) from the legacy GDI redirection paths that win32k
- * services in software.
- */
-static const char *
-dxgi_present_model_name(unsigned model)
-{
-   static const char *names[] = {
-      "uninitialized",
-      "redirected_gdi",
-      "redirected_flip",
-      "redirected_blt",
-      "redirected_vistablt",
-      "screencapturefence",
-      "redirected_gdi_sysmem",
-      "redirected_composition",
-      "surfacecomplete",
-      "flipmanager",
-   };
-
-   return model < sizeof(names) / sizeof(names[0]) ? names[model] : "unknown";
-}
-
-static void
-dxgi_trace_present_context(Device *device, const char *label, void *context)
-{
-   if (!dxgi_trace_enabled(device)) {
-      return;
-   }
-
-   if (!context) {
-      dxgi_trace_printf(device, "d3d10umd: dxgi %s context=NULL\n",
-                        label);
-      return;
-   }
-
-   D3DKMT_PRESENT *present = (D3DKMT_PRESENT *)context;
-   dxgi_trace_printf(device,
-                     "d3d10umd: dxgi %s context=%p hWindow=%p hSource=0x%lx hDestination=0x%lx flags=0x%x flip=%u present_count=%u model=%u(%s) token_size=%u comp_binding=0x%llx src={%ld,%ld,%ld,%ld} dst={%ld,%ld,%ld,%ld} subrects=%u optimize=%u private_size=%u\n",
-                     label,
-                     context,
-                     present->hWindow,
-                     (unsigned long)present->hSource,
-                     (unsigned long)present->hDestination,
-                     present->Flags.Value,
-                     present->FlipInterval,
-                     present->PresentCount,
-                     (unsigned)present->PresentHistoryToken.Model,
-                     dxgi_present_model_name(
-                        (unsigned)present->PresentHistoryToken.Model),
-                     present->PresentHistoryToken.TokenSize,
-                     (unsigned long long)
-                        present->PresentHistoryToken.CompositionBindingId,
-                     present->SrcRect.left,
-                     present->SrcRect.top,
-                     present->SrcRect.right,
-                     present->SrcRect.bottom,
-                     present->DstRect.left,
-                     present->DstRect.top,
-                     present->DstRect.right,
-                     present->DstRect.bottom,
-                     present->SubRectCnt,
-                     present->bOptimizeForComposition ? 1 : 0,
-                     present->PrivateDriverDataSize);
-}
-
-/*
  * ----------------------------------------------------------------------
  *
  * _Present --
@@ -324,7 +151,6 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
    struct Device *device = CastDevice(pPresentData->hDevice);
    Resource *pSrcResource = CastResource(pPresentData->hSurfaceToPresent);
    const bool yttrium_screen = dxgi_is_yttrium_screen(device);
-   const bool trace = dxgi_trace_enabled(device);
    Resource *pDstResource = CastResource(pPresentData->hDstResource);
    D3DKMT_HANDLE src_alloc = 0;
    D3DKMT_HANDLE dst_alloc = 0;
@@ -333,24 +159,6 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
       pPresentData->pDXGIContext ?
          (const D3DKMT_PRESENT *)pPresentData->pDXGIContext : NULL;
 
-   if (trace) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi Present src=%p dst=%p src_sub=%u dst_sub=%u dxgi_ctx=%p flags=0x%x flip_interval=%u screen=%s\n",
-                        (void *)pPresentData->hSurfaceToPresent,
-                        (void *)pPresentData->hDstResource,
-                        pPresentData->SrcSubResourceIndex,
-                        pPresentData->DstSubResourceIndex,
-                        pPresentData->pDXGIContext,
-                        pPresentData->Flags.Value,
-                        pPresentData->FlipInterval,
-                        dxgi_screen_name(device));
-      dxgi_trace_resource(device, "Present src", pSrcResource);
-      if (pPresentData->hDstResource) {
-         dxgi_trace_resource(device, "Present dst",
-                             CastResource(pPresentData->hDstResource));
-      }
-      dxgi_trace_present_context(device, "Present", pPresentData->pDXGIContext);
-   }
 
    if (yttrium_screen) {
       src_alloc = dxgi_get_d3dkmt_allocation(device, pSrcResource);
@@ -374,16 +182,25 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
          dxgi_present_context ? dxgi_present_context->PresentCount : 0,
          0,
          0);
-      yttrium_gdi_trace_debugf("yttrium: dxgi present src_resource=%p dst_resource=%p src_alloc=0x%lx dst_alloc=0x%lx src_sub=%u dst_sub=%u dxgi_context=%p flags=0x%x flip_interval=%u\n",
-                               (void *)pPresentData->hSurfaceToPresent,
-                               (void *)pPresentData->hDstResource,
-                               (unsigned long)src_alloc,
-                               (unsigned long)dst_alloc,
-                               pPresentData->SrcSubResourceIndex,
-                               pPresentData->DstSubResourceIndex,
-                               pPresentData->pDXGIContext,
-                               pPresentData->Flags.Value,
-                               pPresentData->FlipInterval);
+   }
+
+   /* A runtime/KMD blt writes the allocation, not canonical optimal storage.
+    * UMD GPU Blt below is different: it writes the canonical pipe image and
+    * publishes its endpoint. Do not allow a reverse CPU writer here. */
+   if (yttrium_screen && pDstResource && pDstResource->resource &&
+       (yttrium_gdi_resource_is_optimal_present(pDstResource->resource) ||
+        yttrium_gdi_resource_is_optimal_shared(pDstResource->resource))) {
+      yttrium_gdi_user_logf("yttrium: ERROR optimal image Present destination rejected owner=Present component=d3d10umd reason=external-write-bypasses-canonical-storage action=fail-present\n");
+      return DXGI_DDI_ERR_UNSUPPORTED;
+   }
+
+   if ((dxgi_is_optimal_composition_resource(device, pSrcResource) ||
+        (yttrium_screen && pSrcResource &&
+         yttrium_gdi_resource_is_optimal_present(pSrcResource->resource))) &&
+       (pPresentData->SrcSubResourceIndex || pPresentData->DstSubResourceIndex ||
+        pPresentData->hDstResource)) {
+      yttrium_gdi_user_logf("yttrium: ERROR optimal image Present rejected owner=Present component=d3d10umd reason=only-one-whole-surface-qualified action=fail-present\n");
+      return DXGI_DDI_ERR_UNSUPPORTED;
    }
 
    /* dxgi_flush_frontbuffer publishes this Yttrium Present asynchronously. */
@@ -443,10 +260,6 @@ _Present(DXGI_DDI_ARG_PRESENT *pPresentData)
          present_result = present_info.status;
    }
 
-   if (trace) {
-      dxgi_trace_printf(device, "d3d10umd: dxgi Present complete src=%p\n",
-                        (void *)pPresentData->hSurfaceToPresent);
-   }
    if (yttrium_screen) {
       yttrium_gdi_trace_dxgi_present(
          YTTRIUM_GDI_TRACE_DXGI_PRESENT_END,
@@ -522,7 +335,6 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
    
    Device* device = CastDevice(SetDisplayMode->hDevice);
    Resource *res = CastResource(SetDisplayMode->hResource);
-   const bool trace = dxgi_trace_enabled(device);
 
    if (!res || !res->resource) {
       yttrium_gdi_trace_warnf("yttrium: dxgi SetDisplayMode failed owner=d3d10umd "
@@ -532,21 +344,15 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
       return E_INVALIDARG;
    }
 
-   if (trace) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi SetDisplayMode resource=%p sub=%u screen=%s\n",
-                        (void *)SetDisplayMode->hResource,
-                        SetDisplayMode->SubResourceIndex,
-                        dxgi_screen_name(device));
-      dxgi_trace_resource(device, "SetDisplayMode", res);
+   if (dxgi_is_yttrium_screen(device) &&
+       yttrium_gdi_resource_is_optimal_shared(res->resource)) {
+      yttrium_gdi_user_logf("yttrium: ERROR optimal shared mode set rejected owner=SetDisplayMode component=d3d10umd reason=opaque-storage-is-not-scanout action=fail-mode-set\n");
+      return DXGI_DDI_ERR_UNSUPPORTED;
    }
+
 
    if(!device->screen->resource_get_handle) {
       LOG_UNSUPPORTED_ENTRYPOINT();
-      if (trace) {
-         dxgi_trace_printf(device,
-                           "d3d10umd: dxgi SetDisplayMode skipped: resource_get_handle missing\n");
-      }
       return DXGI_DDI_ERR_UNSUPPORTED;
    }
 
@@ -555,11 +361,6 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
    handle.type = WINSYS_HANDLE_TYPE_D3DKMT_ALLOC;
    if(!device->screen->resource_get_handle(device->screen, NULL, res->resource, &handle, 0)) {
       LOG_UNSUPPORTED_ENTRYPOINT();
-      if (trace) {
-         dxgi_trace_printf(device,
-                           "d3d10umd: dxgi SetDisplayMode skipped: resource_get_handle failed resource=%p\n",
-                           (void *)SetDisplayMode->hResource);
-      }
       return E_FAIL;
    };
 
@@ -567,14 +368,6 @@ _SetDisplayMode( DXGI_DDI_ARG_SETDISPLAYMODE *SetDisplayMode )
       static_cast<D3DKMT_HANDLE>(reinterpret_cast<uintptr_t>(handle.handle));
    NTSTATUS status =
       device->device.base.setDisplayMode(&device->device.base, kmt_handle);
-   if (trace) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi SetDisplayMode hAllocation=0x%lx status=0x%lx stride=%u size=0x%llx\n",
-                        (unsigned long)kmt_handle,
-                        status,
-                        handle.stride,
-                        (unsigned long long)handle.size);
-   }
 
    return (HRESULT)status;
 }
@@ -637,19 +430,7 @@ _RotateResourceIdentities(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *RotateResourc
    LOG_ENTRYPOINT();
 
    Device *device = CastDevice(RotateResourceIdentities->hDevice);
-   const bool trace = dxgi_trace_enabled(device);
 
-   if (trace) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi RotateResourceIdentities count=%u\n",
-                        RotateResourceIdentities->Resources);
-      for (UINT i = 0; i < RotateResourceIdentities->Resources; ++i) {
-         char label[64];
-         snprintf(label, sizeof(label), "Rotate before[%u]", i);
-         dxgi_trace_resource(device, label,
-                             CastResource(RotateResourceIdentities->pResources[i]));
-      }
-   }
 
    if (RotateResourceIdentities->Resources <= 1) {
       return S_OK;
@@ -728,14 +509,6 @@ _RotateResourceIdentities(DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES *RotateResourc
 
    device->shader_resource_views_dirty = true;
 
-   if (trace) {
-      for (UINT i = 0; i < RotateResourceIdentities->Resources; ++i) {
-         char label[64];
-         snprintf(label, sizeof(label), "Rotate after[%u]", i);
-         dxgi_trace_resource(device, label,
-                             CastResource(RotateResourceIdentities->pResources[i]));
-      }
-   }
 
    return S_OK;
 }
@@ -760,32 +533,17 @@ _Blt(DXGI_DDI_ARG_BLT *Blt)
    Device *device = CastDevice(Blt->hDevice);
    Resource *dst = CastResource(Blt->hDstResource);
    Resource *src = CastResource(Blt->hSrcResource);
-   const bool trace = dxgi_trace_enabled(device);
 
-   if (trace) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi Blt dst=%p dst_sub=%u rect=%u,%u-%u,%u src=%p src_sub=%u flags=0x%x present=%u resolve=%u convert=%u stretch=%u rotate=%u\n",
-                        (void *)Blt->hDstResource,
-                        Blt->DstSubresource,
-                        Blt->DstLeft,
-                        Blt->DstTop,
-                        Blt->DstRight,
-                        Blt->DstBottom,
-                        (void *)Blt->hSrcResource,
-                        Blt->SrcSubresource,
-                        Blt->Flags.Value,
-                        Blt->Flags.Present,
-                        Blt->Flags.Resolve,
-                        Blt->Flags.Convert,
-                        Blt->Flags.Stretch,
-                        Blt->Rotate);
-      dxgi_trace_resource(device, "Blt dst", dst);
-      dxgi_trace_resource(device, "Blt src", src);
-   }
 
    if (!device || !device->pipe || !dst || !src || !dst->resource ||
        !src->resource) {
       return E_INVALIDARG;
+   }
+
+   if (dxgi_is_optimal_composition_resource(device, src) ||
+       dxgi_is_optimal_composition_resource(device, dst)) {
+      yttrium_gdi_user_logf("yttrium: ERROR optimal composition Blt rejected owner=DXGI-Blt component=d3d10umd reason=legacy-and-reverse-composition-blits-not-qualified action=fail-blt\n");
+      return DXGI_DDI_ERR_UNSUPPORTED;
    }
 
    struct pipe_context *pipe = device->pipe;
@@ -822,10 +580,6 @@ _Blt(DXGI_DDI_ARG_BLT *Blt)
       dxgi_flush_frontbuffer(device, dst_resource, dst_level, dst_layer, NULL);
    }
 
-   if (trace) {
-      dxgi_trace_printf(device, "d3d10umd: dxgi Blt complete present=%u\n",
-                        Blt->Flags.Present);
-   }
 
    return S_OK;
 }
@@ -839,6 +593,16 @@ _ResolveSharedResource(DXGI_DDI_ARG_RESOLVESHAREDRESOURCE *Resolve)
    if (!Resolve)
       return E_INVALIDARG;
 
+   Device *device = CastDevice(Resolve->hDevice);
+   Resource *resource = CastResource(Resolve->hResource);
+   if (!device || !device->pipe || !resource || !resource->resource)
+      return E_INVALIDARG;
+
+   if (dxgi_is_yttrium_screen(device)) {
+      if (!yttrium_gdi_flush_handoff(device->pipe,
+                                      "DXGI resolve shared resource"))
+         return DXGI_ERROR_DEVICE_REMOVED;
+   }
    return S_OK;
 }
 
@@ -853,36 +617,17 @@ _Blt1(DXGI_DDI_ARG_BLT1 *Blt)
    Device *device = CastDevice(Blt->hDevice);
    Resource *dst = CastResource(Blt->hDstResource);
    Resource *src = CastResource(Blt->hSrcResource);
-   const bool trace = dxgi_trace_enabled(device);
 
-   if (trace) {
-      dxgi_trace_printf(device,
-                        "d3d10umd: dxgi Blt1 dst=%p dst_sub=%u rect=%u,%u-%u,%u src=%p src_sub=%u src_rect=%u,%u-%u,%u flags=0x%x present=%u resolve=%u convert=%u stretch=%u rotate=%u\n",
-                        (void *)Blt->hDstResource,
-                        Blt->DstSubresource,
-                        Blt->DstLeft,
-                        Blt->DstTop,
-                        Blt->DstRight,
-                        Blt->DstBottom,
-                        (void *)Blt->hSrcResource,
-                        Blt->SrcSubresource,
-                        Blt->SrcLeft,
-                        Blt->SrcTop,
-                        Blt->SrcRight,
-                        Blt->SrcBottom,
-                        Blt->Flags.Value,
-                        Blt->Flags.Present,
-                        Blt->Flags.Resolve,
-                        Blt->Flags.Convert,
-                        Blt->Flags.Stretch,
-                        Blt->Rotate);
-      dxgi_trace_resource(device, "Blt1 dst", dst);
-      dxgi_trace_resource(device, "Blt1 src", src);
-   }
 
    if (!device || !device->pipe || !dst || !src || !dst->resource ||
        !src->resource) {
       return E_INVALIDARG;
+   }
+
+   if (dxgi_is_optimal_composition_resource(device, src) ||
+       dxgi_is_optimal_composition_resource(device, dst)) {
+      yttrium_gdi_user_logf("yttrium: ERROR optimal composition Blt rejected owner=DXGI-Blt component=d3d10umd reason=legacy-and-reverse-composition-blits-not-qualified action=fail-blt\n");
+      return DXGI_DDI_ERR_UNSUPPORTED;
    }
 
    struct pipe_context *pipe = device->pipe;
@@ -926,10 +671,6 @@ _Blt1(DXGI_DDI_ARG_BLT1 *Blt)
       dxgi_flush_frontbuffer(device, dst_resource, dst_level, dst_layer, NULL);
    }
 
-   if (trace) {
-      dxgi_trace_printf(device, "d3d10umd: dxgi Blt1 complete present=%u\n",
-                        Blt->Flags.Present);
-   }
 
    return S_OK;
 }
@@ -1003,11 +744,76 @@ _Present1(DXGI_DDI_ARG_PRESENT1 *Present)
       return E_INVALIDARG;
    }
 
+   Device *device = CastDevice(Present->hDevice);
+   const UINT selected_source = Present->SurfacesToPresent - 1;
+   if (dxgi_is_yttrium_screen(device)) {
+      Resource *destination = CastResource(Present->hDstResource);
+      if (destination && destination->resource &&
+          (yttrium_gdi_resource_is_optimal_present(destination->resource) ||
+           yttrium_gdi_resource_is_optimal_shared(destination->resource))) {
+         yttrium_gdi_user_logf("yttrium: ERROR optimal image Present1 destination rejected owner=Present1 component=d3d10umd reason=external-write-bypasses-canonical-storage action=fail-present\n");
+         return DXGI_DDI_ERR_UNSUPPORTED;
+      }
+      bool optimal_batch = false;
+      if (Present->SurfacesToPresent > 1) {
+         for (UINT i = 0; i < Present->SurfacesToPresent; ++i) {
+            Resource *resource = CastResource(Present->phSurfacesToPresent[i].hSurface);
+            if (resource && resource->resource &&
+                (yttrium_gdi_resource_is_optimal_shared(resource->resource) ||
+                 yttrium_gdi_resource_is_optimal_present(resource->resource))) {
+               optimal_batch = true;
+               break;
+            }
+         }
+      }
+      /* Present1 releases every source in one ownership batch. Canonical
+       * optimal-shared images need no per-resource publication copy; the
+       * ordered Present flush releases all acquired external images. Mixed
+       * optimal batches must first qualify every role's publication. Legacy-
+       * only arrays retain their existing publication policy. */
+      for (UINT i = 0; i < Present->SurfacesToPresent; ++i) {
+         Resource *resource = CastResource(Present->phSurfacesToPresent[i].hSurface);
+         const bool shared = resource && resource->resource &&
+            yttrium_gdi_resource_is_optimal_shared(resource->resource);
+         const bool endpoint = resource && resource->resource &&
+            yttrium_gdi_resource_is_optimal_present(resource->resource);
+         const char *reason = NULL;
+         HRESULT failure = DXGI_DDI_ERR_UNSUPPORTED;
+         if (!resource || !resource->resource) {
+            reason = "invalid-source-resource";
+            failure = E_INVALIDARG;
+         } else if (optimal_batch && !shared) {
+            reason = "multi-source-requires-canonical-optimal-shared";
+         } else if ((shared || endpoint) &&
+                    Present->phSurfacesToPresent[i].SubResourceIndex) {
+            reason = "source-subresource-not-qualified";
+         } else if ((shared || endpoint) && Present->hDstResource) {
+            reason = "explicit-destination-not-qualified";
+         } else if ((shared || endpoint) && Present->DstSubResourceIndex) {
+            reason = "destination-subresource-not-qualified";
+         }
+         if (reason) {
+            yttrium_gdi_user_logf("yttrium: ERROR optimal image Present1 rejected owner=Present1 component=d3d10umd reason=%s sources=%u selected_index=%u source_index=%u resource=%p source_subresource=%u shared=%u endpoint=%u destination=%p destination_subresource=%u flags=0x%x flip_interval=%u dxgi_context=%p action=fail-present\n",
+                                 reason, Present->SurfacesToPresent,
+                                 selected_source, i,
+                                 (void *)Present->phSurfacesToPresent[i].hSurface,
+                                 Present->phSurfacesToPresent[i].SubResourceIndex,
+                                 shared, endpoint, (void *)Present->hDstResource,
+                                 Present->DstSubResourceIndex, Present->Flags.Value,
+                                 Present->FlipInterval, Present->pDXGIContext);
+            return failure;
+         }
+      }
+   }
+
+   /* DXGI carries the whole ownership batch in its opaque context. Its single
+    * Present callback must translate the LAST source, not issue one callback
+    * per surface. Keep that context and the presentation flags unchanged. */
    DXGI_DDI_ARG_PRESENT legacy = {};
    legacy.hDevice = Present->hDevice;
-   legacy.hSurfaceToPresent = Present->phSurfacesToPresent[0].hSurface;
+   legacy.hSurfaceToPresent = Present->phSurfacesToPresent[selected_source].hSurface;
    legacy.SrcSubResourceIndex =
-      Present->phSurfacesToPresent[0].SubResourceIndex;
+      Present->phSurfacesToPresent[selected_source].SubResourceIndex;
    legacy.hDstResource = Present->hDstResource;
    legacy.DstSubResourceIndex = Present->DstSubResourceIndex;
    legacy.pDXGIContext = Present->pDXGIContext;

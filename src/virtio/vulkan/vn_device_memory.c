@@ -10,9 +10,14 @@
 
 #include "vn_device_memory.h"
 
+#include "util/log.h"
+
 #include "venus-protocol/vn_protocol_driver_device_memory.h"
 #if defined(HAVE_YTTRIUM)
+#include <winternl.h>
+
 #include "venus-protocol/vn_protocol_driver_image.h"
+#include "gallium/winsys/yttrium/gdi/yttrium_shared_image.h"
 #endif
 #include "venus-protocol/vn_protocol_driver_transport.h"
 #include "vk_debug_utils.h"
@@ -151,108 +156,6 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
 
    return VK_SUCCESS;
 }
-
-#if defined(HAVE_YTTRIUM)
-static uint32_t
-vn_choose_memory_type(const VkPhysicalDeviceMemoryProperties *props,
-                      uint32_t type_bits,
-                      VkMemoryPropertyFlags preferred_flags)
-{
-   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
-      if (!(type_bits & BITFIELD_BIT(i)))
-         continue;
-      if ((props->memoryTypes[i].propertyFlags & preferred_flags) ==
-          preferred_flags)
-         return i;
-   }
-
-   return type_bits ? ffs(type_bits) - 1 : UINT32_MAX;
-}
-
-VkResult
-vn_device_memory_import_win32_handle(struct vn_device *dev,
-                                     struct vn_device_memory *mem,
-                                     const VkMemoryAllocateInfo *alloc_info,
-                                     void *handle)
-{
-   const VkMemoryType *mem_type =
-      &dev->physical_device->memory_properties
-          .memoryTypes[alloc_info->memoryTypeIndex];
-
-   struct vn_renderer_bo *bo;
-   VkResult result = vn_renderer_bo_create_from_win32_handle(
-      dev->renderer, alloc_info->allocationSize, handle,
-      mem_type->propertyFlags, &bo);
-   if (result != VK_SUCCESS)
-      return result;
-
-   vn_ring_roundtrip(dev->primary_ring);
-
-   VkMemoryResourcePropertiesMESA props = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
-   };
-   result = vn_call_vkGetMemoryResourcePropertiesMESA(
-      dev->primary_ring, vn_device_to_handle(dev), bo->res_id, &props);
-   if (result != VK_SUCCESS) {
-      vn_renderer_bo_unref(dev->renderer, bo);
-      return result;
-   }
-
-   const VkMemoryDedicatedAllocateInfo *dedicated_info =
-      vk_find_struct_const(alloc_info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
-   uint32_t memory_type_bits = props.memoryTypeBits;
-   VkDeviceSize allocation_size = alloc_info->allocationSize;
-
-   if (dedicated_info && dedicated_info->image != VK_NULL_HANDLE) {
-      VkMemoryRequirements reqs;
-      vn_call_vkGetImageMemoryRequirements(dev->primary_ring,
-                                           vn_device_to_handle(dev),
-                                           dedicated_info->image, &reqs);
-      memory_type_bits &= reqs.memoryTypeBits;
-      allocation_size = MAX2(allocation_size, reqs.size);
-   }
-
-   const uint32_t memory_type_index =
-      vn_choose_memory_type(&dev->physical_device->memory_properties,
-                            memory_type_bits,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-   if (memory_type_index == UINT32_MAX) {
-      vn_renderer_bo_unref(dev->renderer, bo);
-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   }
-
-   mem->base.vk.memory_type_index = memory_type_index;
-
-   VkMemoryDedicatedAllocateInfo local_dedicated_info;
-   VkImportMemoryResourceInfoMESA import_info = {
-      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
-      .pNext = NULL,
-      .resourceId = bo->res_id,
-   };
-   if (dedicated_info) {
-      local_dedicated_info = *dedicated_info;
-      local_dedicated_info.pNext = NULL;
-      import_info.pNext = &local_dedicated_info;
-   }
-
-   const VkMemoryAllocateInfo memory_info = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .pNext = &import_info,
-      .allocationSize = allocation_size,
-      .memoryTypeIndex = memory_type_index,
-   };
-   result = vn_device_memory_alloc_simple(dev, mem, &memory_info);
-   if (result != VK_SUCCESS) {
-      vn_renderer_bo_unref(dev->renderer, bo);
-      return result;
-   }
-
-   mem->base_bo = bo;
-   vn_wsi_memory_info_init(mem, &memory_info);
-
-   return VK_SUCCESS;
-}
-#endif
 
 static VkResult
 vn_device_memory_alloc_guest_vram(struct vn_device *dev,
@@ -457,6 +360,93 @@ vn_device_memory_emit_report(struct vn_device *dev,
                                 mem_type->heapIndex);
 }
 
+#if defined(HAVE_YTTRIUM)
+VkResult
+vn_device_memory_import_win32_image(
+   struct vn_device *dev, VkImage image, struct vn_renderer_bo *bo,
+   const struct yttrium_optimal_image_data *data,
+   const VkAllocationCallbacks *alloc, VkDeviceMemory *out)
+{
+   VkDevice device = vn_device_to_handle(dev);
+   VkMemoryDedicatedRequirements dedicated = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+   };
+   VkMemoryRequirements2 requirements = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+      .pNext = &dedicated,
+   };
+   const VkImageMemoryRequirementsInfo2 image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = image,
+   };
+   vn_call_vkGetImageMemoryRequirements2(dev->primary_ring, device,
+                                          &image_info, &requirements);
+   const VkMemoryRequirements *reqs = &requirements.memoryRequirements;
+   VkMemoryResourcePropertiesMESA properties = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
+   };
+   vn_ring_roundtrip(dev->primary_ring);
+   VkResult result = vn_call_vkGetMemoryResourcePropertiesMESA(
+      dev->primary_ring, device, bo->res_id, &properties);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const uint32_t type = data->memory_type_index;
+   if (type >= dev->physical_device->memory_properties.memoryTypeCount ||
+       !(reqs->memoryTypeBits & properties.memoryTypeBits & (1u << type)) ||
+       !(dev->physical_device->memory_properties.memoryTypes[type].propertyFlags &
+         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ||
+       !reqs->alignment || data->memory_alignment % reqs->alignment ||
+       reqs->size > data->allocation.Size ||
+       (dedicated.requiresDedicatedAllocation && !data->dedicated)) {
+      mesa_loge("venus: Win32 shared image memory rejected "
+                "owner=device-memory reason=allocation-contract-mismatch "
+                "memory_type=%u image_bits=0x%x resource_bits=0x%x "
+                "required_size=%llu shared_size=%llu action=fail-import",
+                type, reqs->memoryTypeBits, properties.memoryTypeBits,
+                (unsigned long long)reqs->size,
+                (unsigned long long)data->allocation.Size);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   const VkImportMemoryResourceInfoMESA import_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+      .resourceId = bo->res_id,
+   };
+   const VkMemoryDedicatedAllocateInfo dedicated_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+      .pNext = &import_info,
+      .image = image,
+   };
+   const VkMemoryAllocateInfo memory_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = data->dedicated ? (const void *)&dedicated_info :
+                                (const void *)&import_info,
+      .allocationSize = data->allocation.Size,
+      .memoryTypeIndex = type,
+   };
+   struct vn_device_memory *mem = vk_device_memory_create(
+      &dev->base.vk, &memory_info, alloc, sizeof(*mem));
+   if (!mem)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
+   VkDeviceMemory memory = vn_device_memory_to_handle(mem);
+   /* This is the external allocation handoff: know whether the import was
+    * accepted before transferring ownership of the opened resource. */
+   result = vn_call_vkAllocateMemory(dev->primary_ring, device, &memory_info,
+                                      NULL, &memory);
+   vn_device_memory_emit_report(dev, mem, true, result);
+   if (result != VK_SUCCESS) {
+      vk_device_memory_destroy(&dev->base.vk, alloc, &mem->base.vk);
+      return result;
+   }
+   mem->base_bo = bo;
+   mem->dedicated_img = vn_image_from_handle(image);
+   *out = memory;
+   return VK_SUCCESS;
+}
+#endif
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_AllocateMemory(VkDevice device,
                   const VkMemoryAllocateInfo *pAllocateInfo,
@@ -474,16 +464,6 @@ vn_AllocateMemory(VkDevice device,
 
    const VkImportMemoryFdInfoKHR *import_fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
-#if defined(HAVE_YTTRIUM)
-   const struct wsi_memory_win32_handle_import_info *import_win32_info = NULL;
-   vk_foreach_struct_const(pnext, pAllocateInfo->pNext) {
-      if (pnext->sType ==
-          VK_STRUCTURE_TYPE_WSI_MEMORY_WIN32_HANDLE_IMPORT_INFO_MESA) {
-         import_win32_info = (const void *)pnext;
-         break;
-      }
-   }
-#endif
 
    VkResult result;
    if (mem->base.vk.ahardware_buffer) {
@@ -491,11 +471,6 @@ vn_AllocateMemory(VkDevice device,
    } else if (import_fd_info) {
       result = vn_device_memory_import_dma_buf(dev, mem, pAllocateInfo,
                                                import_fd_info->fd);
-#if defined(HAVE_YTTRIUM)
-   } else if (import_win32_info) {
-      result = vn_device_memory_import_win32_handle(dev, mem, pAllocateInfo,
-                                                    import_win32_info->handle);
-#endif
    } else {
       result = vn_device_memory_alloc(dev, mem, pAllocateInfo);
       if (result == VK_SUCCESS)

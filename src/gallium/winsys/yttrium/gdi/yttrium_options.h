@@ -25,29 +25,6 @@ yttrium_gdi_debug_get_bool_option(const char *name, bool dfault);
 bool
 yttrium_gdi_static_ubo_sampled_cache_enabled(void);
 
-/*
- * When scheduled Present is disabled, this defaults on: application-owned
- * fullscreen scanouts are published by the ordered worker through the scanout
- * escape after GPU completion. Set
- * D3D10UMD_YTTRIUM_PRESENT_TIMELINE_SYNC=0 to force those Presents through the
- * legacy pfnPresentCb path.  Windowed/DWM Presents always use pfnPresentCb.
- */
-bool
-yttrium_present_timeline_sync_enabled(void);
-
-/*
- * Enabled by default: ordinary runtime Presents enter pfnPresentCb only after
- * the ordered worker has issued their asynchronous render publication.  Set
- * D3D10UMD_YTTRIUM_PRESENT_ISSUANCE_WAIT=0 only for profiling; doing so can
- * publish rotating allocations out of order and resurface older frames or
- * cursor positions.
- */
-bool
-yttrium_present_issuance_wait_enabled(void);
-
-bool
-yttrium_gdi_debug_has_option(const char *name);
-
 int64_t
 yttrium_gdi_debug_get_num_option(const char *name, int64_t dfault);
 

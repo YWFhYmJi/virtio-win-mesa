@@ -6,7 +6,6 @@
 #include "yttrium_present.h"
 
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 #include <windows.h>
 #include <winternl.h>
@@ -17,17 +16,11 @@
 #include "pipe/p_screen.h"
 
 #include "yttrium_context.h"
-#include "yttrium_draw.h"
 #include "yttrium_gdi_public.h"
 #include "yttrium_internal.h"
-#include "yttrium_options.h"
 #include "yttrium_resource.h"
 #include "yttrium_trace.h"
 #include "yttrium_venus.h"
-
-bool
-yttrium_ensure_display_mapped(struct pipe_context *ctx,
-                              struct yttrium_resource *res);
 
 static struct pipe_context *
 yttrium_present_driver_context(struct pipe_context *ctx)
@@ -53,7 +46,7 @@ yttrium_prepare_present_publication(void *data)
    if (!publication)
       return E_FAIL;
    if (publication->issuance &&
-       !yttrium_gdi_wait_flush_issuance(publication->issuance, 5000))
+       !yttrium_gdi_wait_flush_issuance(publication->issuance))
       return E_FAIL;
    if (publication->producer)
       return publication->producer->wait_present(publication->producer,
@@ -84,13 +77,62 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
    struct pipe_context *driver_ctx = yttrium_present_driver_context(ctx);
    struct yttrium_context *yctx = yttrium_context(driver_ctx);
 
-   /* Before the early returns, so a failed Present still counts. */
-   yttrium_rt_stats_frame_advance();
-
    if (!res || !res->hAllocation || !yctx || !yctx->kmt_ctx) {
       if (present_status)
          present_status->status = E_FAIL;
       YTTRIUM_WARN("yttrium: present failed, missing display allocation or context\n");
+      return;
+   }
+
+   /* These runtime-shared window inputs are canonical GPU storage. The
+    * compositor consumes them through pfnPresentCb; no scanout command may
+    * reinterpret their opaque layout as linear pixels. */
+   if (res->optimal_shared_image && res->display_target &&
+       (!present_info || !present || level || layer ||
+        !present->Flags.RedirectedFlip || present->Flags.Flip ||
+        present->Flags.Blt || present->Flags.RedirectedBlt ||
+        present_info->application_scanout || present_info->hDstAllocation)) {
+      YTTRIUM_WARN("yttrium: ERROR optimal composition Present rejected owner=yttrium-present component=optimal-shared reason=only-redirected-flip-qualified flags=0x%x allocation=0x%lx action=fail-present\n",
+                   present ? present->Flags.Value : 0,
+                   (unsigned long)res->hAllocation);
+      if (present_status)
+         present_status->status = E_INVALIDARG;
+      return;
+   }
+
+   const bool legacy_endpoint =
+      yttrium_resource_is_legacy_optimal_present(res);
+   /* Local legacy outputs publish after a canonical GPU copy/draw, including
+    * the NULL-context DXGI Blt route. Primary and opaque composition contracts
+    * retain their stricter flip-only qualification above/below. */
+   if (res->optimal_present_image &&
+       (level || layer ||
+        (legacy_endpoint && present_info && present_info->hDstAllocation) ||
+        (!legacy_endpoint &&
+         (!present_info || !present ||
+          !(present->Flags.Flip || present->Flags.RedirectedFlip) ||
+          present->Flags.Blt || present->Flags.RedirectedBlt)))) {
+      YTTRIUM_WARN("yttrium: ERROR optimal display Present rejected owner=yttrium-present component=linear-endpoint role=%s reason=%s flags=0x%x allocation=0x%lx action=fail-present\n",
+                   legacy_endpoint ? "local-legacy" : "primary",
+                   legacy_endpoint ? "legacy-destination-or-subresource-not-qualified" :
+                      "only-flip-consumers-qualified",
+                   present ? present->Flags.Value : 0,
+                   (unsigned long)res->hAllocation);
+      if (present_status)
+         present_status->status = E_INVALIDARG;
+      InterlockedExchange(&yctx->draw_failure, 1);
+      gdikmt_device_report_reset(screen->device, PIPE_UNKNOWN_CONTEXT_RESET);
+      return;
+   }
+
+   /* Publication is ordered with rendering on the same worker. Its copy must
+    * precede the existing producer-ready signal, including the NULL-context
+    * Present-blt route which has no normal Present callback below. */
+   if (res->optimal_present_image &&
+       !yttrium_gdi_publish_display_endpoint(frontend_ctx, resource,
+                                              "optimal display Present")) {
+      if (present_status)
+         present_status->status = E_FAIL;
       return;
    }
 
@@ -120,7 +162,7 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
    const bool scheduled = present_ctx->scheduled_present_mode != 0;
    struct gdikmt_context *producer = present_ctx;
    const bool worker_publish =
-      !scheduled && yttrium_present_timeline_sync_enabled() && present_info &&
+      !scheduled && present_info &&
       present_info->version >= 3 && present_info->application_scanout;
 
    if (worker_publish) {
@@ -140,8 +182,7 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
       /*
        * The worker owns the only publication path.  Calling pfnPresentCb here
        * would let the miniport race an unordered scanout update against the
-       * completion-ordered escape.  Setting PRESENT_TIMELINE_SYNC=0 skips this
-       * branch and deliberately restores pfnPresentCb for fullscreen testing.
+       * completion-ordered escape.
        */
       if (present_status)
          present_status->status = S_OK;
@@ -149,7 +190,6 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
    }
 
    struct yttrium_gdi_flush_issuance *issuance = NULL;
-   const bool wait_for_issuance = yttrium_present_issuance_wait_enabled();
    struct yttrium_present_publication publication = {0};
 
    if (scheduled) {
@@ -171,7 +211,7 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
          if (present_status) present_status->status = E_FAIL;
          return;
       }
-   } else if (wait_for_issuance) {
+   } else {
       issuance = yttrium_gdi_flush_async_issuance(
          frontend_ctx, "display Present publication");
       if (!issuance) {
@@ -179,9 +219,6 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
             present_status->status = E_FAIL;
          return;
       }
-   } else {
-      yttrium_gdi_flush_labeled(frontend_ctx, NULL, PIPE_FLUSH_ASYNC,
-                                "display Present publication");
    }
 
    publication.issuance = issuance;
@@ -194,11 +231,8 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
    device_present_info.hDstAllocation =
       present_info ? present_info->hDstAllocation : 0;
    device_present_info.status = S_OK;
-   if (scheduled || wait_for_issuance) {
-      device_present_info.prepare_present =
-         yttrium_prepare_present_publication;
-      device_present_info.prepare_present_data = &publication;
-   }
+   device_present_info.prepare_present = yttrium_prepare_present_publication;
+   device_present_info.prepare_present_data = &publication;
 
    NTSTATUS status = screen->device->present(present_ctx, res->hAllocation,
                                              &device_present_info, boxes);
@@ -218,36 +252,6 @@ yttrium_flush_frontbuffer(struct pipe_screen *pscreen,
                    present ? present->FlipInterval : 0,
                    present ? present->PresentCount : 0);
    }
-}
-
-void
-yttrium_format_indexed_path(char *dst, size_t dst_size,
-                            const char *path, unsigned index)
-{
-   const char *marker;
-   size_t prefix_len;
-
-   if (!dst || !dst_size)
-      return;
-
-   dst[0] = '\0';
-   if (!path)
-      return;
-
-   marker = strstr(path, "%u");
-   if (!marker) {
-      snprintf(dst, dst_size, "%s", path);
-      return;
-   }
-
-   prefix_len = (size_t)(marker - path);
-   if (prefix_len >= dst_size)
-      prefix_len = dst_size - 1;
-
-   memcpy(dst, path, prefix_len);
-   dst[prefix_len] = '\0';
-   snprintf(dst + prefix_len, dst_size - prefix_len, "%u%s",
-            index, marker + 2);
 }
 
 bool

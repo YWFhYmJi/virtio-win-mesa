@@ -117,6 +117,11 @@ struct gdikmt_device {
    volatile LONG reset_callback_notified;
    struct pipe_device_reset_callback reset_callback;
 
+   /* Set only when Windows explicitly reports removal, independently of a
+    * locally detected transport fault. Private GPU escapes are no longer valid;
+    * allocation deallocation still belongs to the runtime/KMT backend. */
+   volatile LONG device_removed;
+
    void (*destroy)(struct gdikmt_device* device);
 
    NTSTATUS (*queryAdapterInfo)(
@@ -131,6 +136,10 @@ struct gdikmt_device {
     VOID*                   pPrivateDriverData,
     UINT                    PrivateDriverDataSize
    );
+
+   /* Query OS execution state without submitting work to the GPU. */
+   NTSTATUS (*queryDeviceState)(struct gdikmt_device *device,
+                                D3DKMT_DEVICEEXECUTION_STATE *state);
 
    NTSTATUS (*createContext)(struct gdikmt_device* device, struct gdikmt_context** out_ctx);
 
@@ -154,6 +163,12 @@ gdikmt_device_get_reset_status(struct gdikmt_device *device)
 
    return (enum pipe_reset_status)InterlockedCompareExchange(
       &device->reset_status, PIPE_NO_RESET, PIPE_NO_RESET);
+}
+
+static inline bool
+gdikmt_device_is_removed(struct gdikmt_device *device)
+{
+   return device && InterlockedCompareExchange(&device->device_removed, 0, 0);
 }
 
 static inline void
@@ -185,6 +200,18 @@ gdikmt_device_set_reset_callback(
    gdikmt_device_notify_reset(device);
 }
 
+/* The frontend is reporting this loss through its runtime error callback.
+ * Publish the notification claim first so backend workers cannot recursively
+ * report removal through that same callback. Keep the first reset reason.
+ */
+static inline void
+gdikmt_device_record_runtime_reset(struct gdikmt_device *device)
+{
+   InterlockedExchange(&device->reset_callback_notified, 1);
+   InterlockedCompareExchange(&device->reset_status, PIPE_UNKNOWN_CONTEXT_RESET,
+                              PIPE_NO_RESET);
+}
+
 static inline void
 gdikmt_device_report_reset(struct gdikmt_device *device,
                            enum pipe_reset_status status)
@@ -197,6 +224,15 @@ gdikmt_device_report_reset(struct gdikmt_device *device,
    gdikmt_device_notify_reset(device);
 }
 
+static inline void
+gdikmt_device_report_removal(struct gdikmt_device *device)
+{
+   if (!device)
+      return;
+
+   InterlockedExchange(&device->device_removed, 1);
+   gdikmt_device_report_reset(device, PIPE_UNKNOWN_CONTEXT_RESET);
+}
 
 #ifdef __cplusplus
 extern "C" {

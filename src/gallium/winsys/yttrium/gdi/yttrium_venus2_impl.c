@@ -56,6 +56,7 @@
 #include "venus-protocol/vn_protocol_driver_transport.h"
 
 #include "yttrium_venus2_private.h"
+#include "yttrium_internal.h"
 
 #define YTTRIUM_VENUS_UBO_ARENA_PRE_SIZE_DEFAULT \
    (4ull * 1024ull * 1024ull)
@@ -91,6 +92,33 @@
          _failure;                                                       \
       }                                                                  \
    } while (0)
+
+static bool
+yttrium_venus_srgb_color_format(VkFormat format)
+{
+   return format == VK_FORMAT_R8G8B8A8_SRGB ||
+          format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+/* Image views otherwise inherit every image usage. Canonical UNORM storage
+ * also permits sRGB sampling/rendering, but sRGB has no storage-image usage.
+ * Restrict only that view format so cached UNORM views remain usable by both
+ * sampled and storage descriptors regardless of which creates them first. */
+static const void *
+yttrium_venus_image_view_usage(
+   const struct yttrium_venus_resource *resource, VkFormat format,
+   VkImageViewUsageCreateInfo *usage)
+{
+   if (!yttrium_venus_srgb_color_format(format) ||
+       !(resource->image_usage & VK_IMAGE_USAGE_STORAGE_BIT))
+      return NULL;
+
+   *usage = (VkImageViewUsageCreateInfo) {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+      .usage = resource->image_usage & ~VK_IMAGE_USAGE_STORAGE_BIT,
+   };
+   return usage;
+}
 
 static VkDeviceSize
 yttrium_venus_pre_size_option(const char *name, VkDeviceSize dfault)
@@ -486,7 +514,8 @@ yttrium_venus_unmap_memory(struct yttrium_venus *venus,
        !mapping->hAllocation)
       return;
 
-   if (mapping->map && mapping->map_is_blob) {
+   if (mapping->map && mapping->map_is_blob &&
+       !gdikmt_device_is_removed(venus->device)) {
       VIOGPU_ESCAPE unmap;
       memset(&unmap, 0, sizeof(unmap));
       unmap.Type = VIOGPU_RES_UNMAP_BLOB;
@@ -780,6 +809,7 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    bool have_vertex_attribute_divisor_khr = false;
    bool have_push_descriptor_ext = false;
    bool have_create_renderpass2_khr = false;
+   bool have_depth_stencil_resolve_khr = false;
    bool have_multisampled_render_to_single_sampled_ext = false;
    bool have_fragment_shader_interlock_ext = false;
    bool have_attachment_feedback_loop_layout_ext = false;
@@ -787,6 +817,12 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    bool have_load_store_op_none_ext = false;
    bool have_vulkan_memory_model_khr = false;
    bool have_custom_border_color_ext = false;
+   bool have_image_format_list_khr = false;
+   bool have_external_memory_dma_buf_ext = false;
+   bool have_external_memory_fd_khr = false;
+   bool have_image_drm_format_modifier_ext = false;
+   bool have_robustness2_ext = false;
+   bool have_texel_buffer_alignment_ext = false;
    uint32_t extension_count = 0;
    result = vn_call_vkEnumerateDeviceExtensionProperties(
       &venus->vn_ring, venus->physical_device, NULL, &extension_count, NULL);
@@ -819,6 +855,11 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
                                   VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME)) {
                   have_create_renderpass2_khr = true;
                } else if (!strcmp(extensions[i].extensionName,
+                                  VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME)) {
+                  have_depth_stencil_resolve_khr =
+                     vn_cs_renderer_protocol_has_extension(
+                        200 /* VK_KHR_depth_stencil_resolve */);
+               } else if (!strcmp(extensions[i].extensionName,
                                   VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME)) {
                   have_multisampled_render_to_single_sampled_ext = true;
                } else if (!strcmp(extensions[i].extensionName,
@@ -845,6 +886,36 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
                   have_custom_border_color_ext =
                      vn_cs_renderer_protocol_has_extension(
                         288 /* VK_EXT_custom_border_color */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) {
+                  have_image_format_list_khr =
+                     vn_cs_renderer_protocol_has_extension(
+                        148 /* VK_KHR_image_format_list */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
+                  have_external_memory_dma_buf_ext =
+                     vn_cs_renderer_protocol_has_extension(
+                        126 /* VK_EXT_external_memory_dma_buf */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+                  have_external_memory_fd_khr =
+                     vn_cs_renderer_protocol_has_extension(
+                        75 /* VK_KHR_external_memory_fd */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME)) {
+                  have_image_drm_format_modifier_ext =
+                     vn_cs_renderer_protocol_has_extension(
+                        159 /* VK_EXT_image_drm_format_modifier */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+                  have_robustness2_ext =
+                     vn_cs_renderer_protocol_has_extension(
+                        287 /* VK_EXT_robustness2 */);
+               } else if (!strcmp(extensions[i].extensionName,
+                                  VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME)) {
+                  have_texel_buffer_alignment_ext =
+                     vn_cs_renderer_protocol_has_extension(
+                        282 /* VK_EXT_texel_buffer_alignment */);
                }
             }
          }
@@ -921,6 +992,21 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       features_pnext = &transform_feedback;
    }
 
+   VkPhysicalDeviceRobustness2FeaturesEXT robustness2 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+   };
+   if (have_robustness2_ext) {
+      robustness2.pNext = features_pnext;
+      features_pnext = &robustness2;
+   }
+   VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT texel_buffer_alignment = {
+      .sType =
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT,
+   };
+   if (have_texel_buffer_alignment_ext) {
+      texel_buffer_alignment.pNext = features_pnext;
+      features_pnext = &texel_buffer_alignment;
+   }
    VkPhysicalDeviceFeatures2 features2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
       .pNext = features_pnext,
@@ -963,6 +1049,21 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       custom_border_color_props.pNext = properties_pnext;
       properties_pnext = &custom_border_color_props;
    }
+   VkPhysicalDeviceDepthStencilResolveProperties depth_resolve_props = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES,
+   };
+   if (have_depth_stencil_resolve_khr && have_create_renderpass2_khr) {
+      depth_resolve_props.pNext = properties_pnext;
+      properties_pnext = &depth_resolve_props;
+   }
+   VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT texel_buffer_props = {
+      .sType =
+         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT,
+   };
+   if (have_texel_buffer_alignment_ext) {
+      texel_buffer_props.pNext = properties_pnext;
+      properties_pnext = &texel_buffer_props;
+   }
    VkPhysicalDeviceProperties2 properties2 = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
       .pNext = properties_pnext,
@@ -970,6 +1071,35 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    vn_call_vkGetPhysicalDeviceProperties2(&venus->vn_ring,
                                           venus->physical_device,
                                           &properties2);
+   venus->texel_buffer_offset_alignment =
+      properties2.properties.limits.minTexelBufferOffsetAlignment;
+   venus->texel_buffer_alignment =
+      have_texel_buffer_alignment_ext && texel_buffer_alignment.texelBufferAlignment;
+   if (venus->texel_buffer_alignment &&
+       (!util_is_power_of_two_nonzero64(
+           texel_buffer_props.uniformTexelBufferOffsetAlignmentBytes) ||
+        !util_is_power_of_two_nonzero64(
+           texel_buffer_props.storageTexelBufferOffsetAlignmentBytes))) {
+      YTTRIUM_WARN("yttrium: invalid texel buffer alignment properties owner=venus2 uniform=0x%llx storage=0x%llx action=reject-device\n",
+                   (unsigned long long)texel_buffer_props.uniformTexelBufferOffsetAlignmentBytes,
+                   (unsigned long long)texel_buffer_props.storageTexelBufferOffsetAlignmentBytes);
+      return false;
+   }
+   venus->uniform_texel_buffer_alignment =
+      texel_buffer_props.uniformTexelBufferOffsetAlignmentBytes;
+   venus->storage_texel_buffer_alignment =
+      texel_buffer_props.storageTexelBufferOffsetAlignmentBytes;
+   venus->uniform_texel_buffer_single_texel_alignment =
+      texel_buffer_props.uniformTexelBufferOffsetSingleTexelAlignment;
+   venus->storage_texel_buffer_single_texel_alignment =
+      texel_buffer_props.storageTexelBufferOffsetSingleTexelAlignment;
+   venus->max_texel_buffer_elements =
+      properties2.properties.limits.maxTexelBufferElements;
+   venus->robust_buffer_access2 =
+      have_robustness2_ext && features2.features.robustBufferAccess &&
+      robustness2.robustBufferAccess2;
+   venus->null_descriptor =
+      venus->robust_buffer_access2 && robustness2.nullDescriptor;
    venus->uniform_buffer_offset_alignment =
       properties2.properties.limits.minUniformBufferOffsetAlignment;
    if (!util_is_power_of_two_nonzero64(
@@ -977,6 +1107,13 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       venus->uniform_buffer_offset_alignment = 256;
    venus->depth_bias_control =
       have_depth_bias_control_ext && depth_bias_control.depthBiasControl;
+   venus->depth_bias_exact =
+      venus->depth_bias_control && depth_bias_control.depthBiasExact;
+   venus->depth_bias_float =
+      venus->depth_bias_control && depth_bias_control.floatRepresentation;
+   venus->depth_bias_force_unorm = venus->depth_bias_control &&
+      depth_bias_control.leastRepresentableValueForceUnormRepresentation;
+   venus->depth_bias_clamp = features2.features.depthBiasClamp;
    venus->transform_feedback =
       have_transform_feedback_ext && transform_feedback.transformFeedback;
    venus->vertex_attribute_instance_rate_divisor =
@@ -1032,10 +1169,26 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    YTTRIUM_LOG("yttrium: Venus read-only depth capability load_store_op_none=%u khr=%u ext=%u\n",
                venus->load_store_op_none, have_load_store_op_none_khr,
                have_load_store_op_none_ext);
+   YTTRIUM_LOG("yttrium: Venus depth bias capabilities control=%u exact=%u float=%u force_unorm=%u clamp=%u owner=venus2\n",
+               venus->depth_bias_control, venus->depth_bias_exact,
+               venus->depth_bias_float, venus->depth_bias_force_unorm,
+               venus->depth_bias_clamp);
    venus->multisampled_render_to_single_sampled =
       have_multisampled_render_to_single_sampled_ext &&
       have_create_renderpass2_khr &&
       multisampled_render_to_single_sampled.multisampledRenderToSingleSampled;
+   venus->depth_stencil_resolve =
+      have_depth_stencil_resolve_khr && have_create_renderpass2_khr;
+   venus->depth_resolve_modes = depth_resolve_props.supportedDepthResolveModes;
+   venus->stencil_resolve_modes =
+      depth_resolve_props.supportedStencilResolveModes;
+   venus->independent_resolve_none = depth_resolve_props.independentResolveNone;
+   YTTRIUM_LOG("yttrium: Venus depth/stencil resolve capabilities owner=venus2 "
+               "enabled=%u depth_modes=0x%x stencil_modes=0x%x "
+               "independent_none=%u independent=%u\n",
+               venus->depth_stencil_resolve, venus->depth_resolve_modes,
+               venus->stencil_resolve_modes, venus->independent_resolve_none,
+               depth_resolve_props.independentResolve);
    venus->push_descriptor =
       have_push_descriptor_ext && push_descriptor_props.maxPushDescriptors;
    venus->max_push_descriptors =
@@ -1121,7 +1274,10 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
                venus->custom_border_colors,
                venus->max_custom_border_color_samplers);
    depth_bias_control.depthBiasControl = venus->depth_bias_control;
-   depth_bias_control.depthBiasExact = VK_FALSE;
+   depth_bias_control.depthBiasExact = venus->depth_bias_exact;
+   depth_bias_control.leastRepresentableValueForceUnormRepresentation =
+      venus->depth_bias_force_unorm;
+   depth_bias_control.floatRepresentation = venus->depth_bias_float;
    transform_feedback.transformFeedback = venus->transform_feedback;
    transform_feedback.geometryStreams = VK_FALSE;
    vertex_divisor.vertexAttributeInstanceRateDivisor =
@@ -1145,7 +1301,12 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    custom_border_color.customBorderColors = venus->custom_border_colors;
    custom_border_color.customBorderColorWithoutFormat =
       venus->custom_border_color_without_format;
+   robustness2.robustBufferAccess2 = venus->robust_buffer_access2;
+   robustness2.robustImageAccess2 = VK_FALSE;
+   robustness2.nullDescriptor = venus->null_descriptor;
+   texel_buffer_alignment.texelBufferAlignment = venus->texel_buffer_alignment;
    VkPhysicalDeviceFeatures enabled_features = {
+      .robustBufferAccess = venus->robust_buffer_access2,
       .drawIndirectFirstInstance = venus->draw_indirect_first_instance,
       .shaderClipDistance = features2.features.shaderClipDistance,
       .shaderCullDistance = features2.features.shaderCullDistance,
@@ -1158,6 +1319,7 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       .shaderUniformBufferArrayDynamicIndexing =
          features2.features.shaderUniformBufferArrayDynamicIndexing,
       .depthClamp = venus->depth_clamp,
+      .depthBiasClamp = venus->depth_bias_clamp,
       .dualSrcBlend = venus->dual_src_blend,
       .independentBlend = venus->independent_blend,
       .logicOp = venus->logic_op,
@@ -1172,7 +1334,15 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
       .multiViewport = venus->multi_viewport,
    };
 
-   const char *device_extensions[12];
+   /* The winsys requests Vulkan 1.1, so shared UNORM/sRGB image views need
+    * KHR_image_format_list even when the physical device supports 1.2. */
+   venus->shared_image_supported =
+      properties2.properties.apiVersion >= VK_API_VERSION_1_2 &&
+      have_image_format_list_khr && have_external_memory_dma_buf_ext &&
+      have_external_memory_fd_khr;
+   venus->image_drm_format_modifier =
+      venus->shared_image_supported && have_image_drm_format_modifier_ext;
+   const char *device_extensions[19];
    uint32_t device_extension_count = 0;
    if (venus->depth_bias_control)
       device_extensions[device_extension_count++] =
@@ -1190,12 +1360,16 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    if (venus->push_descriptor)
       device_extensions[device_extension_count++] =
          VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
-   if (venus->multisampled_render_to_single_sampled) {
+   if (venus->multisampled_render_to_single_sampled ||
+       venus->depth_stencil_resolve)
       device_extensions[device_extension_count++] =
          VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME;
+   if (venus->multisampled_render_to_single_sampled)
       device_extensions[device_extension_count++] =
          VK_EXT_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_EXTENSION_NAME;
-   }
+   if (venus->depth_stencil_resolve)
+      device_extensions[device_extension_count++] =
+         VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME;
    if (venus->fragment_shader_pixel_interlock)
       device_extensions[device_extension_count++] =
          VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME;
@@ -1213,6 +1387,24 @@ yttrium_venus_create_device_objects(struct yttrium_venus *venus)
    if (venus->custom_border_colors)
       device_extensions[device_extension_count++] =
          VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+   if (venus->shared_image_supported) {
+      device_extensions[device_extension_count++] =
+         VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
+      device_extensions[device_extension_count++] =
+         VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+      device_extensions[device_extension_count++] =
+         VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+   }
+   if (venus->image_drm_format_modifier)
+      device_extensions[device_extension_count++] =
+         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
+   if (have_robustness2_ext)
+      device_extensions[device_extension_count++] =
+         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME;
+   if (have_texel_buffer_alignment_ext)
+      device_extensions[device_extension_count++] =
+         VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME;
+   assert(device_extension_count <= ARRAY_SIZE(device_extensions));
 
    yttrium_venus_init_object(venus, &venus->device_obj);
    venus->device_handle = YTTRIUM_VENUS_HANDLE(VkDevice, &venus->device_obj);
@@ -1473,14 +1665,16 @@ yttrium_venus_storage_image_without_format_listed(VkFormat format)
 bool
 yttrium_venus2_storage_image_formatless_format_supported(
    struct yttrium_venus *venus, enum pipe_format format,
-   bool read, bool write)
+   bool read, bool write, bool buffer)
 {
    if (format == PIPE_FORMAT_NONE || (unsigned)format >= PIPE_FORMAT_COUNT ||
        !yttrium_venus2_storage_image_without_format_supported(venus,
                                                                read, write))
       return false;
 
-   uint8_t *cached = &venus->storage_image_formatless_formats[format];
+   uint8_t *cached = buffer ?
+      &venus->storage_buffer_formatless_formats[format] :
+      &venus->storage_image_formatless_formats[format];
    if (*cached)
       return *cached == 2;
 
@@ -1495,9 +1689,15 @@ yttrium_venus2_storage_image_formatless_format_supported(
    };
    vn_call_vkGetPhysicalDeviceFormatProperties2(
       &venus->vn_ring, venus->physical_device, vk_format, &properties);
-   const bool supported =
-      properties.formatProperties.optimalTilingFeatures &
-      VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+   /* Enabled core read/write-without-format features cover the restricted
+    * standard list above for both images and storage texel buffers.  Query
+    * the view kind independently; image support does not imply buffer support.
+    */
+   const bool supported = buffer ?
+      (properties.formatProperties.bufferFeatures &
+       VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT) != 0 :
+      (properties.formatProperties.optimalTilingFeatures &
+       VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
    *cached = supported ? 2 : 1;
    return supported;
 }
@@ -1792,6 +1992,29 @@ yttrium_venus_cmd_batch_transition_image(struct yttrium_venus *venus,
 }
 
 static bool
+yttrium_venus_display_endpoint_write_allowed(
+   struct yttrium_venus *venus,
+   const struct yttrium_venus_resource *resource, const char *operation)
+{
+   if (!resource || !resource->display_endpoint_imported)
+      return true;
+   YTTRIUM_WARN("yttrium: ERROR display endpoint write rejected owner=venus2 operation=%s reason=v3-consumer-only-linear-endpoint action=fail-operation\n", operation);
+   if (venus && venus->device)
+      gdikmt_device_report_reset(venus->device, PIPE_UNKNOWN_CONTEXT_RESET);
+   return false;
+}
+
+static void
+yttrium_venus_mark_render_aspects_initialized(
+   struct yttrium_venus_resource *resource, VkImageAspectFlags aspects)
+{
+   yttrium_venus_mark_aspects_initialized(resource, aspects);
+   if (resource && resource->display_endpoint && resource->display_endpoint_recording &&
+       (aspects & VK_IMAGE_ASPECT_COLOR_BIT))
+      yttrium_venus_shared_image_written(&resource->display_endpoint_state);
+}
+
+static bool
 yttrium_venus_cmd_ensure_image_initialized(struct yttrium_venus *venus,
                                            struct yttrium_venus_resource *resource,
                                            uint32_t resource_id)
@@ -1803,7 +2026,7 @@ yttrium_venus_cmd_ensure_image_initialized(struct yttrium_venus *venus,
        util_format_is_compressed(resource->owner->format)) {
       /* Vulkan forbids vkCmdClearColorImage for compressed formats.  D3D
        * leaves any unwritten parts of a newly created resource undefined. */
-      yttrium_venus_mark_aspects_initialized(resource,
+      yttrium_venus_mark_render_aspects_initialized(resource,
                                              VK_IMAGE_ASPECT_COLOR_BIT);
       return true;
    }
@@ -1832,15 +2055,14 @@ yttrium_venus_cmd_ensure_image_initialized(struct yttrium_venus *venus,
    const VkClearColorValue zero = {
       .float32 = { 0.0f, 0.0f, 0.0f, 0.0f },
    };
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource))
+      return false;
    vn_async_vkCmdClearColorImage(&venus->vn_ring, venus->command_buffer,
                                  resource->image,
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &zero, 1, &range);
-   yttrium_venus_mark_aspects_initialized(resource,
+   yttrium_venus_mark_render_aspects_initialized(resource,
                                           VK_IMAGE_ASPECT_COLOR_BIT);
-   YTTRIUM_LOG("yttrium: Venus initialized image res_id=%u image_id=%llu before partial update\n",
-                resource_id,
-                (unsigned long long)resource->image_obj.id);
    return true;
 }
 
@@ -1890,9 +2112,9 @@ yttrium_venus_cmd_ensure_depth_initialized(struct yttrium_venus *venus,
    const VkImageSubresourceRange range = {
       .aspectMask = yttrium_venus_format_aspects(resource->vk_format),
       .baseMipLevel = 0,
-      .levelCount = 1,
+      .levelCount = MAX2(resource->levels, 1),
       .baseArrayLayer = 0,
-      .layerCount = 1,
+      .layerCount = MAX2(resource->layers, 1),
    };
    yttrium_venus_cmd_transition_image(venus, resource,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1909,11 +2131,8 @@ yttrium_venus_cmd_ensure_depth_initialized(struct yttrium_venus *venus,
                                         resource->image,
                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                         &clear_value, 1, &range);
-   yttrium_venus_mark_aspects_initialized(
+   yttrium_venus_mark_render_aspects_initialized(
       resource, yttrium_venus_format_aspects(resource->vk_format));
-   YTTRIUM_LOG("yttrium: Venus initialized depth image res_id=%u image_id=%llu\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id);
    return true;
 }
 
@@ -2717,22 +2936,6 @@ yttrium_venus_pipeline_prepare_ubo_descriptors(
       }
    }
 
-   YTTRIUM_LOG("yttrium: Venus native descriptors set_layout_id=%llu push_set_layout_id=%llu pool_id=%llu set_id=%llu bindings=%u descriptors=%u ubos=%u sampled_bindings=%u storage_image_mask=0x%llx storage_buffer_mask=0x%llx sampled_images=%u sampled_buffers=%u storage_images=%u storage_buffers=%u push_supported=%u max_push=%u\n",
-                (unsigned long long)pipeline->descriptor_set_layout_obj.id,
-                (unsigned long long)
-                   pipeline->push_descriptor_set_layout_obj.id,
-                (unsigned long long)pipeline->descriptor_pool_obj.id,
-                (unsigned long long)pipeline->descriptor_set_obj.id,
-                binding_count, descriptor_count, ubo_descriptor_count,
-                sampled_binding_count,
-                (unsigned long long)storage_image_mask,
-                (unsigned long long)storage_buffer_mask,
-                sampled_image_descriptor_count,
-                sampled_buffer_descriptor_count,
-                storage_image_descriptor_count,
-                storage_buffer_descriptor_count,
-                push_descriptor_supported,
-                venus->max_push_descriptors);
    return true;
 }
 
@@ -2991,12 +3194,104 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
                             VkShaderStageFlags storage_stage_flags,
                             const struct yttrium_venus_draw_state *draw_state)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "pipeline render target"))
+      return false;
+   for (uint32_t i = 0; color_resources && i < color_resource_count; i++) {
+      if (!yttrium_venus_display_endpoint_write_allowed(
+             venus, color_resources[i], "pipeline render target"))
+         return false;
+   }
    const bool has_depth = depth_resource != NULL;
 
    if (!yttrium_venus_ensure_initialized(venus))
       return false;
    if (color_resource_count > PIPE_MAX_COLOR_BUFS)
       return false;
+   if (draw_state && draw_state->depth_bias_enable &&
+       draw_state->depth_bias_clamp != 0.0f && !venus->depth_bias_clamp) {
+      YTTRIUM_ERROR("yttrium: Venus native pipeline rejected owner=venus2 "
+                    "reason=depthBiasClamp-not-supported clamp=%g\n",
+                    draw_state->depth_bias_clamp);
+      return false;
+   }
+   VkDepthBiasRepresentationEXT depth_bias_mode =
+      VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT;
+   float depth_bias_constant = draw_state ?
+      draw_state->depth_bias_constant_factor : 0.0f;
+   const bool logical_d24 = draw_state &&
+      (draw_state->depth_bias_format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+       draw_state->depth_bias_format == PIPE_FORMAT_S8_UINT_Z24_UNORM ||
+       draw_state->depth_bias_format == PIPE_FORMAT_Z24X8_UNORM ||
+       draw_state->depth_bias_format == PIPE_FORMAT_X8Z24_UNORM);
+   const bool remapped_d24 = has_depth && logical_d24 &&
+      (depth_resource->vk_format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+       depth_resource->vk_format == VK_FORMAT_D32_SFLOAT);
+   if (has_depth && draw_state && draw_state->depth_bias_enable &&
+       depth_bias_constant != 0.0f &&
+       (remapped_d24 || draw_state->depth_bias_units_unscaled)) {
+      if (!draw_state->depth_bias_units_unscaled)
+         depth_bias_constant /= 16777215.0f;
+      if (venus->depth_bias_float) {
+         depth_bias_mode = VK_DEPTH_BIAS_REPRESENTATION_FLOAT_EXT;
+      } else {
+         /* Exact FORMAT bias uses r = 2^-n for UNORM depth. FORCE_UNORM
+          * gives float depth the same constant unit, with n = mantissa
+          * bits + 1. Scaling by 2^n therefore preserves the normalized
+          * offset without depending on the primitive's depth exponent.
+          */
+         unsigned depth_bits = 0;
+         switch (depth_resource->vk_format) {
+         case VK_FORMAT_D16_UNORM:
+         case VK_FORMAT_D16_UNORM_S8_UINT:
+            depth_bits = 16;
+            break;
+         case VK_FORMAT_X8_D24_UNORM_PACK32:
+         case VK_FORMAT_D24_UNORM_S8_UINT:
+            depth_bits = 24;
+            break;
+         case VK_FORMAT_D32_SFLOAT:
+         case VK_FORMAT_D32_SFLOAT_S8_UINT:
+            if (venus->depth_bias_force_unorm) {
+               depth_bias_mode =
+                  VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+               depth_bits = 24;
+            }
+            break;
+         default:
+            break;
+         }
+         if (!venus->depth_bias_exact || !depth_bits) {
+            YTTRIUM_ERROR("yttrium: native depth bias rejected owner=venus2 "
+                          "component=native-pipeline "
+                          "reason=normalizedRepresentation-not-supported "
+                          "logical_format=%u vk_format=%u constant=%g "
+                          "unscaled=%u exact=%u force_unorm=%u "
+                          "action=reject-pipeline\n",
+                          draw_state->depth_bias_format,
+                          depth_resource->vk_format, depth_bias_constant,
+                          draw_state->depth_bias_units_unscaled,
+                          venus->depth_bias_exact,
+                          venus->depth_bias_force_unorm);
+            return false;
+         }
+         depth_bias_constant = ldexpf(depth_bias_constant, depth_bits);
+      }
+   }
+   if (has_depth && draw_state && draw_state->depth_bias_enable &&
+       draw_state->depth_bias_constant_factor != 0.0f &&
+       depth_bias_mode ==
+          VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT &&
+       !venus->depth_bias_exact &&
+       (depth_resource->vk_format == VK_FORMAT_D16_UNORM ||
+        depth_resource->vk_format == VK_FORMAT_D16_UNORM_S8_UINT ||
+        depth_resource->vk_format == VK_FORMAT_D24_UNORM_S8_UINT ||
+        depth_resource->vk_format == VK_FORMAT_X8_D24_UNORM_PACK32)) {
+      YTTRIUM_WARN("yttrium: inexact Vulkan depth bias fallback owner=venus2 "
+                   "reason=depthBiasExact-not-supported vk_format=%u "
+                   "constant=%g action=implementation-dependent-scaling\n",
+                   depth_resource->vk_format,
+                   draw_state->depth_bias_constant_factor);
+   }
 
    bool has_color = false;
    for (uint32_t i = 0; i < color_resource_count; i++) {
@@ -3326,8 +3621,11 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
       const uint32_t color_layer =
          draw_state && i < ARRAY_SIZE(draw_state->rt_layer) ?
             draw_state->rt_layer[i] : render_layer;
+      VkImageViewUsageCreateInfo view_usage;
       const VkImageViewCreateInfo view_info = {
          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .pNext = yttrium_venus_image_view_usage(
+            color, attachment_format, &view_usage),
          .image = color->image,
          .viewType = yttrium_venus_render_view_type(color, render_layers),
          .format = attachment_format,
@@ -3748,26 +4046,24 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
       .viewportCount = MAX2(draw_state->viewport_count, 1),
       .scissorCount = MAX2(draw_state->viewport_count, 1),
    };
-   const bool force_unorm_depth_bias =
-      venus->depth_bias_control && has_depth &&
-      (depth_resource->vk_format == VK_FORMAT_D24_UNORM_S8_UINT ||
-       depth_resource->vk_format == VK_FORMAT_X8_D24_UNORM_PACK32);
+   /* Native scaled bias retains FORMAT units. Normalized bias uses FLOAT
+    * or exact UNORM units, independent of the primitive exponent. */
    const VkDepthBiasRepresentationInfoEXT depth_bias_representation = {
       .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
-      .depthBiasRepresentation =
-         VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT,
-      .depthBiasExact = VK_FALSE,
+      .depthBiasRepresentation = depth_bias_mode,
+      .depthBiasExact = venus->depth_bias_exact,
    };
    const VkPipelineRasterizationStateCreateInfo raster = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-      .pNext = force_unorm_depth_bias ? &depth_bias_representation : NULL,
+      .pNext = venus->depth_bias_control && has_depth ?
+                  &depth_bias_representation : NULL,
       .depthClampEnable = draw_state->depth_clamp_enable,
       .rasterizerDiscardEnable = draw_state->rasterizer_discard_enable,
       .polygonMode = VK_POLYGON_MODE_FILL,
       .cullMode = draw_state->cull_mode,
       .frontFace = draw_state->front_face,
       .depthBiasEnable = draw_state->depth_bias_enable,
-      .depthBiasConstantFactor = draw_state->depth_bias_constant_factor,
+      .depthBiasConstantFactor = depth_bias_constant,
       .depthBiasClamp = draw_state->depth_bias_clamp,
       .depthBiasSlopeFactor = draw_state->depth_bias_slope_factor,
       .lineWidth = 1.0f,
@@ -3901,29 +4197,6 @@ yttrium_venus2_pipeline_init(struct yttrium_venus *venus,
       }
    }
 
-   YTTRIUM_LOG("yttrium: Venus native pipeline setup res_id=%u image_id=%llu depth_res_id=%u depth_image_id=%llu pipeline_id=%llu push_pipeline_id=%llu push_layout_id=%llu extent=%ux%u topology=%u restart=%u cull=0x%x front=%u blend=%u color_mask=0x%x sample_mask=0x%x bindings=%u attribs=%u ubo_bindings=%u ubo_slots=%u sampled_bindings=%u depth_test=%u depth_write=%u depth_compare=%u\n",
-                resource_id,
-                (unsigned long long)resource->image_obj.id,
-                has_depth ? depth_resource_id : 0,
-                has_depth ?
-                   (unsigned long long)depth_resource->image_obj.id : 0,
-                (unsigned long long)pipeline->pipeline_obj.id,
-                (unsigned long long)pipeline->push_pipeline_obj.id,
-                (unsigned long long)pipeline->push_pipeline_layout_obj.id,
-                resource->width, resource->height,
-                draw_state->topology,
-                draw_state->primitive_restart_enable,
-                draw_state->cull_mode,
-                draw_state->front_face,
-                draw_state->blend_enable,
-                 draw_state->color_write_mask,
-                 draw_state->sample_mask,
-                 binding_count, attrib_count,
-                 ubo_binding_count, pipeline->ubo_count,
-                 sampled_binding_count,
-                 draw_state->depth_test_enable,
-                 draw_state->depth_write_enable,
-                 draw_state->depth_compare_op);
    return true;
 
 pipeline_submit_failed:
@@ -4052,13 +4325,6 @@ yttrium_venus2_compute_pipeline_init(
          &push_pipeline_info, NULL, &pipeline->push_pipeline);
    }
 
-   YTTRIUM_LOG("yttrium: Venus native compute pipeline setup pipeline_id=%llu push_pipeline_id=%llu push_layout_id=%llu ubo_bindings=%u ubo_slots=%u storage_image_mask=0x%llx storage_buffer_mask=0x%llx\n",
-               (unsigned long long)pipeline->pipeline_obj.id,
-               (unsigned long long)pipeline->push_pipeline_obj.id,
-               (unsigned long long)pipeline->push_pipeline_layout_obj.id,
-               ubo_binding_count, pipeline->ubo_count,
-               (unsigned long long)storage_image_mask,
-               (unsigned long long)storage_buffer_mask);
    return true;
 
 compute_submit_failed:
@@ -4177,7 +4443,9 @@ yttrium_venus_sample_view_format(VkFormat resource_format,
              view_format == VK_FORMAT_D24_UNORM_S8_UINT)
             return VK_FORMAT_D32_SFLOAT_S8_UINT;
       } else if (resource_format == VK_FORMAT_D32_SFLOAT) {
+         /* D3D R32_FLOAT depth SRVs retain the Vulkan depth storage format. */
          if (view_format == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+             view_format == VK_FORMAT_R32_SFLOAT ||
              view_format == VK_FORMAT_D32_SFLOAT)
             return VK_FORMAT_D32_SFLOAT;
       }
@@ -4378,8 +4646,10 @@ yttrium_venus_ensure_sample_image_view(struct yttrium_venus *venus,
    entry->view = YTTRIUM_VENUS_HANDLE(VkImageView, &entry->obj);
    const VkComponentMapping components =
       yttrium_venus_sample_view_components(aspect_mask, swizzle_key);
+   VkImageViewUsageCreateInfo view_usage;
    const VkImageViewCreateInfo view_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = yttrium_venus_image_view_usage(resource, vk_format, &view_usage),
       .image = resource->image,
       .viewType = view_type,
       .format = vk_format,
@@ -4420,13 +4690,16 @@ yttrium_venus_ensure_storage_image_view(struct yttrium_venus *venus,
                                         VkImageAspectFlags aspect_mask,
                                         VkImageView *out_view)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "storage image view"))
+      return false;
    if (!resource || !resource->initialized || resource->buffer_backed ||
        !resource->image || !out_view)
       return false;
    *out_view = VK_NULL_HANDLE;
    if (vk_format == VK_FORMAT_UNDEFINED)
       vk_format = resource->vk_format;
-   if (vk_format == VK_FORMAT_UNDEFINED)
+   if (vk_format == VK_FORMAT_UNDEFINED ||
+       yttrium_venus_srgb_color_format(vk_format))
       return false;
    if (!aspect_mask)
       aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -4490,6 +4763,36 @@ storage_image_view_submit_failed:
    return false;
 }
 
+/* VkBufferView inherits both texel usages from its buffer.  Apply each
+ * enabled requirement, including the extension's three-component rule,
+ * without widening the D3D view or changing its logical coordinates. */
+static VkDeviceSize
+yttrium_venus_texel_buffer_alignment(const struct yttrium_venus *venus,
+                                     VkBufferUsageFlags usage,
+                                     unsigned texel_size)
+{
+   if (!venus->texel_buffer_alignment)
+      return venus->texel_buffer_offset_alignment;
+
+   const unsigned single_texel = texel_size % 3 ? texel_size : texel_size / 3;
+   VkDeviceSize alignment = 1;
+   if (usage & VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT) {
+      const VkDeviceSize uniform_alignment =
+         venus->uniform_texel_buffer_single_texel_alignment ?
+         MIN2(venus->uniform_texel_buffer_alignment, single_texel) :
+         venus->uniform_texel_buffer_alignment;
+      alignment = MAX2(alignment, uniform_alignment);
+   }
+   if (usage & VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT) {
+      const VkDeviceSize storage_alignment =
+         venus->storage_texel_buffer_single_texel_alignment ?
+         MIN2(venus->storage_texel_buffer_alignment, single_texel) :
+         venus->storage_texel_buffer_alignment;
+      alignment = MAX2(alignment, storage_alignment);
+   }
+   return alignment;
+}
+
 static bool
 yttrium_venus_ensure_sample_buffer_view(struct yttrium_venus *venus,
                                         struct yttrium_venus_resource *resource,
@@ -4497,6 +4800,7 @@ yttrium_venus_ensure_sample_buffer_view(struct yttrium_venus *venus,
                                         enum pipe_format pipe_format,
                                         VkDeviceSize offset,
                                         VkDeviceSize range,
+                                        bool exact_range,
                                         VkBufferView *out_view)
 {
    const VkFormat vk_format = yttrium_venus2_pipe_format(pipe_format);
@@ -4534,7 +4838,9 @@ yttrium_venus_ensure_sample_buffer_view(struct yttrium_venus *venus,
    if (range > resource->image_size - offset)
       range = resource->image_size - offset;
    range -= range % blocksize;
-   if (!range || offset % blocksize) {
+   const VkDeviceSize alignment = yttrium_venus_texel_buffer_alignment(
+      venus, resource->buffer_usage, blocksize);
+   if (!range || offset % blocksize || !alignment || offset % alignment) {
       YTTRIUM_LOG("yttrium: Venus sampled buffer view rejected alignment res_id=%u buffer_id=%llu size=0x%llx offset=0x%llx range=0x%llx format=%u vk_format=%u blocksize=%u\n",
                   resource_id,
                   (unsigned long long)resource->buffer_obj.id,
@@ -4545,10 +4851,10 @@ yttrium_venus_ensure_sample_buffer_view(struct yttrium_venus *venus,
       return false;
    }
 
-   const VkDeviceSize view_range =
-      (!offset && range == resource->image_size) ||
-      offset + range >= resource->image_size ?
-      VK_WHOLE_SIZE : range;
+   const VkDeviceSize view_range = exact_range ? range :
+      ((!offset && range == resource->image_size) ||
+       offset + range >= resource->image_size ?
+       VK_WHOLE_SIZE : range);
 
    /* Keep typed buffer views alive for the resource lifetime; one draw can
     * bind several SRVs with different formats over the same buffer.
@@ -4802,12 +5108,6 @@ yttrium_venus_prepare_textured_descriptors(struct yttrium_venus *venus,
       return false,
       venus->device_handle, &sampler_info, NULL, &resource->sampler);
 
-   YTTRIUM_LOG("yttrium: Venus textured descriptors res_id=%u set_layout_id=%llu pool_id=%llu set_id=%llu sampler_id=%llu\n",
-                resource_id,
-                (unsigned long long)resource->descriptor_set_layout_obj.id,
-                (unsigned long long)resource->descriptor_pool_obj.id,
-                (unsigned long long)resource->descriptor_set_obj.id,
-                (unsigned long long)resource->sampler_obj.id);
    return true;
 }
 
@@ -4908,8 +5208,11 @@ yttrium_venus_prepare_graphics(struct yttrium_venus *venus,
    yttrium_venus_init_object(venus, &resource->image_view_obj);
    resource->image_view =
       YTTRIUM_VENUS_HANDLE(VkImageView, &resource->image_view_obj);
+   VkImageViewUsageCreateInfo view_usage;
    const VkImageViewCreateInfo view_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = yttrium_venus_image_view_usage(
+         resource, resource->vk_format, &view_usage),
       .image = resource->image,
       .viewType = yttrium_venus_render_view_type(resource, render_layers),
       .format = resource->vk_format,
@@ -5185,16 +5488,6 @@ yttrium_venus_prepare_graphics(struct yttrium_venus *venus,
    const char *mode_name =
       mode == YTTRIUM_VENUS_GRAPHICS_TEXTURED_VERTEX_BUFFER ? "textured" :
       "vertex-buffer";
-   YTTRIUM_LOG("yttrium: Venus graphics setup res_id=%u image_id=%llu pipeline_id=%llu extent=%ux%u mode=%s topology=%u cull=0x%x front=%u blend=%u color_mask=0x%x sample_mask=0x%x rgb=(%u,%u,%u) alpha=(%u,%u,%u)\n",
-                resource_id, (unsigned long long)resource->image_obj.id,
-                (unsigned long long)resource->pipeline_obj.id,
-                resource->width, resource->height, mode_name,
-                topology, cull_mode, front_face,
-                blend_enable, color_write_mask,
-                sample_mask,
-                src_color_blend_factor, dst_color_blend_factor,
-                color_blend_op, src_alpha_blend_factor,
-                dst_alpha_blend_factor, alpha_blend_op);
    return true;
 
 graphics_submit_failed:
@@ -5334,33 +5627,12 @@ yttrium_venus_ensure_draw_vertex_buffer(struct yttrium_venus *venus,
       .allocationSize = MAX2(reqs.size, allocation_size),
       .memoryTypeIndex = memory_type_index,
    };
-   VkResult result =
-      direct_map_candidate ?
-      vn_call_vkAllocateMemory(&venus->vn_ring, venus->device_handle,
-                               &memory_info, NULL,
-                               &resource->draw_vertex_memory) :
-      VK_SUCCESS;
-   if (!direct_map_candidate) {
-      YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
-         venus, vkAllocateMemory, &resource->draw_vertex_memory_obj,
-         &resource->draw_vertex_memory,
-         goto vertex_submit_failed, venus->device_handle, &memory_info, NULL,
-         &resource->draw_vertex_memory);
-   } else if (result != VK_SUCCESS) {
-      YTTRIUM_WARN("yttrium: ERROR: vertex backing allocation failed owner=venus2 result=%d type=%u size=0x%llx bits=0x%x\n",
-                   result, memory_type_index,
-                   (unsigned long long)memory_info.allocationSize,
-                   reqs.memoryTypeBits);
-      vn_async_vkDestroyBuffer(&venus->vn_ring, venus->device_handle,
-                               resource->draw_vertex_buffer, NULL);
-      memset(&resource->draw_vertex_buffer_obj, 0,
-             sizeof(resource->draw_vertex_buffer_obj));
-      memset(&resource->draw_vertex_memory_obj, 0,
-             sizeof(resource->draw_vertex_memory_obj));
-      resource->draw_vertex_buffer = VK_NULL_HANDLE;
-      resource->draw_vertex_memory = VK_NULL_HANDLE;
-      return false;
-   }
+   VkResult result = yttrium_venus_allocate_memory(
+      venus, &memory_info, &reqs, &resource->draw_vertex_memory,
+      resource->draw_vertex_memory_obj.id, "vertex-backing",
+      direct_map_candidate);
+   if (result != VK_SUCCESS)
+      goto vertex_submit_failed;
 
    result = direct_map_candidate ?
       vn_call_vkBindBufferMemory(&venus->vn_ring, venus->device_handle,
@@ -5410,13 +5682,6 @@ yttrium_venus_ensure_draw_vertex_buffer(struct yttrium_venus *venus,
 
    resource->draw_vertex_buffer_size = memory_info.allocationSize;
    resource->draw_vertex_buffer_generation++;
-   YTTRIUM_LOG("yttrium: Venus vertex buffer setup res_id=%u buffer_id=%llu memory_id=%llu size=0x%llx req_size=0x%llx type=%u bits=0x%x\n",
-                resource_id,
-                (unsigned long long)resource->draw_vertex_buffer_obj.id,
-                (unsigned long long)resource->draw_vertex_memory_obj.id,
-                (unsigned long long)memory_info.allocationSize,
-                (unsigned long long)reqs.size,
-                memory_type_index, reqs.memoryTypeBits);
    return true;
 
 vertex_submit_failed:
@@ -5566,33 +5831,12 @@ yttrium_venus_ensure_draw_index_buffer(struct yttrium_venus *venus,
       .allocationSize = MAX2(reqs.size, allocation_size),
       .memoryTypeIndex = memory_type_index,
    };
-   VkResult result =
-      direct_map_candidate ?
-      vn_call_vkAllocateMemory(&venus->vn_ring, venus->device_handle,
-                               &memory_info, NULL,
-                               &resource->draw_index_memory) :
-      VK_SUCCESS;
-   if (!direct_map_candidate) {
-      YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
-         venus, vkAllocateMemory, &resource->draw_index_memory_obj,
-         &resource->draw_index_memory,
-         goto index_submit_failed, venus->device_handle, &memory_info, NULL,
-         &resource->draw_index_memory);
-   } else if (result != VK_SUCCESS) {
-      YTTRIUM_WARN("yttrium: ERROR: index backing allocation failed owner=venus2 result=%d type=%u size=0x%llx bits=0x%x\n",
-                   result, memory_type_index,
-                   (unsigned long long)memory_info.allocationSize,
-                   reqs.memoryTypeBits);
-      vn_async_vkDestroyBuffer(&venus->vn_ring, venus->device_handle,
-                               resource->draw_index_buffer, NULL);
-      memset(&resource->draw_index_buffer_obj, 0,
-             sizeof(resource->draw_index_buffer_obj));
-      memset(&resource->draw_index_memory_obj, 0,
-             sizeof(resource->draw_index_memory_obj));
-      resource->draw_index_buffer = VK_NULL_HANDLE;
-      resource->draw_index_memory = VK_NULL_HANDLE;
-      return false;
-   }
+   VkResult result = yttrium_venus_allocate_memory(
+      venus, &memory_info, &reqs, &resource->draw_index_memory,
+      resource->draw_index_memory_obj.id, "index-backing",
+      direct_map_candidate);
+   if (result != VK_SUCCESS)
+      goto index_submit_failed;
 
    result = direct_map_candidate ?
       vn_call_vkBindBufferMemory(&venus->vn_ring, venus->device_handle,
@@ -5642,13 +5886,6 @@ yttrium_venus_ensure_draw_index_buffer(struct yttrium_venus *venus,
 
    resource->draw_index_buffer_size = memory_info.allocationSize;
    resource->draw_index_buffer_generation++;
-   YTTRIUM_LOG("yttrium: Venus index buffer setup res_id=%u buffer_id=%llu memory_id=%llu size=0x%llx req_size=0x%llx type=%u bits=0x%x\n",
-               resource_id,
-               (unsigned long long)resource->draw_index_buffer_obj.id,
-               (unsigned long long)resource->draw_index_memory_obj.id,
-               (unsigned long long)memory_info.allocationSize,
-               (unsigned long long)reqs.size,
-               memory_type_index, reqs.memoryTypeBits);
    return true;
 
 index_submit_failed:
@@ -5837,6 +6074,11 @@ yttrium_venus2_update_buffer(struct yttrium_venus *venus,
                                  VK_PIPELINE_STAGE_HOST_BIT, 0,
                                  0, NULL, 1, &barrier, 0, NULL);
 
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "buffer update");
 }
 
@@ -5899,6 +6141,11 @@ yttrium_venus2_clear_buffer(struct yttrium_venus *venus,
                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                                  0, NULL, 1, &barrier, 0, NULL);
 
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "buffer clear");
 }
 
@@ -6098,18 +6345,16 @@ yttrium_venus_ensure_ubo_upload_buffer(struct yttrium_venus *venus,
       .allocationSize = MAX2(reqs.size, allocation_size),
       .memoryTypeIndex = memory_type_index,
    };
-   VkResult result =
-      direct_map_candidate ?
-      vn_call_vkAllocateMemory(&venus->vn_ring, venus->device_handle,
-                               &memory_info, NULL,
-                               &arena->memory) :
-      VK_SUCCESS;
-   if (!direct_map_candidate) {
-      YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
-         venus, vkAllocateMemory, &arena->memory_obj, &arena->memory,
-         goto ubo_submit_failed, venus->device_handle, &memory_info, NULL,
-         &arena->memory);
-   } else if (result != VK_SUCCESS) {
+   VkResult result = yttrium_venus_allocate_memory(
+      venus, &memory_info, &reqs, &arena->memory, arena->memory_obj.id,
+      "ubo-backing", direct_map_candidate);
+   if (result != VK_SUCCESS) {
+      /* Only actual heap exhaustion can be helped by retiring old arenas. */
+      if (!direct_map_candidate ||
+          (result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+           result != VK_ERROR_OUT_OF_DEVICE_MEMORY))
+         goto ubo_submit_failed;
+
       YTTRIUM_WARN("yttrium: WARNING: Venus UBO backing allocation exhausted owner=venus2 reason=vkAllocateMemory result=%d action=synchronous-bounded-memory-retirement type=%u requested_bytes=%llu live_bytes=%llu\n",
                    result, memory_type_index,
                    (unsigned long long)memory_info.allocationSize,
@@ -6183,15 +6428,6 @@ yttrium_venus_ensure_ubo_upload_buffer(struct yttrium_venus *venus,
    venus->peak_ubo_arena_bytes =
       MAX2(venus->peak_ubo_arena_bytes, venus->ubo_arena_bytes);
    yttrium_venus_activate_ubo_arena(venus, arena);
-   YTTRIUM_LOG("yttrium: Venus shared ubo buffer setup buffer_id=%llu memory_id=%llu size=0x%llx req_size=0x%llx requested=0x%llx type=%u flags=0x%x bits=0x%x\n",
-               (unsigned long long)arena->buffer_obj.id,
-               (unsigned long long)arena->memory_obj.id,
-               (unsigned long long)memory_info.allocationSize,
-               (unsigned long long)reqs.size,
-               (unsigned long long)size,
-               memory_type_index,
-               venus->memory_props.memoryTypes[memory_type_index].propertyFlags,
-               reqs.memoryTypeBits);
    return true;
 
 ubo_submit_failed:
@@ -6912,6 +7148,8 @@ yttrium_venus_draw_graphics(struct yttrium_venus *venus,
                             uint32_t vertex_count,
                             const struct yttrium_venus_draw_state *draw_state)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "legacy draw render target"))
+      return false;
    const bool vertex_buffer = mode == YTTRIUM_VENUS_GRAPHICS_VERTEX_BUFFER;
    const VkDeviceSize vertex_data_size =
       sizeof(struct yttrium_venus_triangle_vertex) * vertex_count;
@@ -7039,6 +7277,7 @@ yttrium_venus_draw_graphics(struct yttrium_venus *venus,
    vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
 
    resource->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   yttrium_venus_mark_render_aspects_initialized(resource, VK_IMAGE_ASPECT_COLOR_BIT);
    yttrium_trace_venus_draw(YTTRIUM_EVENT_VENUS_DRAW,
                             resource_id, resource->image_obj.id,
                             0, 0, resource->pipeline_obj.id,
@@ -7047,31 +7286,13 @@ yttrium_venus_draw_graphics(struct yttrium_venus *venus,
                             viewport->width, viewport->height,
                             scissor->offset.x, scissor->offset.y,
                             scissor->extent.width, scissor->extent.height);
-   YTTRIUM_LOG("yttrium: Venus draw vertices res_id=%u image_id=%llu pipeline_id=%llu count=%u viewport=%f,%f %fx%f scissor=%d,%d %ux%u topology=%u cull=0x%x front=%u blend=%u color_mask=0x%x sample_mask=0x%x v0=(%f,%f,%f,%f) c0=(%f,%f,%f,%f) vlast=(%f,%f,%f,%f) clast=(%f,%f,%f,%f)\n",
-               resource_id, (unsigned long long)resource->image_obj.id,
-               (unsigned long long)resource->pipeline_obj.id,
-               vertex_count,
-               viewport->x, viewport->y, viewport->width,
-               viewport->height, scissor->offset.x, scissor->offset.y,
-               scissor->extent.width, scissor->extent.height,
-               resource->graphics_topology,
-               resource->graphics_cull_mode,
-               resource->graphics_front_face,
-               resource->graphics_blend_enable,
-               resource->graphics_color_write_mask,
-               resource->graphics_sample_mask,
-               vertices[0].position[0], vertices[0].position[1],
-               vertices[0].position[2], vertices[0].position[3],
-               vertices[0].color[0], vertices[0].color[1],
-               vertices[0].color[2], vertices[0].color[3],
-               vertices[vertex_count - 1].position[0],
-               vertices[vertex_count - 1].position[1],
-               vertices[vertex_count - 1].position[2],
-               vertices[vertex_count - 1].position[3],
-               vertices[vertex_count - 1].color[0],
-               vertices[vertex_count - 1].color[1],
-               vertices[vertex_count - 1].color[2],
-               vertices[vertex_count - 1].color[3]);
+   if ((!draw_state || (!draw_state->rasterizer_discard_enable &&
+                        draw_state->color_write_mask)) &&
+       !yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "vertex draw");
 
 fail_command_batch:
@@ -7090,9 +7311,21 @@ yttrium_venus2_draw_textured_vertices(struct yttrium_venus *venus,
                                      uint32_t vertex_count,
                                      const struct yttrium_venus_draw_state *draw_state)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "textured draw render target"))
+      return false;
    if (!resource || !sampled || resource == sampled || !vertices ||
        !vertex_count || vertex_count > YTTRIUM_VENUS_MAX_DRAW_VERTICES)
       return false;
+   struct yttrium_venus_sampled_image sampled_binding = {
+      .resource = sampled,
+      .pipe_resource = sampled->owner,
+      .resource_id = sampled_resource_id,
+      .view_type = VK_IMAGE_VIEW_TYPE_2D,
+      .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .level_count = 1,
+      .layer_count = 1,
+      .format = sampled->owner ? sampled->owner->format : PIPE_FORMAT_NONE,
+   };
    VkImageView sampled_view = VK_NULL_HANDLE;
    if (!yttrium_venus_ensure_sample_image_view(venus, sampled,
                                                sampled_resource_id,
@@ -7170,7 +7403,7 @@ yttrium_venus2_draw_textured_vertices(struct yttrium_venus *venus,
       return false;
 
    if (!yttrium_venus_cmd_batch_track_resource(venus, resource) ||
-       !yttrium_venus_cmd_batch_track_resource(venus, sampled)) {
+       !yttrium_venus_cmd_batch_track_sampled_refs(venus, &sampled_binding, 1)) {
       yttrium_venus_cancel_command_batch_setup_failure(
          venus, "textured draw tracking failure");
       return false;
@@ -7270,6 +7503,7 @@ yttrium_venus2_draw_textured_vertices(struct yttrium_venus *venus,
    vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
 
    resource->layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   yttrium_venus_mark_render_aspects_initialized(resource, VK_IMAGE_ASPECT_COLOR_BIT);
    yttrium_trace_venus_draw(YTTRIUM_EVENT_VENUS_TEXTURED_DRAW,
                             resource_id, resource->image_obj.id,
                             sampled_resource_id, sampled->image_obj.id,
@@ -7278,19 +7512,13 @@ yttrium_venus2_draw_textured_vertices(struct yttrium_venus *venus,
                             viewport->width, viewport->height,
                             scissor->offset.x, scissor->offset.y,
                             scissor->extent.width, scissor->extent.height);
-   YTTRIUM_LOG("yttrium: Venus textured draw dst_res_id=%u dst_image_id=%llu src_res_id=%u src_image_id=%llu pipeline_id=%llu count=%u viewport=%f,%f %fx%f scissor=%d,%d %ux%u uv0=(%f,%f) uvlast=(%f,%f)\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id,
-               sampled_resource_id,
-               (unsigned long long)sampled->image_obj.id,
-               (unsigned long long)resource->pipeline_obj.id,
-               vertex_count,
-               viewport->x, viewport->y, viewport->width,
-               viewport->height, scissor->offset.x, scissor->offset.y,
-               scissor->extent.width, scissor->extent.height,
-               vertices[0].texcoord[0], vertices[0].texcoord[1],
-               vertices[vertex_count - 1].texcoord[0],
-               vertices[vertex_count - 1].texcoord[1]);
+   if ((!draw_state || (!draw_state->rasterizer_discard_enable &&
+                        draw_state->color_write_mask)) &&
+       !yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "textured draw");
 
 fail_command_batch:
@@ -9325,6 +9553,13 @@ yttrium_venus2_draw_pipeline(struct yttrium_venus *venus,
                             uint32_t draw_auto_stride,
                             const struct yttrium_venus_draw_state *draw_state)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "draw render target"))
+      return false;
+   for (uint32_t i = 0; color_resources && i < color_resource_count; i++) {
+      if (!yttrium_venus_display_endpoint_write_allowed(
+             venus, color_resources[i], "draw render target"))
+         return false;
+   }
    const bool draw_auto = draw_auto_target != NULL;
    struct yttrium_venus_resource *indirect_resource =
       draw_state ? draw_state->indirect_resource : NULL;
@@ -9340,6 +9575,8 @@ yttrium_venus2_draw_pipeline(struct yttrium_venus *venus,
 
    if (!venus || !resource || !pipeline || !pipeline->pipeline ||
        (!vertex_uploads && vertex_upload_count) ||
+       (!sampled_images && sampled_image_count) ||
+       sampled_image_count > YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES ||
        (!draw_auto && !draw_indirect && !vertex_count) ||
        (!draw_indirect && !instance_count) || !draw_state ||
        vertex_upload_count > YTTRIUM_VENUS_MAX_PIPELINE_VERTEX_BINDINGS)
@@ -9931,7 +10168,7 @@ retry_batch_layout:
             if (!yttrium_venus_ensure_sample_buffer_view(
                    venus, sampled_resource, sampled_resource_id,
                    sampled->format, sampled->buffer_offset,
-                   sampled->buffer_range, &buffer_view))
+                   sampled->buffer_range, false, &buffer_view))
                return false;
 
             sampled_buffer_views[sampled_update_count] = buffer_view;
@@ -10335,14 +10572,6 @@ retry_batch_layout:
          goto fail_restore_command_buffer;
    }
 
-   if (mirror_copy_pending &&
-       venus->test_fail_after_draw_mirror_copy_once &&
-       !venus->test_fail_after_draw_mirror_copy_consumed) {
-      venus->test_fail_after_draw_mirror_copy_consumed = true;
-      YTTRIUM_WARN("yttrium: TEST: injecting native draw failure after device-local mirror copy owner=venus2 action=abort_command_batch\n");
-      goto fail_restore_command_buffer;
-   }
-
    const bool direct_cpu_vertex_upload =
       yttrium_venus_direct_cpu_vertex_upload_enabled();
    const bool direct_vertex_upload =
@@ -10602,13 +10831,6 @@ retry_batch_layout:
                    sampled->buffer_size, sampled->buffer_data, &written_size))
                goto fail_restore_command_buffer;
          }
-         YTTRIUM_LOG("yttrium: Venus sampled buffer publish res_id=%u buffer_id=%llu view_offset=0x%llx view_range=0x%llx upload_offset=0x0 upload_size=0x%llx written_size=0x%llx\n",
-                     sampled->resource_id,
-                     (unsigned long long)sampled_resource->buffer_obj.id,
-                     (unsigned long long)sampled->buffer_offset,
-                     (unsigned long long)sampled->buffer_range,
-                     (unsigned long long)sampled->buffer_size,
-                     (unsigned long long)written_size);
 
          sampled_buffer_barriers[sampled_buffer_barrier_count++] =
             (VkBufferMemoryBarrier) {
@@ -11227,6 +11449,24 @@ retry_batch_layout:
       0, stage_start_us, NULL, resource_id,
       pipeline->pipeline_obj.id, vertex_count, index_count);
 
+   /* Mark the display endpoint stale before submission can reset its
+    * provisional recording state. */
+   for (uint32_t i = 0; i < color_resource_count; i++) {
+      struct yttrium_venus_resource *color = color_resources[i];
+      if (!pipeline->key.rasterizer_discard_enable &&
+          pipeline->key.color_write_mask[i] &&
+          !yttrium_venus_cmd_batch_track_write(venus, color))
+         goto fail_restore_command_buffer;
+      if (color && color->display_endpoint && color->display_endpoint_recording)
+         yttrium_venus_shared_image_written(&color->display_endpoint_state);
+   }
+
+   /* Storage descriptors have no read-only access flag in this interface. */
+   for (uint32_t i = 0; i < storage_image_count; i++) {
+      if (!yttrium_venus_cmd_batch_track_write(venus, storage_images[i].resource))
+         goto fail_restore_command_buffer;
+   }
+
    bool submitted = false;
    if (native_draw_batch_candidate) {
       submitted = yttrium_venus_cmd_batch_after_native_draw_record(
@@ -11262,8 +11502,10 @@ retry_batch_layout:
       if (!color || color->buffer_backed)
          continue;
 
-      yttrium_venus_mark_aspects_initialized(color,
+      yttrium_venus_mark_render_aspects_initialized(color,
                                              VK_IMAGE_ASPECT_COLOR_BIT);
+      if (color->external_image.enabled && !color->external_image.acquired)
+         continue;
       color->layout =
          pipeline->key.color_feedback_loop_mask & (1u << i) ?
             VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
@@ -11289,45 +11531,6 @@ retry_batch_layout:
                             draw_state->scissors[0].offset.y,
                             draw_state->scissors[0].extent.width,
                             draw_state->scissors[0].extent.height);
-   YTTRIUM_LOG("yttrium: Venus native draw res_id=%u image_id=%llu depth_res_id=%u depth_image_id=%llu sampled_res_id=%u sampled_object_id=%llu sampled_buffer=%u pipeline_id=%llu count=%u instances=%u vertex_bytes=0x%llx vertex_bindings=%u indexed=%u index_count=%u index_bytes=0x%llx index_type=%u vertex_offset=%d ubos=%u sampled_count=%u sampled_expected=%u sampled_stages=0x%x viewports=%u viewport0=%f,%f %fx%f scissor0=%d,%d %ux%u topology=%u depth_test=%u depth_write=%u depth_compare=%u\n",
-                 resource_id,
-                 (unsigned long long)resource->image_obj.id,
-                 has_depth ? depth_resource_id : 0,
-                 has_depth && depth_resource ?
-                    (unsigned long long)depth_resource->image_obj.id : 0,
-                 first_sampled ? first_sampled->resource_id : 0,
-                 first_sampled && first_sampled->resource ?
-                    (unsigned long long)(first_sampled->buffer ?
-                       first_sampled->resource->buffer_obj.id :
-                       first_sampled->resource->image_obj.id) : 0,
-                 first_sampled ? first_sampled->buffer : 0,
-                 (unsigned long long)pipeline->pipeline_obj.id,
-                 indexed ? index_count : vertex_count,
-                 instance_count,
-                 (unsigned long long)vertex_data_size,
-                 vertex_upload_count,
-                 indexed,
-                 indexed ? index_count : 0,
-                 indexed ? (unsigned long long)index_data_size : 0,
-                 indexed ? index_type : 0,
-                 indexed ? vertex_offset : 0,
-                 ubo_upload_count,
-                 sampled_image_count,
-                 pipeline->key.sampled_binding_count,
-                 pipeline->key.sampled_stage_mask,
-                 draw_state->viewport_count,
-                 draw_state->viewports[0].x,
-                draw_state->viewports[0].y,
-                draw_state->viewports[0].width,
-                draw_state->viewports[0].height,
-                draw_state->scissors[0].offset.x,
-                draw_state->scissors[0].offset.y,
-                draw_state->scissors[0].extent.width,
-                draw_state->scissors[0].extent.height,
-                draw_state->topology,
-                draw_state->depth_test_enable,
-                draw_state->depth_write_enable,
-                draw_state->depth_compare_op);
    if (has_depth && depth_resource &&
        (draw_state->depth_write_enable || draw_state->stencil_test_enable))
       yttrium_venus_ds_clear_history_invalidate(depth_resource);
@@ -11347,6 +11550,8 @@ yttrium_venus2_draw_vertex_buffer_vertices(struct yttrium_venus *venus,
                                           uint32_t vertex_count,
                                           const struct yttrium_venus_draw_state *draw_state)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "vertex draw render target"))
+      return false;
    if (vertex_count > YTTRIUM_VENUS_MAX_DRAW_VERTICES) {
       YTTRIUM_LOG("yttrium: Venus vertex-buffer draw vertex count %u exceeds limit %u\n",
                    vertex_count, YTTRIUM_VENUS_MAX_DRAW_VERTICES);
@@ -11386,10 +11591,92 @@ yttrium_venus_clear_display_buffer(struct yttrium_venus *venus,
    vn_async_vkCmdFillBuffer(&venus->vn_ring, venus->command_buffer,
                             resource->buffer, 0, allocation_size, pattern);
 
-   YTTRIUM_LOG("yttrium: Venus fill display buffer res_id=%u buffer_id=%llu pattern=0x%08x size=0x%llx\n",
-                resource_id, (unsigned long long)resource->buffer_obj.id,
-                pattern, (unsigned long long)allocation_size);
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "buffer clear");
+}
+
+/* A compute SRV describes logical D3D view bytes, excluding allocation
+ * padding. Check host limits before reusing or creating a native texel view. */
+static bool
+yttrium_venus_compute_sampled_buffer_supported(
+   struct yttrium_venus *venus,
+   const struct yttrium_venus_sampled_image *sampled)
+{
+   const struct yttrium_venus_resource *resource = sampled->resource;
+   const enum pipe_format format = sampled->format;
+   if ((unsigned)format >= PIPE_FORMAT_COUNT || format == PIPE_FORMAT_NONE ||
+       !resource || !resource->initialized || !resource->buffer_backed ||
+       !resource->buffer ||
+       !(resource->buffer_usage & VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT)) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_buffer_not_native res_id=%u binding=%u format=%u action=reject-dispatch\n",
+                   sampled->resource_id, sampled->binding, format);
+      return false;
+   }
+
+   const VkFormat vk_format = yttrium_venus2_pipe_format(format);
+   const unsigned blocksize = util_format_get_blocksize(format);
+   const VkDeviceSize offset = sampled->buffer_offset;
+   const VkDeviceSize range = sampled->buffer_range;
+   const VkDeviceSize size = sampled->buffer_size;
+   const VkDeviceSize alignment = yttrium_venus_texel_buffer_alignment(
+      venus, resource->buffer_usage, blocksize);
+   if (vk_format == VK_FORMAT_UNDEFINED || !blocksize || !size ||
+       size > resource->image_size || offset > size || !range ||
+       range > size - offset || offset % blocksize || range % blocksize ||
+       !alignment || offset % alignment ||
+       !venus->max_texel_buffer_elements ||
+       range / blocksize > venus->max_texel_buffer_elements ||
+       (sampled->buffer_data &&
+        (size > UINT64_MAX - 3 || align64(size, 4) > resource->image_size))) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_buffer_view_limits res_id=%u binding=%u format=%u size=0x%llx allocation=0x%llx offset=0x%llx range=0x%llx alignment=0x%llx max_texels=%u action=reject-dispatch\n",
+                   sampled->resource_id, sampled->binding, format,
+                   (unsigned long long)size,
+                   (unsigned long long)resource->image_size,
+                   (unsigned long long)offset, (unsigned long long)range,
+                   (unsigned long long)alignment,
+                   venus->max_texel_buffer_elements);
+      return false;
+   }
+
+   /* A detached CPU shadow is not evidence of ownership after a GPU write. */
+   const struct yttrium_resource *owner =
+      sampled->pipe_resource ? yttrium_resource(sampled->pipe_resource) : NULL;
+   if (sampled->buffer_data &&
+       (!owner || resource->owner != &owner->base || !owner->data_dirty ||
+        sampled->buffer_data != owner->data ||
+        sampled->buffer_size !=
+           MIN2((uint64_t)owner->base.width0, owner->size))) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_buffer_cpu_ownership res_id=%u binding=%u action=reject-dispatch\n",
+                   sampled->resource_id, sampled->binding);
+      return false;
+   }
+   if (!sampled->buffer_data && !resource->contents_initialized) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_buffer_contents_unavailable res_id=%u binding=%u action=reject-dispatch\n",
+                   sampled->resource_id, sampled->binding);
+      return false;
+   }
+
+   uint8_t *supported = &venus->compute_sampled_buffer_formats[format];
+   if (!*supported) {
+      VkFormatProperties2 properties = {
+         .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+      };
+      vn_call_vkGetPhysicalDeviceFormatProperties2(
+         &venus->vn_ring, venus->physical_device, vk_format, &properties);
+      *supported =
+         (properties.formatProperties.bufferFeatures &
+          VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT) ? 2 : 1;
+   }
+   if (*supported != 2) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_buffer_format_unsupported res_id=%u binding=%u format=%u vk_format=%u action=reject-dispatch\n",
+                   sampled->resource_id, sampled->binding, format, vk_format);
+      return false;
+   }
+   return true;
 }
 
 static bool
@@ -11403,8 +11690,8 @@ yttrium_venus_compute_push_descriptors_complete(
    if (ubo_update_count != pipeline->ubo_descriptor_count ||
        ubo_update_count != pipeline->ubo_count ||
        ubo_update_count > YTTRIUM_VENUS_MAX_PIPELINE_UBO_SLOTS ||
-       sampled_image_count != pipeline->sampled_image_descriptor_count ||
-       pipeline->sampled_buffer_descriptor_count ||
+       sampled_image_count != pipeline->sampled_image_descriptor_count +
+                                 pipeline->sampled_buffer_descriptor_count ||
        storage_update_count != pipeline->storage_image_descriptor_count +
                                   pipeline->storage_buffer_descriptor_count)
       return false;
@@ -11449,12 +11736,21 @@ yttrium_venus2_dispatch_compute(
 
    if (sampled_image_count != pipeline->key.sampled_binding_count ||
        sampled_image_count > YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES ||
-       (sampled_image_count && !sampled_images) || pipeline->has_sampled_buffer)
+       (sampled_image_count && !sampled_images) ||
+       storage_image_count > YTTRIUM_VENUS_MAX_PIPELINE_STORAGE_IMAGES ||
+       (storage_image_count && !storage_images)) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=descriptor_input_counts action=reject-dispatch\n");
       return false;
+   }
+   if (pipeline->has_sampled_buffer && !venus->robust_buffer_access2) {
+      YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_buffer_robustness2_unavailable action=reject-dispatch\n");
+      return false;
+   }
 
    const bool has_descriptors =
       pipeline->ubo_descriptor_count ||
       pipeline->sampled_image_descriptor_count ||
+      pipeline->sampled_buffer_descriptor_count ||
       pipeline->storage_image_descriptor_count ||
       pipeline->storage_buffer_descriptor_count;
    const bool use_push_descriptors =
@@ -11500,20 +11796,57 @@ yttrium_venus2_dispatch_compute(
       [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
    VkDescriptorImageInfo sampled_infos
       [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+   VkBufferView sampled_buffer_views
+      [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
    VkWriteDescriptorSet sampled_writes
       [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
    memset(resolved_samples, 0, sizeof(resolved_samples));
    memset(sampled_infos, 0, sizeof(sampled_infos));
+   memset(sampled_buffer_views, 0, sizeof(sampled_buffer_views));
    memset(sampled_writes, 0, sizeof(sampled_writes));
    for (uint32_t i = 0; i < sampled_image_count; i++) {
       const struct yttrium_venus_sampled_binding_layout *layout =
          &pipeline->key.sampled_bindings[i];
       struct yttrium_venus_sampled_image *sampled = &resolved_samples[i];
       *sampled = sampled_images[i];
-      if (layout->stage != MESA_SHADER_COMPUTE || layout->buffer ||
-          sampled->buffer || sampled->binding != layout->binding ||
-          !pipeline->samplers[i])
+      if (layout->stage != MESA_SHADER_COMPUTE ||
+          sampled->buffer != (layout->buffer != VK_FALSE) ||
+          sampled->binding != layout->binding ||
+          (!sampled->buffer && !pipeline->samplers[i])) {
+         YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=sampled_binding_mismatch index=%u binding=%u action=reject-dispatch\n",
+                      i, sampled->binding);
          return false;
+      }
+      if (sampled->buffer) {
+         if (!sampled->resource) {
+            /* A real null descriptor also preserves a zero size query. */
+            if (!venus->null_descriptor || sampled->pipe_resource ||
+                sampled->buffer_data || sampled->buffer_size ||
+                sampled->buffer_offset || sampled->buffer_range) {
+               YTTRIUM_WARN("yttrium: compute dispatch rejected owner=venus2 reason=null_sampled_buffer_unavailable binding=%u action=reject-dispatch\n",
+                            sampled->binding);
+               return false;
+            }
+         } else if (!yttrium_venus_compute_sampled_buffer_supported(
+                       venus, sampled) ||
+                    !yttrium_venus_ensure_sample_buffer_view(
+                       venus, sampled->resource, sampled->resource_id,
+                       sampled->format, sampled->buffer_offset,
+                       sampled->buffer_range, true,
+                       &sampled_buffer_views[i])) {
+            return false;
+         }
+         sampled_writes[i] = (VkWriteDescriptorSet) {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = use_push_descriptors ? VK_NULL_HANDLE :
+                         dispatch_descriptor_set,
+            .dstBinding = sampled->binding,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,
+            .pTexelBufferView = &sampled_buffer_views[i],
+         };
+         continue;
+      }
       if (!sampled->resource &&
           !yttrium_venus_ensure_null_sampled_image(
              venus, &sampled->resource, &sampled->resource_id))
@@ -11695,8 +12028,11 @@ yttrium_venus2_dispatch_compute(
       return false;
    }
    for (uint32_t i = 0; i < sampled_image_count; i++) {
-      if (!yttrium_venus_cmd_batch_track_resource(
-             venus, resolved_samples[i].resource)) {
+      /* A null texel-buffer descriptor has no allocation or view to retain. */
+      if (resolved_samples[i].buffer && !resolved_samples[i].resource)
+         continue;
+      if (!yttrium_venus_cmd_batch_track_sampled_refs(
+             venus, &resolved_samples[i], 1)) {
          yttrium_venus_cancel_command_batch_setup_failure(
             venus, "native compute dispatch sampled resource tracking failure");
          return false;
@@ -11717,6 +12053,65 @@ yttrium_venus2_dispatch_compute(
          yttrium_venus_cancel_command_batch_setup_failure(
             venus, "native compute dispatch resource tracking failure");
          return false;
+      }
+   }
+
+   /* Publish CPU-authored dirty bytes in order. GPU-written buffers remain
+    * native and are only barriered; retained resources protect cached views. */
+   if (pipeline->has_sampled_buffer) {
+      VkBufferMemoryBarrier sampled_barriers
+         [YTTRIUM_VENUS_MAX_PIPELINE_SAMPLED_IMAGES];
+      uint32_t sampled_barrier_count = 0;
+      for (uint32_t i = 0; i < sampled_image_count; i++) {
+         const struct yttrium_venus_sampled_image *sampled =
+            &resolved_samples[i];
+         struct yttrium_venus_resource *resource = sampled->resource;
+         if (!sampled->buffer || !resource)
+            continue;
+
+         if (sampled->buffer_data) {
+            const VkBufferMemoryBarrier overwrite = {
+               .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+               .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                                VK_ACCESS_MEMORY_WRITE_BIT,
+               .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .buffer = resource->buffer,
+               .offset = 0,
+               .size = align64(sampled->buffer_size, 4),
+            };
+            vn_async_vkCmdPipelineBarrier(
+               &venus->vn_ring, venus->command_buffer,
+               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+               0, NULL, 1, &overwrite, 0, NULL);
+            VkDeviceSize written_size = 0;
+            if (!yttrium_venus_cmd_update_buffer_padded(
+                   venus, venus->command_buffer, resource->buffer, 0,
+                   sampled->buffer_size, sampled->buffer_data, &written_size))
+               goto fail_command_batch;
+         }
+         sampled_barriers[sampled_barrier_count++] =
+            (VkBufferMemoryBarrier) {
+               .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+               .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT |
+                                VK_ACCESS_HOST_WRITE_BIT,
+               .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+               .buffer = resource->buffer,
+               .offset = sampled->buffer_offset,
+               .size = sampled->buffer_range,
+            };
+         resource->contents_initialized = true;
+      }
+      if (sampled_barrier_count) {
+         vn_async_vkCmdPipelineBarrier(
+            &venus->vn_ring, venus->command_buffer,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+            0, NULL, sampled_barrier_count, sampled_barriers, 0, NULL);
       }
    }
 
@@ -11841,6 +12236,8 @@ yttrium_venus2_dispatch_compute(
    for (uint32_t i = 0; i < sampled_image_count; i++) {
       struct yttrium_venus_sampled_image *sampled = &resolved_samples[i];
       struct yttrium_venus_resource *resource = sampled->resource;
+      if (sampled->buffer)
+         continue;
       const bool depth = yttrium_venus_format_has_depth(resource->vk_format);
       if (depth ?
           !yttrium_venus_cmd_ensure_depth_initialized(
@@ -11943,13 +12340,16 @@ yttrium_venus2_dispatch_compute(
                           grid_x, grid_y, grid_z);
 
    for (uint32_t i = 0; i < storage_image_count; i++) {
-      if (storage_images[i].resource)
+      if (storage_images[i].resource) {
          storage_images[i].resource->contents_initialized = true;
+      }
    }
 
-   YTTRIUM_LOG("yttrium: Venus native compute dispatch pipeline_id=%llu grid=%ux%ux%u storage_count=%u ubo_count=%u\n",
-               (unsigned long long)pipeline->pipeline_obj.id,
-               grid_x, grid_y, grid_z, storage_image_count, ubo_upload_count);
+   /* Storage descriptors have no read-only access flag in this interface. */
+   for (uint32_t i = 0; i < storage_image_count; i++) {
+      if (!yttrium_venus_cmd_batch_track_write(venus, storage_images[i].resource))
+         goto fail_command_batch;
+   }
    return yttrium_venus_cmd_batch_after_record(venus,
                                                "native compute dispatch");
 
@@ -12002,6 +12402,9 @@ yttrium_venus_clear_color_value(enum pipe_format pipe_format,
       memcpy(clear.uint32, color->ui, sizeof(clear.uint32));
    } else {
       memcpy(clear.float32, color->f, sizeof(clear.float32));
+      /* Logical A8 uses physical R8 for both image and attachment clears. */
+      if (pipe_format == PIPE_FORMAT_A8_UNORM)
+         clear.float32[0] = color->f[3];
    }
 
    return clear;
@@ -12034,6 +12437,8 @@ yttrium_venus2_clear_depth_stencil(struct yttrium_venus *venus,
                                   uint32_t width,
                                   uint32_t height)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "depth stencil clear"))
+      return false;
    if (!yttrium_venus_ensure_initialized(venus))
       return false;
 
@@ -12116,17 +12521,17 @@ yttrium_venus2_clear_depth_stencil(struct yttrium_venus *venus,
       }
    }
 
-   yttrium_venus_mark_aspects_initialized(resource, aspects);
+   yttrium_venus_mark_render_aspects_initialized(resource, aspects);
    for (uint32_t i = 0; i < layer_count; i++) {
       yttrium_venus_ds_clear_history_note(resource, aspects, depth, stencil,
                                           level, first_layer + i, dstx, dsty,
                                           width, height);
    }
-   YTTRIUM_LOG("yttrium: Venus clear depth/stencil res_id=%u image_id=%llu aspects=0x%x depth=%f stencil=%u level=%u layers=%u+%u\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id,
-               aspects, (float)depth, stencil,
-               level, first_layer, layer_count);
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "depth clear");
 }
 
@@ -12144,6 +12549,8 @@ yttrium_venus2_clear_display(struct yttrium_venus *venus,
                             uint32_t first_layer,
                             uint32_t layer_count)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "color clear"))
+      return false;
    (void)ctx;
    (void)width;
    (void)height;
@@ -12214,13 +12621,12 @@ yttrium_venus2_clear_display(struct yttrium_venus *venus,
                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                  &clear, 1, &range);
 
-   resource->contents_initialized = true;
-   YTTRIUM_LOG("yttrium: Venus clear display res_id=%u image_id=%llu level=%u layers=%u+%u color_f=%f,%f,%f,%f color_ui=%u,%u,%u,%u color_i=%d,%d,%d,%d\n",
-                resource_id, (unsigned long long)resource->image_obj.id,
-                level, first_layer, layer_count,
-                color->f[0], color->f[1], color->f[2], color->f[3],
-                color->ui[0], color->ui[1], color->ui[2], color->ui[3],
-                color->i[0], color->i[1], color->i[2], color->i[3]);
+   yttrium_venus_mark_render_aspects_initialized(resource, VK_IMAGE_ASPECT_COLOR_BIT);
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "image clear");
 }
 
@@ -12239,6 +12645,8 @@ yttrium_venus2_clear_display_rect(struct yttrium_venus *venus,
                                   uint32_t width,
                                   uint32_t height)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, resource, "color rectangle clear"))
+      return false;
    (void)ctx;
 
    if (!yttrium_venus_ensure_initialized(venus))
@@ -12302,15 +12710,12 @@ yttrium_venus2_clear_display_rect(struct yttrium_venus *venus,
       }
    }
 
-   resource->contents_initialized = true;
-   YTTRIUM_LOG("yttrium: Venus color rect clear res_id=%u image_id=%llu level=%u layers=%u+%u rect=%u,%u %ux%u color_f=%f,%f,%f,%f color_ui=%u,%u,%u,%u color_i=%d,%d,%d,%d\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id,
-               level, first_layer, layer_count,
-               dstx, dsty, width, height,
-               color->f[0], color->f[1], color->f[2], color->f[3],
-               color->ui[0], color->ui[1], color->ui[2], color->ui[3],
-               color->i[0], color->i[1], color->i[2], color->i[3]);
+   yttrium_venus_mark_render_aspects_initialized(resource, VK_IMAGE_ASPECT_COLOR_BIT);
+   if (!yttrium_venus_cmd_batch_track_write(venus, resource)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "color rect clear");
 }
 
@@ -12515,14 +12920,11 @@ yttrium_venus2_copy_image_region_aspect_to_display_buffer(struct yttrium_venus *
       width, height, 1, scanout_stride, 0);
 
    render->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-   YTTRIUM_LOG("yttrium: Venus copied render image res_id=%u image_id=%llu to scanout buffer res_id=%u buffer_id=%llu src_level=%u src_layer=%u src=%u,%u dst=%u,%u %ux%u stride=%u row_length=%u offset=0x%llx\n",
-                render_resource_id,
-                (unsigned long long)render->image_obj.id,
-                scanout_resource_id,
-                (unsigned long long)scanout->buffer_obj.id,
-                src_level, src_layer, src_x, src_y, dst_x, dst_y,
-                width, height, scanout_stride, scanout_stride / cpp,
-                (unsigned long long)buffer_offset);
+   if (!yttrium_venus_cmd_batch_track_write(venus, scanout)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus,
                                                "image-to-buffer copy");
 }
@@ -12619,6 +13021,11 @@ yttrium_venus2_copy_buffer_to_buffer(struct yttrium_venus *venus,
                                  VK_PIPELINE_STAGE_HOST_BIT, 0,
                                  0, NULL, 1, &dst_barrier, 0, NULL);
 
+   if (!yttrium_venus_cmd_batch_track_write(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "buffer copy");
 }
 
@@ -12665,11 +13072,6 @@ yttrium_venus_cmd_clear_depth_stencil_image(
                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                         &clear_value, 1, &range);
 
-   YTTRIUM_LOG("yttrium: Venus image-cleared depth/stencil res_id=%u image_id=%llu aspects=0x%x depth=%f stencil=%u level=%u layers=%u+%u\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id,
-               aspects, (float)depth, stencil,
-               level, first_layer, layer_count);
    return true;
 }
 
@@ -12832,11 +13234,6 @@ yttrium_venus_cmd_clear_depth_stencil_attachment(
                                   1, &clear_attachment, 1, &clear_rect);
    vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
 
-   YTTRIUM_LOG("yttrium: Venus attachment-cleared depth/stencil res_id=%u image_id=%llu aspects=0x%x depth=%f stencil=%u level=%u layer=%u rect=%u,%u %ux%u\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id,
-               aspects, (float)depth, stencil,
-               level, layer, dstx, dsty, width, height);
    return true;
 
 depth_clear_submit_failed:
@@ -12894,8 +13291,10 @@ yttrium_venus_cmd_clear_color_attachment(
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
       &range);
 
+   VkImageViewUsageCreateInfo view_usage;
    const VkImageViewCreateInfo view_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = yttrium_venus_image_view_usage(resource, view_format, &view_usage),
       .image = resource->image,
       .viewType = yttrium_venus_render_view_type(resource, 1),
       .format = view_format,
@@ -12991,10 +13390,6 @@ yttrium_venus_cmd_clear_color_attachment(
                                   1, &clear_attachment, 1, &clear_rect);
    vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
 
-   YTTRIUM_LOG("yttrium: Venus attachment-cleared color res_id=%u image_id=%llu level=%u layer=%u rect=%u,%u %ux%u\n",
-               resource_id,
-               (unsigned long long)resource->image_obj.id,
-               level, layer, dstx, dsty, width, height);
    return true;
 
 color_clear_submit_failed:
@@ -13019,16 +13414,8 @@ yttrium_venus2_copy_display_image(struct yttrium_venus *venus,
                                  uint32_t width,
                                  uint32_t height)
 {
-   const uint32_t requested_src_x = src_x;
-   const uint32_t requested_src_y = src_y;
-   const uint32_t requested_src_layer = src_layer;
-   const uint32_t requested_src_level = src_level;
-   const uint32_t requested_dst_x = dst_x;
-   const uint32_t requested_dst_y = dst_y;
-   const uint32_t requested_dst_layer = dst_layer;
-   const uint32_t requested_dst_level = dst_level;
-   const uint32_t requested_width = width;
-   const uint32_t requested_height = height;
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, dst, "copy_display_image"))
+      return false;
    bool promoted_full_copy = false;
 
    if (!src || !src->initialized || src->buffer_backed || !src->image ||
@@ -13067,9 +13454,6 @@ yttrium_venus2_copy_display_image(struct yttrium_venus *venus,
        src->vk_format == dst->vk_format &&
        MAX2(src->levels, 1) == 1 && MAX2(dst->levels, 1) == 1 &&
        MAX2(src->layers, 1) == 1 && MAX2(dst->layers, 1) == 1) {
-      YTTRIUM_LOG("yttrium: Venus promoted partial display image copy to full copy src_res_id=%u dst_res_id=%u dirty=%u,%u->%u,%u %ux%u\n",
-                  src_resource_id, dst_resource_id,
-                  src_x, src_y, dst_x, dst_y, width, height);
       src_x = 0;
       src_y = 0;
       dst_x = 0;
@@ -13176,34 +13560,6 @@ yttrium_venus2_copy_display_image(struct yttrium_venus *venus,
       .dstOffset = { (int32_t)dst_x, (int32_t)dst_y, 0 },
       .extent = { width, height, 1 },
    };
-   yttrium_trace_debug_stringf(
-      "yttrium: Venus display image copy cmd src_res=%u dst_res=%u src_image=%llu dst_image=%llu src_mem=%llu dst_mem=%llu req_src_level=%u req_src=%u,%u,%u req_dst_level=%u req_dst=%u,%u,%u req_size=%ux%u eff_src_level=%u eff_src=%u,%u,%u eff_dst_level=%u eff_dst=%u,%u,%u eff_size=%ux%u src_extent=%ux%u dst_extent=%ux%u src_fmt=%u dst_fmt=%u src_usage=0x%x dst_usage=0x%x src_layout=%u dst_layout=%u src_init=%u dst_init_before=%u full=%u promoted=%u same=%u src_off=0x%llx dst_off=0x%llx src_size=0x%llx dst_size=0x%llx src_row=%llu dst_row=%llu src_array=%llu dst_array=%llu",
-      src_resource_id, dst_resource_id,
-      (unsigned long long)src->image_obj.id,
-      (unsigned long long)dst->image_obj.id,
-      (unsigned long long)src->memory_obj.id,
-      (unsigned long long)dst->memory_obj.id,
-      requested_src_level, requested_src_x, requested_src_y,
-      requested_src_layer,
-      requested_dst_level, requested_dst_x, requested_dst_y,
-      requested_dst_layer,
-      requested_width, requested_height,
-      src_level, src_x, src_y, src_layer,
-      dst_level, dst_x, dst_y, dst_layer, width, height,
-      src->width, src->height, dst->width, dst->height,
-      src->vk_format, dst->vk_format,
-      src->image_usage, dst->image_usage,
-      src->layout, dst->layout,
-      src->contents_initialized, dst->contents_initialized,
-      full_dst_copy, promoted_full_copy, src == dst,
-      (unsigned long long)src->image_offset,
-      (unsigned long long)dst->image_offset,
-      (unsigned long long)src->image_size,
-      (unsigned long long)dst->image_size,
-      (unsigned long long)src->image_row_pitch,
-      (unsigned long long)dst->image_row_pitch,
-      (unsigned long long)src->image_array_pitch,
-      (unsigned long long)dst->image_array_pitch);
    vn_async_vkCmdCopyImage(&venus->vn_ring, venus->command_buffer,
                            src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -13216,22 +13572,284 @@ yttrium_venus2_copy_display_image(struct yttrium_venus *venus,
 
    src->layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
    dst->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-   yttrium_venus_mark_aspects_initialized(dst, copy_aspects);
+   yttrium_venus_mark_render_aspects_initialized(dst, copy_aspects);
 
-   YTTRIUM_LOG("yttrium: Venus copied display image src_res_id=%u image_id=%llu level=%u %u,%u layer=%u dst_res_id=%u image_id=%llu level=%u %u,%u layer=%u %ux%u\n",
-                src_resource_id,
-                (unsigned long long)src->image_obj.id,
-                src_level, src_x, src_y, src_layer,
-                dst_resource_id,
-                (unsigned long long)dst->image_obj.id,
-                dst_level, dst_x, dst_y, dst_layer,
-                width, height);
+   if (!yttrium_venus_cmd_batch_track_write(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_submit_after_record(
       venus, "display image copy");
 
 fail_batch:
    yttrium_venus_flush_command_batch(venus,
                                           "display image copy batch abort");
+   return false;
+}
+
+static bool
+yttrium_venus_cmd_resolve_depth_stencil_attachment(
+   struct yttrium_venus *venus,
+   struct yttrium_venus_resource *src,
+   struct yttrium_venus_resource *dst,
+   uint32_t src_resource_id,
+   uint32_t dst_resource_id,
+   uint32_t width,
+   uint32_t height,
+   VkImageAspectFlags aspects)
+{
+   const VkImageAspectFlags format_aspects =
+      yttrium_venus_format_aspects(src->vk_format);
+   const VkResolveModeFlagBits depth_mode =
+      aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT :
+                                           VK_RESOLVE_MODE_NONE;
+   const VkResolveModeFlagBits stencil_mode =
+      aspects & VK_IMAGE_ASPECT_STENCIL_BIT ? VK_RESOLVE_MODE_SAMPLE_ZERO_BIT :
+                                             VK_RESOLVE_MODE_NONE;
+   const bool combined_format =
+      (format_aspects & (VK_IMAGE_ASPECT_DEPTH_BIT |
+                        VK_IMAGE_ASPECT_STENCIL_BIT)) ==
+      (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+   if (!venus->depth_stencil_resolve ||
+       (depth_mode && !(venus->depth_resolve_modes & depth_mode)) ||
+       (stencil_mode && !(venus->stencil_resolve_modes & stencil_mode)) ||
+       (combined_format && depth_mode != stencil_mode &&
+        !venus->independent_resolve_none)) {
+      YTTRIUM_ERROR("yttrium: depth/stencil MSAA resolve rejected owner=venus2 "
+                    "component=depth-resolve reason=resolve-mode-unsupported "
+                    "src_res_id=%u dst_res_id=%u vk_format=%u samples=0x%x "
+                    "aspects=0x%x enabled=%u depth_modes=0x%x "
+                    "stencil_modes=0x%x independent_none=%u action=reject\n",
+                    src_resource_id, dst_resource_id, src->vk_format,
+                    src->samples, aspects, venus->depth_stencil_resolve,
+                    venus->depth_resolve_modes, venus->stencil_resolve_modes,
+                    venus->independent_resolve_none);
+      return false;
+   }
+   if (src == dst || MAX2(src->depth, 1) != 1 ||
+       MAX2(dst->depth, 1) != 1 ||
+       !(src->image_usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ||
+       !(dst->image_usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) {
+      YTTRIUM_ERROR("yttrium: depth/stencil MSAA resolve rejected owner=venus2 "
+                    "component=depth-resolve reason=attachment-shape-or-usage "
+                    "src_res_id=%u dst_res_id=%u src_usage=0x%x "
+                    "dst_usage=0x%x action=reject\n",
+                    src_resource_id, dst_resource_id,
+                    src->image_usage, dst->image_usage);
+      return false;
+   }
+
+   if (!yttrium_venus_begin_transfer_batch(venus))
+      return false;
+   if (!yttrium_venus_cmd_batch_track_resource(venus, src) ||
+       !yttrium_venus_cmd_batch_track_resource(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "depth/stencil resolve tracking failure");
+      return false;
+   }
+
+   uint32_t src_transient = UINT32_MAX;
+   uint32_t dst_transient = UINT32_MAX;
+   if (!yttrium_venus_cmd_batch_alloc_transient(venus, &src_transient) ||
+       !yttrium_venus_cmd_batch_alloc_transient(venus, &dst_transient))
+      goto resolve_failed;
+
+   VkImageView src_view = venus->cmd_batch_transients[src_transient].view;
+   VkImageView dst_view = venus->cmd_batch_transients[dst_transient].view;
+   VkRenderPass render_pass =
+      venus->cmd_batch_transients[src_transient].render_pass;
+   VkFramebuffer framebuffer =
+      venus->cmd_batch_transients[src_transient].framebuffer;
+   const VkImageSubresourceRange range = {
+      .aspectMask = format_aspects,
+      .baseMipLevel = 0,
+      .levelCount = 1,
+      .baseArrayLayer = 0,
+      .layerCount = 1,
+   };
+   const VkPipelineStageFlags attachment_stages =
+      VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+   const VkAccessFlags depth_access =
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+   /* Fixed-function depth/stencil resolve accesses are color-output
+    * accesses, while the attachment load/store operations use depth tests. */
+   yttrium_venus_cmd_transition_image(
+      venus, src, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      depth_access | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+      attachment_stages, &range);
+   yttrium_venus_cmd_transition_image(
+      venus, dst, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      depth_access | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, attachment_stages, &range);
+
+   const VkImageViewCreateInfo src_view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = src->image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = src->vk_format,
+      .subresourceRange = range,
+   };
+   YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
+      venus, vkCreateImageView,
+      &venus->cmd_batch_transients[src_transient].view_obj, &src_view,
+      goto resolve_failed, venus->device_handle, &src_view_info, NULL,
+      &src_view);
+   venus->cmd_batch_transients[src_transient].view_created = true;
+   const VkImageViewCreateInfo dst_view_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .image = dst->image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D,
+      .format = dst->vk_format,
+      .subresourceRange = range,
+   };
+   YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
+      venus, vkCreateImageView,
+      &venus->cmd_batch_transients[dst_transient].view_obj, &dst_view,
+      goto resolve_failed, venus->device_handle, &dst_view_info, NULL,
+      &dst_view);
+   venus->cmd_batch_transients[dst_transient].view_created = true;
+
+   const VkAttachmentDescription2 attachments[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+         .format = src->vk_format,
+         .samples = src->samples,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+         .format = dst->vk_format,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         /* A NONE resolve mode preserves that destination aspect. */
+         .loadOp = depth_mode ? VK_ATTACHMENT_LOAD_OP_DONT_CARE :
+                               VK_ATTACHMENT_LOAD_OP_LOAD,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .stencilLoadOp = stencil_mode ? VK_ATTACHMENT_LOAD_OP_DONT_CARE :
+                                        VK_ATTACHMENT_LOAD_OP_LOAD,
+         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE,
+         .initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      },
+   };
+   const VkAttachmentReference2 depth_ref = {
+      .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+      .attachment = 0,
+      .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .aspectMask = format_aspects,
+   };
+   const VkAttachmentReference2 resolve_ref = {
+      .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2,
+      .attachment = 1,
+      .layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      .aspectMask = format_aspects,
+   };
+   const VkSubpassDescriptionDepthStencilResolve resolve_info = {
+      .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE,
+      .depthResolveMode = depth_mode,
+      .stencilResolveMode = stencil_mode,
+      .pDepthStencilResolveAttachment = &resolve_ref,
+   };
+   const VkSubpassDescription2 subpass = {
+      .sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2,
+      .pNext = &resolve_info,
+      .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+      .pDepthStencilAttachment = &depth_ref,
+   };
+   const VkRenderPassCreateInfo2 render_pass_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2,
+      .attachmentCount = ARRAY_SIZE(attachments),
+      .pAttachments = attachments,
+      .subpassCount = 1,
+      .pSubpasses = &subpass,
+   };
+   YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
+      venus, vkCreateRenderPass2,
+      &venus->cmd_batch_transients[src_transient].render_pass_obj,
+      &render_pass, goto resolve_failed, venus->device_handle,
+      &render_pass_info, NULL, &render_pass);
+   venus->cmd_batch_transients[src_transient].render_pass_created = true;
+   const VkImageView framebuffer_attachments[2] = { src_view, dst_view };
+   const VkFramebufferCreateInfo framebuffer_info = {
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+      .renderPass = render_pass,
+      .attachmentCount = ARRAY_SIZE(framebuffer_attachments),
+      .pAttachments = framebuffer_attachments,
+      .width = width,
+      .height = height,
+      .layers = 1,
+   };
+   YTTRIUM_VENUS_SUBMIT_OBJECT_OR(
+      venus, vkCreateFramebuffer,
+      &venus->cmd_batch_transients[src_transient].framebuffer_obj,
+      &framebuffer, goto resolve_failed, venus->device_handle,
+      &framebuffer_info, NULL, &framebuffer);
+   venus->cmd_batch_transients[src_transient].framebuffer_created = true;
+   const VkRenderPassBeginInfo render_pass_begin = {
+      .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+      .renderPass = render_pass,
+      .framebuffer = framebuffer,
+      .renderArea = { .extent = { width, height } },
+   };
+   vn_async_vkCmdBeginRenderPass(&venus->vn_ring, venus->command_buffer,
+                                 &render_pass_begin,
+                                 VK_SUBPASS_CONTENTS_INLINE);
+   vn_async_vkCmdEndRenderPass(&venus->vn_ring, venus->command_buffer);
+
+   /* Layout tracking infers depth-test accesses for this layout. Resolve
+    * reads/writes instead use COLOR_ATTACHMENT_OUTPUT, so synchronize both
+    * source reuse and destination consumption before another depth pass. */
+   const VkImageMemoryBarrier resolve_barriers[2] = {
+      {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+         .dstAccessMask = depth_access,
+         .oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = src->image,
+         .subresourceRange = range,
+      },
+      {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+         .dstAccessMask = depth_access,
+         .oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .image = dst->image,
+         .subresourceRange = range,
+      },
+   };
+   vn_async_vkCmdPipelineBarrier(
+      &venus->vn_ring, venus->command_buffer,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+      0, 0, NULL, 0, NULL, ARRAY_SIZE(resolve_barriers), resolve_barriers);
+   yttrium_venus_ds_clear_history_invalidate(dst);
+   yttrium_venus_mark_render_aspects_initialized(dst, aspects);
+   return yttrium_venus_cmd_batch_submit_after_record(
+      venus, "depth/stencil MSAA resolve");
+
+resolve_failed:
+   yttrium_venus_cmd_batch_release_transient(venus, dst_transient);
+   yttrium_venus_cmd_batch_release_transient(venus, src_transient);
+   yttrium_venus_cancel_command_batch_setup_failure(
+      venus, "depth/stencil resolve setup failure");
    return false;
 }
 
@@ -13253,6 +13871,8 @@ yttrium_venus2_copy_depth_stencil_image(struct yttrium_venus *venus,
                                        uint32_t height,
                                        VkImageAspectFlags aspect_mask)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, dst, "copy_depth_stencil_image"))
+      return false;
    if (!src || !src->initialized || src->buffer_backed || !src->image ||
        !dst || !dst->initialized || dst->buffer_backed || !dst->image)
       return false;
@@ -13304,11 +13924,27 @@ yttrium_venus2_copy_depth_stencil_image(struct yttrium_venus *venus,
    if (!full_src_copy || !full_dst_copy ||
        src_level_width != dst_level_width ||
        src_level_height != dst_level_height) {
-      YTTRIUM_WARN("yttrium: Venus depth/stencil copy rejected non-full clear-history copy src_res_id=%u dst_res_id=%u src_level=%u src=%u,%u src_extent=%ux%u dst_level=%u dst=%u,%u dst_extent=%ux%u copy=%ux%u aspects=0x%x\n",
+      YTTRIUM_WARN("yttrium: Venus depth/stencil copy rejected non-full surface copy src_res_id=%u dst_res_id=%u src_level=%u src=%u,%u src_extent=%ux%u dst_level=%u dst=%u,%u dst_extent=%ux%u copy=%ux%u aspects=0x%x\n",
                    src_resource_id, dst_resource_id,
                    src_level, src_x, src_y, src_level_width, src_level_height,
                    dst_level, dst_x, dst_y, dst_level_width, dst_level_height,
                    width, height, aspects);
+      return false;
+   }
+   const VkSampleCountFlagBits src_samples = src->samples ?
+      src->samples : VK_SAMPLE_COUNT_1_BIT;
+   const VkSampleCountFlagBits dst_samples = dst->samples ?
+      dst->samples : VK_SAMPLE_COUNT_1_BIT;
+   if (src_samples != VK_SAMPLE_COUNT_1_BIT &&
+       dst_samples == VK_SAMPLE_COUNT_1_BIT)
+      return yttrium_venus_cmd_resolve_depth_stencil_attachment(
+         venus, src, dst, src_resource_id, dst_resource_id,
+         width, height, aspects);
+   if (src_samples != dst_samples) {
+      YTTRIUM_ERROR("yttrium: depth/stencil copy rejected owner=venus2 "
+                    "component=depth-resolve reason=sample-count-mismatch "
+                    "src_samples=0x%x dst_samples=0x%x action=reject\n",
+                    src_samples, dst_samples);
       return false;
    }
    if (!src->ds_clear_history_valid) {
@@ -13397,14 +14033,12 @@ yttrium_venus2_copy_depth_stencil_image(struct yttrium_venus *venus,
          dst_layer, record->x, record->y, record->width, record->height);
    }
 
-   yttrium_venus_mark_aspects_initialized(dst, aspects);
-   YTTRIUM_LOG("yttrium: Venus replay-copied depth/stencil clear history src_res_id=%u image_id=%llu dst_res_id=%u image_id=%llu level=%u layer=%u -> level=%u layer=%u %ux%u aspects=0x%x records=%u\n",
-               src_resource_id,
-               (unsigned long long)src->image_obj.id,
-               dst_resource_id,
-               (unsigned long long)dst->image_obj.id,
-               src_level, src_layer, dst_level, dst_layer,
-               width, height, aspects, replay_count);
+   yttrium_venus_mark_render_aspects_initialized(dst, aspects);
+   if (!yttrium_venus_cmd_batch_track_write(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_submit_after_record(
       venus, "depth/stencil image copy");
 }
@@ -13510,8 +14144,11 @@ yttrium_venus_cmd_resolve_color_attachment(
       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, &dst_range);
 
+   VkImageViewUsageCreateInfo src_view_usage;
    const VkImageViewCreateInfo src_view_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = yttrium_venus_image_view_usage(
+         src, resolve_vk_format, &src_view_usage),
       .image = src->image,
       .viewType = yttrium_venus_render_view_type(src, 1),
       .format = resolve_vk_format,
@@ -13524,8 +14161,11 @@ yttrium_venus_cmd_resolve_color_attachment(
       &src_view);
    venus->cmd_batch_transients[src_transient].view_created = true;
 
+   VkImageViewUsageCreateInfo dst_view_usage;
    const VkImageViewCreateInfo dst_view_info = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+      .pNext = yttrium_venus_image_view_usage(
+         dst, resolve_vk_format, &dst_view_usage),
       .image = dst->image,
       .viewType = yttrium_venus_render_view_type(dst, 1),
       .format = resolve_vk_format,
@@ -13647,6 +14287,8 @@ yttrium_venus2_resolve_display_image(struct yttrium_venus *venus,
                                     uint32_t width,
                                     uint32_t height)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, dst, "resolve_display_image"))
+      return false;
    if (!src || !src->initialized || src->buffer_backed || !src->image ||
        !dst || !dst->initialized || dst->buffer_backed || !dst->image)
       return false;
@@ -13786,7 +14428,12 @@ yttrium_venus2_resolve_display_image(struct yttrium_venus *venus,
       src_resource_id, dst_resource_id, width, height, 1,
       (uint32_t)MIN2(dst->image_row_pitch, (uint64_t)UINT32_MAX), 0);
 
-   yttrium_venus_mark_aspects_initialized(dst, VK_IMAGE_ASPECT_COLOR_BIT);
+   yttrium_venus_mark_render_aspects_initialized(dst, VK_IMAGE_ASPECT_COLOR_BIT);
+   if (!yttrium_venus_cmd_batch_track_write(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus,
                                                "display image resolve");
 }
@@ -13813,6 +14460,8 @@ yttrium_venus2_blit_display_image(struct yttrium_venus *venus,
                                  uint32_t dst_depth,
                                  bool linear_filter)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, dst, "blit_display_image"))
+      return false;
    if (!src || !src->initialized || src->buffer_backed || !src->image ||
        !dst || !dst->initialized || dst->buffer_backed || !dst->image)
       return false;
@@ -14010,7 +14659,12 @@ yttrium_venus2_blit_display_image(struct yttrium_venus *venus,
       src->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
    }
 
-   dst->contents_initialized = true;
+   yttrium_venus_mark_render_aspects_initialized(dst, VK_IMAGE_ASPECT_COLOR_BIT);
+   if (!yttrium_venus_cmd_batch_track_write(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus, "display image blit");
 }
 
@@ -14032,11 +14686,31 @@ yttrium_venus2_copy_buffer_to_display_image(struct yttrium_venus *venus,
                                            uint32_t depth,
                                            enum pipe_format pipe_format)
 {
+   if (!yttrium_venus_display_endpoint_write_allowed(venus, dst, "copy_buffer_to_display_image"))
+      return false;
    if (!src || !src->initialized || !src->buffer_backed || !src->buffer ||
        !dst || !dst->initialized || dst->buffer_backed || !dst->image)
       return false;
    if (!(dst->image_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT))
       return false;
+   const VkImageAspectFlags copy_aspect =
+      yttrium_venus_format_aspects(dst->vk_format);
+   if (copy_aspect != VK_IMAGE_ASPECT_COLOR_BIT &&
+       copy_aspect != VK_IMAGE_ASPECT_DEPTH_BIT) {
+      YTTRIUM_WARN("yttrium: buffer-to-image upload rejected owner=venus2 "
+                   "reason=stencil-plane-upload-not-implemented "
+                   "dst_res_id=%u vk_format=%u pipe_format=%u aspects=0x%x\n",
+                   dst_resource_id, dst->vk_format, pipe_format, copy_aspect);
+      return false;
+   }
+   if (copy_aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+       yttrium_venus2_pipe_format(pipe_format) != dst->vk_format) {
+      YTTRIUM_WARN("yttrium: buffer-to-image upload rejected owner=venus2 "
+                   "reason=depth-layout-conversion-not-implemented "
+                   "dst_res_id=%u vk_format=%u pipe_format=%u\n",
+                   dst_resource_id, dst->vk_format, pipe_format);
+      return false;
+   }
    const bool dst_is_3d = MAX2(dst->depth, 1) > 1;
    const uint32_t dst_array_layer = dst_is_3d ? 0 : dst_layer;
    const uint32_t dst_z = dst_is_3d ? dst_layer : 0;
@@ -14109,7 +14783,7 @@ yttrium_venus2_copy_buffer_to_display_image(struct yttrium_venus *venus,
                                  0, NULL, 1, &buffer_barrier, 0, NULL);
 
    const VkImageSubresourceRange dst_range = {
-      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .aspectMask = copy_aspect,
       .baseMipLevel = dst_level,
       .levelCount = 1,
       .baseArrayLayer = dst_array_layer,
@@ -14121,12 +14795,17 @@ yttrium_venus2_copy_buffer_to_display_image(struct yttrium_venus *venus,
       width == dst->width && height == dst->height &&
       MAX2(dst->depth, 1) == 1 && MAX2(dst->levels, 1) == 1 &&
       MAX2(dst->layers, 1) == 1;
-   if (!dst->contents_initialized && !full_dst_copy &&
-       !yttrium_venus_cmd_ensure_image_initialized(venus, dst,
-                                                   dst_resource_id)) {
-      yttrium_venus_cancel_command_batch_setup_failure(
-         venus, "buffer-to-image destination init failure");
-      return false;
+   if (!dst->contents_initialized && !full_dst_copy) {
+      const bool initialized = copy_aspect == VK_IMAGE_ASPECT_DEPTH_BIT ?
+         yttrium_venus_cmd_ensure_depth_initialized(venus, dst,
+                                                    dst_resource_id) :
+         yttrium_venus_cmd_ensure_image_initialized(venus, dst,
+                                                    dst_resource_id);
+      if (!initialized) {
+         yttrium_venus_cancel_command_batch_setup_failure(
+            venus, "buffer-to-image destination init failure");
+         return false;
+      }
    }
    yttrium_venus_cmd_transition_image(venus, dst,
                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -14139,7 +14818,7 @@ yttrium_venus2_copy_buffer_to_display_image(struct yttrium_venus *venus,
       .bufferRowLength = buffer_row_length,
       .bufferImageHeight = buffer_image_height,
       .imageSubresource = {
-         .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+         .aspectMask = copy_aspect,
          .mipLevel = dst_level,
          .baseArrayLayer = dst_array_layer,
          .layerCount = 1,
@@ -14160,16 +14839,14 @@ yttrium_venus2_copy_buffer_to_display_image(struct yttrium_venus *venus,
       dst_resource_id, width, height, depth, src_stride, src_layer_stride);
 
    dst->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-   dst->contents_initialized = true;
-   YTTRIUM_LOG("yttrium: Venus copied buffer to display image src_res_id=%u buffer_id=%llu dst_res_id=%u image_id=%llu src_offset=0x%llx dst_level=%u dst=%u,%u layer=%u %ux%ux%u stride=%u layer_stride=%u row_length=%u image_height=%u\n",
-                src_resource_id,
-                (unsigned long long)src->buffer_obj.id,
-                dst_resource_id,
-                (unsigned long long)dst->image_obj.id,
-                (unsigned long long)src_offset,
-                dst_level, dst_x, dst_y, dst_layer,
-                width, height, depth, src_stride, src_layer_stride,
-                buffer_row_length, buffer_image_height);
+   if (copy_aspect == VK_IMAGE_ASPECT_DEPTH_BIT)
+      yttrium_venus_ds_clear_history_invalidate(dst);
+   yttrium_venus_mark_render_aspects_initialized(dst, copy_aspect);
+   if (!yttrium_venus_cmd_batch_track_write(venus, dst)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "primary write tracking failure");
+      return false;
+   }
    return yttrium_venus_cmd_batch_after_record(venus,
                                                "buffer-to-image copy");
 }
@@ -14183,13 +14860,44 @@ yttrium_venus2_resource_fini(
 {
    (void)ctx;
 
-   if (!venus || !venus->initialized || !resource || !resource->initialized)
+   if (!venus || venus->retain_unretired_resources || !venus->initialized ||
+       !resource || !resource->initialized)
       return false;
+
+   /* Loss cancels cleanup work; it does not prove that submitted references
+    * have retired. Keep their existing owner until retirement can be proven. */
+   if (venus->failed ||
+       gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return false;
+   }
 
    bool allocation_adopted = false;
 
-   yttrium_venus_flush_command_batch(venus,
-                                          "resource destroy flush");
+   const bool flushed = yttrium_venus_flush_command_batch(
+      venus, "resource destroy flush");
+   if (venus->failed ||
+       gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return false;
+   }
+   if (resource->display_endpoint) {
+      struct yttrium_venus_resource *endpoint = resource->display_endpoint;
+      if (!flushed || !yttrium_venus_wait_resource_batches(
+             venus, endpoint, "display endpoint destroy")) {
+         YTTRIUM_WARN("yttrium: ERROR display endpoint retirement failed owner=venus2 reason=uncertain-GPU-completion action=retain-producer-endpoint-and-backing\n");
+         yttrium_venus2_retain_on_teardown(venus);
+         return false;
+      }
+      yttrium_venus2_resource_fini(venus, NULL, endpoint, NULL);
+      if (endpoint->initialized || venus->retain_unretired_resources) {
+         YTTRIUM_WARN("yttrium: ERROR display endpoint retirement failed owner=venus2 reason=endpoint-not-retired action=retain-producer-endpoint-and-backing\n");
+         yttrium_venus2_retain_on_teardown(venus);
+         return false;
+      }
+      resource->display_endpoint = NULL;
+      FREE(endpoint);
+   }
    yttrium_venus_render_target_cache_invalidate_image(
       venus, resource->image_obj.id);
 
@@ -14233,12 +14941,23 @@ yttrium_venus2_resource_fini(
       }
    }
 
+   if (venus->failed ||
+       gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return false;
+   }
+
    struct yttrium_venus_retired_resource *retired =
       yttrium_venus_retired_resource_create(resource);
    if (!retired) {
       YTTRIUM_LOG("yttrium: Venus resource retire allocation failed owner=venus2 reason=out-of-memory; falling back to synchronous resource destroy\n");
       yttrium_venus_wait_resource_batches(venus, resource,
                                           "resource destroy oom fallback");
+      if (venus->failed ||
+          gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return false;
+      }
       yttrium_venus_destroy_graphics_objects(venus, resource);
       retired = yttrium_venus_retired_resource_create(resource);
    }
@@ -14416,15 +15135,6 @@ yttrium_venus2_create(struct gdikmt_device *device)
    venus->device_local_static_draw_buffers =
       yttrium_gdi_debug_get_bool_option(
          YTTRIUM_VENUS_DEVICE_LOCAL_STATIC_DRAW_BUFFERS_ENV, true);
-   const char *draw_mirror_fault =
-      getenv(YTTRIUM_VENUS_TEST_FAIL_AFTER_DRAW_MIRROR_COPY_ONCE_ENV);
-   venus->test_fail_after_draw_mirror_copy_once =
-      draw_mirror_fault && draw_mirror_fault[0] &&
-      strcmp(draw_mirror_fault, "0") != 0;
-   if (venus->test_fail_after_draw_mirror_copy_once) {
-      YTTRIUM_WARN("yttrium: TEST: device-local draw-mirror fault injection enabled owner=venus2 source=process_environment variable=%s\n",
-                   YTTRIUM_VENUS_TEST_FAIL_AFTER_DRAW_MIRROR_COPY_ONCE_ENV);
-   }
    venus->draw_arena_bar =
       yttrium_gdi_debug_get_bool_option(
          YTTRIUM_VENUS_DRAW_ARENA_BAR_ENV, false);
@@ -14456,6 +15166,16 @@ yttrium_venus2_get_kmt_context(struct yttrium_venus *venus)
 }
 
 bool
+yttrium_venus2_resource_ready(struct yttrium_venus *venus,
+                             struct yttrium_venus_resource *resource)
+{
+   /* Readiness must not initialize a device or submit work as a side effect. */
+   if (!venus || !venus->initialized)
+      return false;
+   return yttrium_venus_resource_batches_ready(venus, resource);
+}
+
+bool
 yttrium_venus2_wait_resource(struct yttrium_venus *venus,
                              struct yttrium_venus_resource *resource,
                              const char *label)
@@ -14464,14 +15184,44 @@ yttrium_venus2_wait_resource(struct yttrium_venus *venus,
 }
 
 void
+yttrium_venus2_retain_on_teardown(struct yttrium_venus *venus)
+{
+   if (!venus || venus->retain_unretired_resources)
+      return;
+
+   venus->retain_unretired_resources = true;
+   venus->failed = true;
+   YTTRIUM_WARN("yttrium: ERROR backend teardown retained owner=venus2 reason=unretired-resource-work action=retain-device-ring-and-backing-until-real-reset\n");
+}
+
+void
 yttrium_venus2_destroy(struct yttrium_venus *venus)
 {
    if (!venus)
       return;
+   if (venus->retain_unretired_resources)
+      return;
+   if (venus->failed ||
+       gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return;
+   }
 
    if (venus->initialized) {
-      yttrium_venus_flush_command_batch(venus,
-                                             "Venus destroy flush");
+      if (!yttrium_venus_flush_command_batch(venus, "Venus destroy flush")) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
+      if (venus->retain_unretired_resources)
+         return;
+      /* Retiring batches can release the last shared-resource references.
+       * Resolve those owner releases before destroying device objects. */
+      if (!yttrium_venus_drain_batches(venus, "Venus destroy owner references")) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
+      if (venus->retain_unretired_resources)
+         return;
       yttrium_venus_cmd_batch_destroy_descriptor_pool(
          venus, &venus->cmd_batch_descriptor_pool);
 
@@ -14479,8 +15229,12 @@ yttrium_venus2_destroy(struct yttrium_venus *venus)
                                   &venus->null_sampled_image, NULL);
       yttrium_venus2_resource_fini(venus, venus->kmt_ctx,
                                   &venus->null_sampled_buffer, NULL);
+      if (venus->retain_unretired_resources)
+         return;
 
       yttrium_venus_destroy_batches(venus);
+      if (venus->retain_unretired_resources)
+         return;
       yttrium_venus_render_target_cache_destroy(venus);
 
       yttrium_venus_destroy_ubo_arenas(venus);
@@ -14488,18 +15242,27 @@ yttrium_venus2_destroy(struct yttrium_venus *venus)
          vn_async_vkDestroyCommandPool(&venus->vn_ring, venus->device_handle,
                                        venus->command_pool, NULL);
 
-      yttrium_venus_drain_ring(venus, "device object destroy");
+      if (!yttrium_venus_drain_ring(venus, "device object destroy")) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
 
       if (venus->device_handle)
          vn_async_vkDestroyDevice(&venus->vn_ring, venus->device_handle, NULL);
 
-      yttrium_venus_drain_ring(venus, "device destroy");
+      if (!yttrium_venus_drain_ring(venus, "device destroy")) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
 
    }
 
    if (venus->instance_initialized && venus->instance) {
       vn_async_vkDestroyInstance(&venus->vn_ring, venus->instance, NULL);
-      yttrium_venus_drain_ring(venus, "instance destroy");
+      if (!yttrium_venus_drain_ring(venus, "instance destroy")) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
    }
 
    if (venus->ring.id) {
@@ -14510,9 +15273,12 @@ yttrium_venus2_destroy(struct yttrium_venus *venus)
       if (yttrium_venus_warn_encoder_overflow("destroy-ring", &enc, 0) ||
           !yttrium_venus_raw_submit_sync(venus, data,
                                          vn_cs_encoder_get_len(&enc),
-                                         "destroy ring"))
-         YTTRIUM_LOG("yttrium: Venus destroy ring sync submit failed ring_id=%llu\n",
-                     (unsigned long long)venus->ring.id);
+                                         "destroy ring")) {
+         YTTRIUM_WARN("yttrium: Venus destroy ring sync submit failed owner=venus2 ring_id=%llu action=retain-unretired-backing\n",
+                      (unsigned long long)venus->ring.id);
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
    }
 
    venus->failed = true;
@@ -14531,11 +15297,15 @@ yttrium_venus2_destroy(struct yttrium_venus *venus)
    free(venus->cmd_batch_upload_barriers);
    free(venus->cmd_batch_image_barriers);
    free(venus->cmd_batch_draw_mirror_updates);
+   free(venus->cmd_batch_primary_writes.allocations);
+   free(venus->submit_primary_writes.allocations);
    FREE(venus->render_target_cache);
    FREE(venus->pending_submit_batches);
    for (uint32_t i = 0; i < venus->batch_count; i++) {
-      if (venus->batches[i])
+      if (venus->batches[i]) {
          free(venus->batches[i]->draw_mirror_updates);
+         free(venus->batches[i]->primary_writes.allocations);
+      }
       FREE(venus->batches[i]);
    }
    FREE(venus->batches);

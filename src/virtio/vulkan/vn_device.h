@@ -46,6 +46,10 @@ struct vn_device {
    struct vn_image_reqs_cache image_reqs_cache;
 
    bool has_sync2;
+#if defined(_WIN32) && defined(HAVE_YTTRIUM)
+   /* Host-side feature enabled for importing the D3D11 shared descriptor. */
+   bool wsi_attachment_feedback_loop_layout;
+#endif
 
    simple_mtx_t mutex;
    struct list_head chains;

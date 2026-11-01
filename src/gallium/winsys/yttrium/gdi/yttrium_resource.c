@@ -5,7 +5,6 @@
 
 #include "yttrium_resource.h"
 
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <d3dkmthk.h>
@@ -25,6 +24,23 @@
 #include "yttrium_options.h"
 #include "yttrium_present.h"
 #include "yttrium_trace.h"
+#include "yttrium_shared_image.h"
+
+static bool
+yttrium_endpoint_write_rejected(struct pipe_context *ctx,
+                                    struct yttrium_resource *res,
+                                    const char *operation)
+{
+   if (!res || !res->venus.display_endpoint_imported)
+      return false;
+   YTTRIUM_WARN("yttrium: ERROR linear display endpoint write rejected owner=yttrium-resource component=display-endpoint operation=%s reason=consumer-only-import action=report-device-failure allocation=0x%lx\n",
+                operation, (unsigned long)res->hAllocation);
+   if (ctx)
+      InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+   gdikmt_device_report_reset(yttrium_screen(res->base.screen)->device,
+                              PIPE_UNKNOWN_CONTEXT_RESET);
+   return true;
+}
 
 static bool
 yttrium_copy_venus_buffer_to_cpu(struct pipe_context *ctx,
@@ -64,34 +80,6 @@ struct yttrium_buffer_storage {
    bool owns_allocation;
    bool allocation_destroyed_by_runtime;
 };
-
-#define YTTRIUM_TEST_FAIL_BUFFER_REPLACEMENT_METADATA_AT_ENV \
-   "D3D10UMD_YTTRIUM_TEST_FAIL_BUFFER_REPLACEMENT_METADATA_AT"
-
-static bool
-yttrium_take_buffer_replacement_metadata_failpoint(void)
-{
-   static volatile LONG configured_at = -1;
-   static volatile LONG occurrence;
-   LONG fail_at = InterlockedCompareExchange(&configured_at, -1, -1);
-
-   if (fail_at < 0) {
-      const char *value =
-         getenv(YTTRIUM_TEST_FAIL_BUFFER_REPLACEMENT_METADATA_AT_ENV);
-      char *end = NULL;
-      const unsigned long parsed = value ? strtoul(value, &end, 10) : 0;
-      const LONG requested = value && end && end != value && *end == '\0' &&
-                             parsed > 0 && parsed <= LONG_MAX ?
-         (LONG)parsed : 0;
-      InterlockedCompareExchange(&configured_at, requested, -1);
-      fail_at = InterlockedCompareExchange(&configured_at, -1, -1);
-   }
-
-   if (fail_at <= 0)
-      return false;
-
-   return InterlockedIncrement(&occurrence) == fail_at;
-}
 
 static struct yttrium_buffer_storage *
 yttrium_buffer_storage_pool_acquire(struct yttrium_screen *screen,
@@ -294,10 +282,33 @@ yttrium_resource_init_threaded(struct yttrium_resource *res)
    threaded_resource(&res->base)->is_shared = true;
 }
 
+static bool
+yttrium_resource_shared_retired(struct yttrium_resource *res,
+                               const char *owner)
+{
+   if (!res->venus.display_endpoint &&
+       !((res->optimal_shared_image || res->optimal_present_image ||
+          res->venus.display_endpoint_imported) &&
+         res->venus.initialized))
+      return true;
+
+   /* Fini reports allocation adoption, not GPU retirement. A remaining endpoint
+    * or initialized shared image may be referenced by retained batches. */
+   struct yttrium_screen *screen = yttrium_screen(res->base.screen);
+   yttrium_venus_retain_on_teardown(screen->venus);
+   YTTRIUM_WARN("yttrium: ERROR shared image teardown owner=%s component=venus2 reason=shared-objects-retirement-unconfirmed resource=%p allocation=0x%lx res_id=%u action=retain-parent-record-and-Windows-backing-until-process-exit\n",
+                owner, (void *)res, (unsigned long)res->hAllocation,
+                res->venus_res_id);
+   return false;
+}
+
 static void
 yttrium_resource_free(struct yttrium_resource *res)
 {
    if (!res)
+      return;
+
+   if (!yttrium_resource_shared_retired(res, "resource_free"))
       return;
 
    if (res->base.target == PIPE_BUFFER) {
@@ -316,6 +327,18 @@ yttrium_resource_free(struct yttrium_resource *res)
 #define VIRTGPU_BLOB_FLAG_USE_SHAREABLE 0x0002
 #define YTTRIUM_DISPLAY_STAGING_ARENA_DEFAULT_SIZE (16ull * 1024ull * 1024ull)
 
+bool
+yttrium_gdi_resource_is_optimal_shared(struct pipe_resource *resource)
+{
+   return resource && yttrium_resource(resource)->optimal_shared_image;
+}
+
+bool
+yttrium_gdi_resource_is_optimal_present(struct pipe_resource *resource)
+{
+   return resource && yttrium_resource(resource)->optimal_present_image;
+}
+
 void
 yttrium_gdi_resource_set_primary_target(struct pipe_resource *resource,
                                         bool primary_target)
@@ -329,11 +352,6 @@ yttrium_gdi_resource_set_primary_target(struct pipe_resource *resource,
    if (res->primary_target == primary_target)
       return;
 
-   YTTRIUM_LOG("yttrium: resource primary identity hAllocation=0x%lx res_id=%u primary=%u->%u\n",
-               (unsigned long)res->hAllocation,
-               res->venus_res_id,
-               res->primary_target,
-               primary_target);
    res->primary_target = primary_target;
 }
 
@@ -350,10 +368,6 @@ yttrium_gdi_resource_set_allocation_ownership(struct pipe_resource *resource,
    if (res->owns_allocation == owns_allocation)
       return;
 
-   YTTRIUM_LOG("yttrium: resource allocation ownership hAllocation=0x%lx "
-               "res_id=%u owns=%u->%u\n",
-               (unsigned long)res->hAllocation, res->venus_res_id,
-               res->owns_allocation, owns_allocation);
    res->owns_allocation = owns_allocation;
    res->allocation_destroyed_by_runtime = !owns_allocation;
    if (res->replacement_storage) {
@@ -466,47 +480,6 @@ yttrium_gdi_resource_rotate_runtime_handles(
    return true;
 }
 
-void
-yttrium_gdi_resource_debug_log(struct pipe_resource *resource,
-                               const char *label)
-{
-   const struct yttrium_resource *res;
-   const char *name;
-
-   if (!resource || !resource->screen || !resource->screen->get_name)
-      return;
-
-   name = resource->screen->get_name(resource->screen);
-   if (!name || strcmp(name, "yttrium") != 0)
-      return;
-
-   res = yttrium_resource(resource);
-   YTTRIUM_LOG("yttrium: dxgi %s ownership hAllocation=0x%lx res_id=%u mem_id=0x%llx display=%u primary=%u classic=%u owns=%u size=0x%llx stride=%u map_blob=%u venus=(init=%u buffer=%u image_id=%llu buffer_id=%llu memory_id=%llu alloc=0x%llx extent=%ux%u format=%u image_offset=0x%llx image_size=0x%llx row_pitch=%llu array_pitch=%llu)\n",
-                label ? label : "<unknown>",
-                (unsigned long)res->hAllocation,
-                res->venus_res_id,
-                (unsigned long long)res->venus_mem_id,
-                res->display_target,
-                res->primary_target,
-                res->classic_display,
-                res->owns_allocation,
-                (unsigned long long)res->size,
-                res->stride,
-                res->map_is_blob,
-                res->venus.initialized,
-                res->venus.buffer_backed,
-                (unsigned long long)res->venus.image_obj.id,
-                (unsigned long long)res->venus.buffer_obj.id,
-                (unsigned long long)res->venus.memory_obj.id,
-                (unsigned long long)res->venus.allocation_size,
-                res->venus.width,
-                res->venus.height,
-                res->venus.vk_format,
-                (unsigned long long)res->venus.image_offset,
-                (unsigned long long)res->venus.image_size,
-                (unsigned long long)res->venus.image_row_pitch,
-                (unsigned long long)res->venus.image_array_pitch);
-}
 
 static unsigned
 yttrium_resource_level_width(const struct pipe_resource *resource,
@@ -652,21 +625,15 @@ yttrium_resource_level_base_offset(const struct pipe_resource *resource,
 uint32_t
 yttrium_pipe_to_resource_format(enum pipe_format format)
 {
+   STATIC_ASSERT(PIPE_BIND_SHADER_IMAGE ==
+                 YTTRIUM_MESA_SHARED_IMAGE_SHADER_IMAGE_BIND);
    switch (format) {
-   case PIPE_FORMAT_B8G8R8A8_UNORM:
-      return VIRGL_FORMAT_B8G8R8A8_UNORM;
-   case PIPE_FORMAT_B8G8R8X8_UNORM:
-      return VIRGL_FORMAT_B8G8R8X8_UNORM;
-   case PIPE_FORMAT_R8G8B8A8_UNORM:
-      return VIRGL_FORMAT_R8G8B8A8_UNORM;
+#define YTTRIUM_SHARED_PIPE_TO_RESOURCE(name, dxgi, vk, alternate) \
+   case PIPE_FORMAT_##name: return VIRGL_FORMAT_##name;
+      YTTRIUM_SHARED_COLOR_FORMATS(YTTRIUM_SHARED_PIPE_TO_RESOURCE)
+#undef YTTRIUM_SHARED_PIPE_TO_RESOURCE
    case PIPE_FORMAT_R8G8B8X8_UNORM:
       return VIRGL_FORMAT_R8G8B8X8_UNORM;
-   case PIPE_FORMAT_R10G10B10A2_UNORM:
-      return VIRGL_FORMAT_R10G10B10A2_UNORM;
-   case PIPE_FORMAT_B8G8R8A8_SRGB:
-      return VIRGL_FORMAT_B8G8R8A8_SRGB;
-   case PIPE_FORMAT_R8G8B8A8_SRGB:
-      return VIRGL_FORMAT_R8G8B8A8_SRGB;
    default:
       return format;
    }
@@ -676,20 +643,12 @@ enum pipe_format
 yttrium_resource_to_pipe_format(uint32_t format)
 {
    switch (format) {
-   case VIRGL_FORMAT_B8G8R8A8_UNORM:
-      return PIPE_FORMAT_B8G8R8A8_UNORM;
-   case VIRGL_FORMAT_B8G8R8X8_UNORM:
-      return PIPE_FORMAT_B8G8R8X8_UNORM;
-   case VIRGL_FORMAT_R8G8B8A8_UNORM:
-      return PIPE_FORMAT_R8G8B8A8_UNORM;
+#define YTTRIUM_SHARED_RESOURCE_TO_PIPE(name, dxgi, vk, alternate) \
+   case VIRGL_FORMAT_##name: return PIPE_FORMAT_##name;
+      YTTRIUM_SHARED_COLOR_FORMATS(YTTRIUM_SHARED_RESOURCE_TO_PIPE)
+#undef YTTRIUM_SHARED_RESOURCE_TO_PIPE
    case VIRGL_FORMAT_R8G8B8X8_UNORM:
       return PIPE_FORMAT_R8G8B8X8_UNORM;
-   case VIRGL_FORMAT_R10G10B10A2_UNORM:
-      return PIPE_FORMAT_R10G10B10A2_UNORM;
-   case VIRGL_FORMAT_B8G8R8A8_SRGB:
-      return PIPE_FORMAT_B8G8R8A8_SRGB;
-   case VIRGL_FORMAT_R8G8B8A8_SRGB:
-      return PIPE_FORMAT_R8G8B8A8_SRGB;
    default:
       return (enum pipe_format)format;
    }
@@ -799,10 +758,6 @@ yttrium_map_allocation(struct pipe_screen *pscreen,
    *out_map_info = map.ResourceMapBlob.MapInfo;
    *out_map_is_blob = true;
 
-   YTTRIUM_LOG("yttrium: mapped %s blob hAllocation=0x%lx va=%p size=0x%llx map_info=0x%x\n",
-               label, (unsigned long)hAllocation, *out_map,
-               (unsigned long long)map.ResourceMapBlob.Size,
-               *out_map_info);
    return true;
 }
 
@@ -910,12 +865,6 @@ yttrium_create_venus_memory_mapping(struct pipe_screen *pscreen,
       return false;
    }
 
-   YTTRIUM_LOG("yttrium: present readback allocation hAllocation=0x%lx res_id=%u mem_id=0x%llx size=0x%llx stride=%u map=%p map_blob=%u\n",
-                (unsigned long)mapping->hAllocation,
-                mapping->venus_res_id,
-                (unsigned long long)venus_mem_id,
-                (unsigned long long)size, stride, mapping->map,
-                mapping->map_is_blob);
    return true;
 }
 
@@ -927,7 +876,9 @@ yttrium_destroy_readback_mapping(struct pipe_screen *pscreen,
    if (!mapping || !mapping->hAllocation)
       return;
 
-   if (mapping->map && mapping->map_is_blob) {
+   /* Allocation destruction below owns the remaining mapping after removal. */
+   if (mapping->map && mapping->map_is_blob &&
+       !gdikmt_device_is_removed(screen->device)) {
       VIOGPU_ESCAPE unmap;
       memset(&unmap, 0, sizeof(unmap));
       unmap.Type = VIOGPU_RES_UNMAP_BLOB;
@@ -973,7 +924,7 @@ yttrium_unmap_display_allocation(struct pipe_screen *pscreen,
    if (!res->map)
       return;
 
-   if (res->map_is_blob) {
+   if (res->map_is_blob && !gdikmt_device_is_removed(screen->device)) {
       memset(&unmap, 0, sizeof(unmap));
       unmap.Type = VIOGPU_RES_UNMAP_BLOB;
       unmap.DataLength = sizeof(VIOGPU_RES_UNMAP_BLOB_REQ);
@@ -997,7 +948,8 @@ yttrium_buffer_storage_destroy(struct yttrium_buffer_storage *storage)
 {
    struct yttrium_screen *screen = storage->screen;
 
-   if (storage->map && storage->map_is_blob && storage->hAllocation) {
+   if (storage->map && storage->map_is_blob && storage->hAllocation &&
+       !gdikmt_device_is_removed(screen->device)) {
       VIOGPU_ESCAPE unmap;
       memset(&unmap, 0, sizeof(unmap));
       unmap.Type = VIOGPU_RES_UNMAP_BLOB;
@@ -1057,14 +1009,6 @@ yttrium_buffer_storage_attach(struct yttrium_resource *res)
    assert(res->hAllocation);
    assert(res->map && res->data == res->map);
    assert(!res->owns_data);
-
-   if (yttrium_take_buffer_replacement_metadata_failpoint()) {
-      YTTRIUM_WARN("yttrium: TEST ONLY: injected buffer replacement metadata allocation failure owner=threaded-context-storage reason=deterministic-test-fault variable=%s resource=%p size=0x%llx bind=0x%x; replacement remains conservative/shared\n",
-                   YTTRIUM_TEST_FAIL_BUFFER_REPLACEMENT_METADATA_AT_ENV,
-                   (void *)res, (unsigned long long)res->size,
-                   res->base.bind);
-      return false;
-   }
 
    struct yttrium_buffer_storage *storage =
       CALLOC_STRUCT(yttrium_buffer_storage);
@@ -1183,6 +1127,20 @@ yttrium_resource_publish_private_draw_buffer(struct pipe_context *ctx,
    return true;
 }
 
+static uint32_t
+yttrium_shared_color_dxgi_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM: return 28;
+   case PIPE_FORMAT_R8G8B8A8_SRGB: return 29;
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8A8_UNORM: return 87;
+   case PIPE_FORMAT_B8G8R8A8_SRGB: return 91;
+   default: return 0;
+   }
+}
+
 static bool
 yttrium_create_guest_allocation(struct pipe_screen *pscreen,
                                 struct yttrium_resource *res,
@@ -1192,6 +1150,7 @@ yttrium_create_guest_allocation(struct pipe_screen *pscreen,
    struct yttrium_screen *screen = yttrium_screen(pscreen);
    struct pipe_resource *base = &res->base;
    VIOGPU_CREATE_ALLOCATION_EXCHANGE alloc_exchange;
+   struct yttrium_display_endpoint_data endpoint_exchange = {0};
    VIOGPU_CREATE_RESOURCE_EXCHANGE res_exchange;
    struct gdikmt_createallocation create;
    D3DDDI_ALLOCATIONINFO alloc_info;
@@ -1209,7 +1168,11 @@ yttrium_create_guest_allocation(struct pipe_screen *pscreen,
    }
 
    alloc_exchange.ResourceOptions.target = base->target;
-   alloc_exchange.ResourceOptions.format =
+   /* A v3 allocation names the scanout plane's physical byte order. Its
+    * trailer retains the logical UNORM/sRGB resource view separately. */
+   alloc_exchange.ResourceOptions.format = res->optimal_present_image ?
+      yttrium_display_endpoint_resource_format(
+         yttrium_shared_color_dxgi_format(base->format)) :
       yttrium_pipe_to_resource_format(base->format);
    alloc_exchange.ResourceOptions.bind = base->bind;
    alloc_exchange.ResourceOptions.width = base->width0;
@@ -1222,9 +1185,11 @@ yttrium_create_guest_allocation(struct pipe_screen *pscreen,
    alloc_exchange.Size = res->size;
    alloc_exchange.Stride = res->stride;
    alloc_exchange.BlobId = res->venus_mem_id;
-   if (res->venus.initialized && !res->venus.buffer_backed &&
-       res->venus.image_offset <= UINT32_MAX) {
-      alloc_exchange.ScanoutOffset = (ULONG)res->venus.image_offset;
+   const struct yttrium_venus_resource *public_image =
+      res->optimal_present_image ? res->venus.display_endpoint : &res->venus;
+   if (public_image && public_image->initialized && !public_image->buffer_backed &&
+       public_image->image_offset <= UINT32_MAX) {
+      alloc_exchange.ScanoutOffset = (ULONG)public_image->image_offset;
    }
    alloc_exchange.BlobMem = VIRTGPU_BLOB_MEM_HOST3D;
    alloc_exchange.BlobFlags = 0;
@@ -1244,6 +1209,35 @@ yttrium_create_guest_allocation(struct pipe_screen *pscreen,
 
    alloc_info.pPrivateDriverData = &alloc_exchange;
    alloc_info.PrivateDriverDataSize = sizeof(alloc_exchange);
+
+   if (res->optimal_shared_image) {
+      res->optimal_shared_data.allocation = alloc_exchange;
+      if (mappable ||
+          !yttrium_mesa_optimal_image_valid(&res->optimal_shared_data)) {
+         YTTRIUM_WARN("yttrium: ERROR optimal shared allocation rejected owner=resource_create component=venus reason=invalid-optimal-storage-contract action=fail-allocation\n");
+         return false;
+      }
+      res_exchange.magic = YTTRIUM_MESA_SHARED_IMAGE_MAGIC;
+      alloc_info.pPrivateDriverData = &res->optimal_shared_data;
+      alloc_info.PrivateDriverDataSize = res->optimal_shared_data.bytes;
+   }
+
+   if (res->optimal_present_image) {
+      endpoint_exchange.allocation = alloc_exchange;
+      endpoint_exchange.magic = YTTRIUM_MESA_SHARED_IMAGE_MAGIC;
+      endpoint_exchange.version = 3;
+      endpoint_exchange.bytes = sizeof(endpoint_exchange);
+      endpoint_exchange.format = yttrium_shared_color_dxgi_format(base->format);
+      endpoint_exchange.role = YTTRIUM_DISPLAY_ENDPOINT_ROLE_LINEAR_SCANOUT;
+      if (!public_image || !mappable ||
+          !yttrium_display_endpoint_valid(&endpoint_exchange)) {
+         YTTRIUM_WARN("yttrium: ERROR display endpoint rejected owner=resource_create component=venus reason=invalid-linear-primary-contract action=fail-allocation\n");
+         return false;
+      }
+      res_exchange.magic = YTTRIUM_MESA_SHARED_IMAGE_MAGIC;
+      alloc_info.pPrivateDriverData = &endpoint_exchange;
+      alloc_info.PrivateDriverDataSize = sizeof(endpoint_exchange);
+   }
 
    NTSTATUS status = screen->device->createAllocation(screen->device, &create);
    if (!NT_SUCCESS(status)) {
@@ -1281,13 +1275,6 @@ yttrium_create_guest_allocation(struct pipe_screen *pscreen,
 
    res->venus_res_id = resinfo.ResourceInfo.Id;
 
-   YTTRIUM_LOG("yttrium: %s allocation hAllocation=0x%lx res_id=%u mem_id=0x%llx blob_mem=0x%lx blob_flags=0x%lx size=0x%llx stride=%u primary=%u classic=%u\n",
-               label, (unsigned long)res->hAllocation, res->venus_res_id,
-               (unsigned long long)res->venus_mem_id,
-               (unsigned long)alloc_exchange.BlobMem,
-               (unsigned long)alloc_exchange.BlobFlags,
-               (unsigned long long)res->size, res->stride,
-               res->primary_target, res->classic_display);
    return true;
 }
 
@@ -1306,8 +1293,17 @@ yttrium_resource_create(struct pipe_screen *pscreen,
    res->primary_target = (templ->flags & PIPE_RESOURCE_FLAG_FRONTEND_PRIV) != 0;
    res->venus.cpu_readback =
       (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK) != 0;
+   const bool local_render =
+      (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER) != 0;
+   const bool optimal_present =
+      (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT) != 0;
+   const bool optimal_shared =
+      (templ->flags & YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED) != 0;
    res->base.flags &= ~(PIPE_RESOURCE_FLAG_FRONTEND_PRIV |
-                        YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK);
+                        YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK |
+                        YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER |
+                        YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED |
+                        YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT);
    pipe_reference_init(&res->base.reference, 1);
    yttrium_resource_init_threaded(res);
    res->venus.owner = &res->base;
@@ -1316,7 +1312,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
    res->display_target = templ->bind & PIPE_BIND_DISPLAY_TARGET;
    res->owns_allocation = true;
    const bool shared_target = (templ->bind & PIPE_BIND_SHARED) != 0;
-   const bool shared_display_target = shared_target && res->display_target;
    const bool depth_stencil_target =
       (templ->bind & PIPE_BIND_DEPTH_STENCIL) != 0 &&
       templ->target != PIPE_BUFFER;
@@ -1375,133 +1370,129 @@ yttrium_resource_create(struct pipe_screen *pscreen,
          yttrium_resource_apply_buffer_storage(res, pooled);
          threaded_resource(&res->base)->is_shared = false;
          memset(res->data, 0, res->size);
-         YTTRIUM_LOG("yttrium: buffer replacement backing reused resource=%p hAllocation=0x%lx res_id=%u data=%p size=0x%llx capacity=0x%llx bind=0x%x\n",
-                     (void *)res, (unsigned long)res->hAllocation,
-                     res->venus_res_id, res->data,
-                     (unsigned long long)res->size,
-                     (unsigned long long)res->data_capacity,
-                     res->base.bind);
       }
    }
 
-   YTTRIUM_LOG("yttrium: resource_create target=%u %ux%ux%u array=%u levels=%u format=%u bind=0x%x usage=%u flags=0x%x size=0x%llx stride=%u layer_stride=%u display=%u primary=%u shared=%u shared_display=%u\n",
-                templ->target,
-                templ->width0,
-                templ->height0,
-                templ->depth0,
-                templ->array_size,
-                templ->last_level + 1,
-                templ->format,
-                templ->bind,
-                templ->usage,
-                templ->flags,
-                (unsigned long long)res->size,
-                res->stride,
-                res->layer_stride,
-                res->display_target,
-                res->primary_target,
-                shared_target,
-                shared_display_target);
 
-   if (res->display_target) {
+   if (optimal_present) {
+      const unsigned required_bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_DISPLAY_TARGET;
+      const bool primary_present =
+         res->primary_target && !res->venus.cpu_readback;
+      const bool legacy_present =
+         !res->primary_target && res->venus.cpu_readback &&
+         templ->usage == PIPE_USAGE_DEFAULT;
+      if ((!primary_present && !legacy_present) || !local_render || optimal_shared ||
+          templ->target != PIPE_TEXTURE_2D ||
+          (templ->format != PIPE_FORMAT_R8G8B8A8_UNORM &&
+           templ->format != PIPE_FORMAT_R8G8B8A8_SRGB &&
+           templ->format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+           templ->format != PIPE_FORMAT_B8G8R8A8_SRGB) ||
+          templ->depth0 != 1 || templ->array_size != 1 || templ->last_level ||
+          templ->nr_samples > 1 || templ->nr_storage_samples > 1 ||
+          (templ->bind & required_bind) != required_bind ||
+          (templ->bind & ~(required_bind | PIPE_BIND_SAMPLER_VIEW)) || res->base.flags) {
+         YTTRIUM_WARN("yttrium: ERROR optimal present rejected owner=resource_create component=venus reason=unsupported-display-endpoint-contract target=%u format=%u bind=0x%x action=fail-resource\n",
+                      templ->target, templ->format, templ->bind);
+         yttrium_resource_free(res);
+         return NULL;
+      }
+      res->optimal_present_image = true;
+      uint64_t endpoint_size = 0;
+      if (!yttrium_venus_create_presentable_image(screen->venus, &res->venus,
+             templ->width0, templ->height0, templ->format, templ->bind,
+             &res->venus_mem_id, &endpoint_size)) {
+         YTTRIUM_WARN("yttrium: ERROR optimal present creation failed owner=resource_create component=venus reason=optimal-render-or-linear-endpoint-unavailable action=fail-resource\n");
+         if (yttrium_resource_shared_retired(res, "optimal present create"))
+            yttrium_resource_free(res);
+         return NULL;
+      }
+      const struct yttrium_venus_resource *endpoint = res->venus.display_endpoint;
+      res->size = endpoint_size;
+      res->stride = (unsigned)endpoint->image_row_pitch;
+      res->layer_stride = (unsigned)MIN2(endpoint_size, (uint64_t)UINT32_MAX);
+      if (!yttrium_create_guest_allocation(pscreen, res, "linear display endpoint", true)) {
+         yttrium_venus_resource_fini(screen->venus, NULL, &res->venus, NULL);
+         if (yttrium_resource_shared_retired(res, "optimal present allocation"))
+            yttrium_resource_free(res);
+         return NULL;
+      }
+   } else if (optimal_shared) {
+      const unsigned allowed_bind = PIPE_BIND_SHARED | PIPE_BIND_RENDER_TARGET |
+                                    PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_SHADER_IMAGE |
+                                    PIPE_BIND_DISPLAY_TARGET;
+      struct yttrium_shared_color_format shared_format;
+      if (templ->target != PIPE_TEXTURE_2D || templ->depth0 != 1 ||
+          templ->array_size != 1 || templ->last_level ||
+          templ->nr_samples > 1 || templ->nr_storage_samples > 1 ||
+          !(templ->bind & PIPE_BIND_SHARED) || (templ->bind & ~allowed_bind) ||
+          res->base.flags ||
+          res->primary_target || res->venus.cpu_readback || local_render ||
+          !yttrium_shared_color_format(
+             yttrium_pipe_to_resource_format(templ->format), &shared_format)) {
+         YTTRIUM_WARN("yttrium: ERROR optimal shared image rejected owner=resource_create component=venus reason=unsupported-offscreen-image-contract target=%u format=%u bind=0x%x action=fail-resource\n",
+                      templ->target, templ->format, templ->bind);
+         yttrium_resource_free(res);
+         return NULL;
+      }
+      res->optimal_shared_image = true;
+      uint64_t allocation_size = 0;
+      if (!yttrium_venus_create_optimal_shared_image(
+             screen->venus, &res->venus, templ->width0, templ->height0,
+             templ->format, templ->bind, &res->optimal_shared_data,
+             &res->venus_mem_id, &allocation_size)) {
+         YTTRIUM_WARN("yttrium: ERROR optimal shared image create failed owner=resource_create component=venus reason=exportable-optimal-image-unavailable action=fail-resource\n");
+         yttrium_resource_free(res);
+         return NULL;
+      }
+      res->size = allocation_size;
+      res->stride = res->layer_stride = 0;
+      if (!yttrium_create_guest_allocation(pscreen, res, "optimal shared", false)) {
+         yttrium_venus_resource_fini(screen->venus, NULL, &res->venus, NULL);
+         yttrium_resource_free(res);
+         return NULL;
+      }
+   } else if (res->display_target) {
       const uint64_t display_size = res->size;
       uint64_t venus_allocation_size = 0;
-      bool venus_backed = false;
-      const char *display_path = "unset";
-      const bool enable_display_image =
-         yttrium_gdi_debug_get_bool_option(
-            "D3D10UMD_YTTRIUM_ENABLE_DISPLAY_IMAGE", true);
-      const bool force_display_buffer =
-         yttrium_gdi_debug_get_bool_option(
-            "D3D10UMD_YTTRIUM_FORCE_DISPLAY_BUFFER", false);
-      const bool use_display_buffer =
-         force_display_buffer || !enable_display_image;
-
-      YTTRIUM_LOG("yttrium: create display target %ux%u format=%u bind=0x%x primary=%u shared=%u enable_image=%u force_buffer=%u export_sensitive=%u cpu_readback=%u\n",
-                   templ->width0, templ->height0, templ->format, templ->bind,
-                   res->primary_target, shared_target, enable_display_image,
-                   force_display_buffer, shared_display_target,
-                   res->venus.cpu_readback);
-
-      if (use_display_buffer) {
-         YTTRIUM_LOG("yttrium: using Venus display buffer allocation path=%s\n",
-                     force_display_buffer ? "forced" :
-                        "display-image-disabled");
-         res->size = display_size;
-         if (yttrium_venus_create_display_buffer(screen->venus, &res->venus,
-                                                  res->size,
-                                                  &res->venus_mem_id)) {
-            venus_backed = true;
-            display_path = force_display_buffer ? "forced-buffer" :
-               "display-image-disabled-buffer";
-         } else {
-            YTTRIUM_WARN("yttrium: Venus display buffer allocation failed for display target %ux%u format=%u bind=0x%x; refusing classic fallback\n",
-                         templ->width0, templ->height0, templ->format,
-                         templ->bind);
-            yttrium_resource_free(res);
-            return NULL;
+      if (yttrium_venus_create_display_image(screen->venus, &res->venus,
+                                             templ->width0, templ->height0,
+                                             templ->format, display_size,
+                                             &res->venus_mem_id,
+                                             &venus_allocation_size)) {
+         const unsigned cpp = util_format_get_blocksize(templ->format);
+         const uint64_t min_row = (uint64_t)templ->width0 * cpp;
+         if (cpp && res->venus.image_row_pitch >= min_row &&
+             res->venus.image_row_pitch <= UINT32_MAX) {
+            res->stride = (unsigned)res->venus.image_row_pitch;
+            res->layer_stride =
+               (unsigned)MIN2((uint64_t)UINT32_MAX,
+                              res->venus.image_array_pitch ?
+                                 res->venus.image_array_pitch :
+                                 res->venus.image_row_pitch *
+                                    MAX2(templ->height0, 1));
          }
+         const uint64_t venus_layout_size =
+            res->venus.image_offset + res->venus.image_size;
+         res->size = MAX2(display_size,
+                           MAX2(venus_allocation_size,
+                                venus_layout_size));
       } else {
-         if (yttrium_venus_create_display_image(screen->venus, &res->venus,
-                                                templ->width0, templ->height0,
-                                                templ->format, display_size,
-                                                &res->venus_mem_id,
-                                                &venus_allocation_size)) {
-            const unsigned cpp = util_format_get_blocksize(templ->format);
-            const uint64_t min_row = (uint64_t)templ->width0 * cpp;
-            if (cpp && res->venus.image_row_pitch >= min_row &&
-                res->venus.image_row_pitch <= UINT32_MAX) {
-               res->stride = (unsigned)res->venus.image_row_pitch;
-               res->layer_stride =
-                  (unsigned)MIN2((uint64_t)UINT32_MAX,
-                                 res->venus.image_array_pitch ?
-                                    res->venus.image_array_pitch :
-                                    res->venus.image_row_pitch *
-                                       MAX2(templ->height0, 1));
-            }
-            const uint64_t venus_layout_size =
-               res->venus.image_offset + res->venus.image_size;
-            res->size = MAX2(display_size,
-                              MAX2(venus_allocation_size,
-                                   venus_layout_size));
-            venus_backed = true;
-            display_path = "image";
-         } else {
-            YTTRIUM_WARN("yttrium: Venus display image allocation failed for display target %ux%u format=%u bind=0x%x; refusing implicit buffer fallback\n",
-                         templ->width0, templ->height0, templ->format,
-                         templ->bind);
-            yttrium_resource_free(res);
-            return NULL;
-         }
-      }
-
-      if (!yttrium_create_guest_allocation(pscreen, res, "display", true)) {
-         if (venus_backed) {
-            YTTRIUM_WARN("yttrium: Venus-backed display allocation failed for display target %ux%u format=%u bind=0x%x path=%s buffer_backed=%u; refusing implicit fallback\n",
-                         templ->width0, templ->height0, templ->format,
-                         templ->bind, display_path,
-                         res->venus.buffer_backed);
-            yttrium_venus_resource_fini(screen->venus, NULL, &res->venus,
-                                        NULL);
-         }
-
+         YTTRIUM_WARN("yttrium: Venus display image allocation failed for display target %ux%u format=%u bind=0x%x; refusing implicit buffer fallback\n",
+                      templ->width0, templ->height0, templ->format,
+                      templ->bind);
          yttrium_resource_free(res);
          return NULL;
       }
 
-      YTTRIUM_LOG("yttrium: display backing selected path=%s hAllocation=0x%lx res_id=%u shared_display=%u classic=%u venus_initialized=%u buffer_backed=%u image_id=%llu buffer_id=%llu mem_id=0x%llx size=0x%llx stride=%u\n",
-                   display_path,
-                   (unsigned long)res->hAllocation,
-                   res->venus_res_id,
-                   shared_display_target,
-                   res->classic_display,
-                   res->venus.initialized,
-                   res->venus.buffer_backed,
-                   (unsigned long long)res->venus.image_obj.id,
-                   (unsigned long long)res->venus.buffer_obj.id,
-                   (unsigned long long)res->venus_mem_id,
-                   (unsigned long long)res->size,
-                   res->stride);
+      if (!yttrium_create_guest_allocation(pscreen, res, "display", true)) {
+         YTTRIUM_WARN("yttrium: Venus-backed display allocation failed for display target %ux%u format=%u bind=0x%x path=image buffer_backed=%u; refusing implicit fallback\n",
+                      templ->width0, templ->height0, templ->format,
+                      templ->bind, res->venus.buffer_backed);
+         yttrium_venus_resource_fini(screen->venus, NULL, &res->venus,
+                                     NULL);
+         yttrium_resource_free(res);
+         return NULL;
+      }
 
    } else {
       if (ordered_worker_upload_direct_backing) {
@@ -1525,13 +1516,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             res->venus = pooled.venus;
             res->venus.owner = &res->base;
             yttrium_ordered_upload_rehome_venus_handles(&res->venus);
-            YTTRIUM_LOG("yttrium: ordered worker direct upload backing reused resource=%p hAllocation=0x%lx res_id=%u memory_id=%llu buffer_id=%llu data=%p size=0x%llx capacity=0x%llx\n",
-                        (void *)res, (unsigned long)res->hAllocation,
-                        res->venus_res_id,
-                        (unsigned long long)res->venus.memory_obj.id,
-                        (unsigned long long)res->venus.buffer_obj.id,
-                        res->data, (unsigned long long)res->size,
-                        (unsigned long long)res->data_capacity);
          } else {
             if (!yttrium_venus_create_bind_buffer(
                    screen->venus, &res->venus, res->size,
@@ -1569,12 +1553,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             }
             res->data = res->map;
             res->data_capacity = res->size;
-            YTTRIUM_LOG("yttrium: ordered worker direct upload backing created resource=%p hAllocation=0x%lx res_id=%u memory_id=%llu buffer_id=%llu data=%p size=0x%llx\n",
-                        (void *)res, (unsigned long)res->hAllocation,
-                        res->venus_res_id,
-                        (unsigned long long)res->venus.memory_obj.id,
-                        (unsigned long long)res->venus.buffer_obj.id,
-                        res->data, (unsigned long long)res->size);
          }
       }
 
@@ -1681,13 +1659,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             res->data_dirty = true;
             res->contents_serial++;
          }
-         YTTRIUM_LOG("yttrium: allocation-backed buffer resource=%p hAllocation=0x%lx res_id=%u data=%p size=0x%llx bind=0x%x\n",
-                     (void *)res,
-                     (unsigned long)res->hAllocation,
-                     res->venus_res_id,
-                     res->data,
-                     (unsigned long long)res->size,
-                     res->base.bind);
       }
 
       if (offscreen_color_target || depth_stencil_target ||
@@ -1716,16 +1687,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             res->venus_res_id = (uint32_t)res->venus.memory_obj.id;
             if (shared_target)
                res->venus_mem_id = res->venus.memory_obj.id;
-            YTTRIUM_LOG("yttrium: Venus-backed bind texture target created resource=%p image_id=%llu memory_id=%llu res_id=%u size=0x%llx target=%u format=%u extent=%ux%ux%u levels=%u array=%u bind=0x%x usage=0x%x\n",
-                        (void *)res,
-                        (unsigned long long)res->venus.image_obj.id,
-                        (unsigned long long)res->venus.memory_obj.id,
-                        res->venus_res_id,
-                        (unsigned long long)res->size,
-                        templ->target, templ->format, templ->width0,
-                        templ->height0, templ->depth0,
-                        templ->last_level + 1, templ->array_size,
-                        templ->bind, res->venus.image_usage);
          } else if (crash_containment_fallback) {
             YTTRIUM_WARN("yttrium: software fallback native bind texture image unavailable; keeping temporary CPU storage resource=%p target=%u format=%u bind=0x%x extent=%ux%ux%u levels=%u array=%u depth_stencil=%u sampler=%u legacy_shape=%u\n",
                          (void *)res, templ->target, templ->format,
@@ -1760,12 +1721,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             yttrium_resource_free(res);
             return NULL;
          }
-         YTTRIUM_LOG("yttrium: render/depth target uses Venus-only backing resource=%p size=0x%llx bind=0x%x image_id=%llu format=%u\n",
-                     (void *)res,
-                     (unsigned long long)res->size,
-                     res->base.bind,
-                     (unsigned long long)res->venus.image_obj.id,
-                     res->base.format);
       } else {
          if (!res->data) {
             if (res->size > SIZE_MAX) {
@@ -1798,13 +1753,6 @@ yttrium_resource_create(struct pipe_screen *pscreen,
             yttrium_resource_free(res);
             return NULL;
          }
-         YTTRIUM_LOG("yttrium: CPU-backed resource created resource=%p data=%p size=0x%llx bind=0x%x venus_initialized=%u image_id=%llu\n",
-                     (void *)res,
-                     res->data,
-                     (unsigned long long)res->size,
-                     res->base.bind,
-                     res->venus.initialized,
-                     (unsigned long long)res->venus.image_obj.id);
          /* A newly allocated stream-output shadow does not initialize its
           * separate device-local buffer.  Only a real CPU write should make
           * that shadow authoritative; transfer_unmap publishes such writes.
@@ -1860,23 +1808,6 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
    yttrium_trace_resource_destroy_state(
       YTTRIUM_TRACE_RESOURCE_DESTROY_BEGIN, 0, res);
 
-   YTTRIUM_LOG("yttrium: resource_destroy begin resource=%p hAllocation=0x%lx hResource=%p res_id=%u mem_id=0x%llx display=%u primary=%u classic=%u owns=%u size=0x%llx stride=%u venus=(init=%u buffer=%u image_id=%llu buffer_id=%llu memory_id=%llu)\n",
-                (void *)res,
-                (unsigned long)res->hAllocation,
-                res->hResource,
-                res->venus_res_id,
-                (unsigned long long)res->venus_mem_id,
-                res->display_target,
-                res->primary_target,
-                res->classic_display,
-                res->owns_allocation,
-                (unsigned long long)res->size,
-                res->stride,
-                res->venus.initialized,
-                res->venus.buffer_backed,
-                (unsigned long long)res->venus.image_obj.id,
-                (unsigned long long)res->venus.buffer_obj.id,
-                (unsigned long long)res->venus.memory_obj.id);
 
    if (res->replacement_storage) {
       assert(res->base.target == PIPE_BUFFER);
@@ -1888,8 +1819,6 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
     * resource_destroy proves that no GPU work can still read this backing. */
    if (res->ordered_worker_upload_direct_backing &&
        yttrium_ordered_upload_pool_return(screen, res)) {
-      YTTRIUM_LOG("yttrium: ordered worker direct upload backing pooled resource=%p size=0x%llx\n",
-                  (void *)res, (unsigned long long)res->size);
       yttrium_trace_resource_destroy_state(
          YTTRIUM_TRACE_RESOURCE_DESTROY_END, 0, res);
       yttrium_resource_free(res);
@@ -1921,14 +1850,10 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
       yttrium_venus_resource_fini(screen->venus, NULL, &res->venus,
                                   allocation_snapshot_ptr);
 
+   if (!yttrium_resource_shared_retired(res, "resource_destroy"))
+      return;
+
    if (allocation_adopted) {
-      YTTRIUM_LOG("yttrium: resource_destroy deferred allocation to Venus batch hAllocation=0x%lx hResource=%p size=0x%llx map=%p map_blob=%u owns=%u\n",
-                  (unsigned long)allocation_snapshot.hAllocation,
-                  allocation_snapshot.hResource,
-                  (unsigned long long)allocation_snapshot.size,
-                  allocation_snapshot.map,
-                  allocation_snapshot.map_is_blob,
-                  allocation_snapshot.owns_allocation);
       if (allocation_snapshot.map && res->data == allocation_snapshot.map)
          res->data = NULL;
       res->hAllocation = 0;
@@ -1944,9 +1869,6 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
 
    if (res->hAllocation) {
       if (res->allocation_destroyed_by_runtime) {
-         YTTRIUM_LOG("yttrium: release runtime-owned allocation without "
-                     "DeallocateCb hAllocation=0x%lx res_id=%u\n",
-                     (unsigned long)res->hAllocation, res->venus_res_id);
          yttrium_trace_resource_destroy_state(
             YTTRIUM_TRACE_RESOURCE_DESTROY_ALLOCATION_CLOSED, 0, res);
       } else {
@@ -1957,10 +1879,6 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
                screen->device->destroyAllocation(screen->device,
                                                  res->hResource,
                                                  res->hAllocation);
-            YTTRIUM_LOG("yttrium: destroy allocation hAllocation=0x%lx hResource=%p status=0x%lx\n",
-                        (unsigned long)res->hAllocation,
-                        res->hResource,
-                        (unsigned long)status);
             yttrium_trace_resource_destroy_state(
                YTTRIUM_TRACE_RESOURCE_DESTROY_ALLOCATION_CLOSED, status, res);
             if (!NT_SUCCESS(status)) {
@@ -1984,10 +1902,6 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
                screen->device->destroyAllocation(screen->device,
                                                  res->hResource,
                                                  res->hAllocation);
-            YTTRIUM_LOG("yttrium: close opened allocation hAllocation=0x%lx hResource=%p status=0x%lx\n",
-                        (unsigned long)res->hAllocation,
-                        res->hResource,
-                        (unsigned long)status);
             yttrium_trace_resource_destroy_state(
                YTTRIUM_TRACE_RESOURCE_DESTROY_ALLOCATION_CLOSED, status, res);
             if (!NT_SUCCESS(status)) {
@@ -2010,13 +1924,6 @@ yttrium_resource_destroy(struct pipe_screen *pscreen,
       }
    }
 
-   YTTRIUM_LOG("yttrium: resource_destroy end resource=%p hAllocation=0x%lx hResource=%p res_id=%u mem_id=0x%llx owns=%u\n",
-                (void *)res,
-                (unsigned long)res->hAllocation,
-                res->hResource,
-                res->venus_res_id,
-                (unsigned long long)res->venus_mem_id,
-                res->owns_allocation);
    yttrium_trace_resource_destroy_state(
       YTTRIUM_TRACE_RESOURCE_DESTROY_END, 0, res);
 
@@ -2045,20 +1952,6 @@ yttrium_resource_get_handle(struct pipe_screen *pscreen,
    whandle->stride = res->stride;
    whandle->array_stride = res->layer_stride;
    whandle->size = res->size;
-   YTTRIUM_LOG("yttrium: get_handle type=%u usage=0x%x handle=0x%lx hAllocation=0x%lx res_id=%u %ux%u format=%u bind=0x%x flags=0x%x primary=%u classic=%u stride=%u size=0x%llx\n",
-                whandle->type, usage,
-                (unsigned long)(uintptr_t)whandle->handle,
-                (unsigned long)res->hAllocation,
-                res->venus_res_id,
-                res->base.width0,
-                res->base.height0,
-                res->base.format,
-                res->base.bind,
-                res->base.flags,
-                res->primary_target,
-                res->classic_display,
-                res->stride,
-                (unsigned long long)res->size);
    return true;
 }
 
@@ -2112,15 +2005,6 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
       return NULL;
    }
 
-   YTTRIUM_LOG("yttrium: resource_from_handle type=%u handle=0x%lx usage=0x%x templ=%ux%u format=%u bind=0x%x flags=0x%x\n",
-                whandle->type,
-                (unsigned long)(uintptr_t)whandle->handle,
-                usage,
-                templ ? templ->width0 : 0,
-                templ ? templ->height0 : 0,
-                templ ? templ->format : PIPE_FORMAT_NONE,
-                templ ? templ->bind : 0,
-                templ ? templ->flags : 0);
 
    memset(&open, 0, sizeof(open));
    open.hGlobalHandle = (D3DKMT_HANDLE)(uintptr_t)whandle->handle;
@@ -2157,9 +2041,67 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
       goto out;
    }
 
-   const VIOGPU_CREATE_ALLOCATION_EXCHANGE *alloc =
-      (const VIOGPU_CREATE_ALLOCATION_EXCHANGE *)open_info[0].pPrivateDriverData;
-   if (!alloc ||
+   VIOGPU_CREATE_ALLOCATION_EXCHANGE alloc_copy;
+   struct yttrium_shared_image_data shared_image = {0};
+   struct yttrium_optimal_image_data optimal_image = {0};
+   struct yttrium_display_endpoint_data endpoint_image = {0};
+   bool mesa_optimal = false, mesa_endpoint = false;
+   uint32_t resource_magic = 0, trailer_magic = 0;
+   if (open.pPrivateDriverData && open.PrivateDriverDataSize >= sizeof(resource_magic))
+      memcpy(&resource_magic, open.pPrivateDriverData, sizeof(resource_magic));
+   if (open_info[0].pPrivateDriverData &&
+       open_info[0].PrivateDriverDataSize >= sizeof(alloc_copy) + sizeof(trailer_magic))
+      memcpy(&trailer_magic, (const uint8_t *)open_info[0].pPrivateDriverData +
+             sizeof(alloc_copy), sizeof(trailer_magic));
+   const bool mesa_shared = resource_magic == YTTRIUM_MESA_SHARED_IMAGE_MAGIC ||
+                            trailer_magic == YTTRIUM_MESA_SHARED_IMAGE_MAGIC;
+   if (mesa_shared &&
+       (!open_info[0].hAllocation || !open_info[0].pPrivateDriverData ||
+        !yttrium_shared_image_wire_valid(resource_magic, open.PrivateDriverDataSize,
+                                        trailer_magic, open_info[0].PrivateDriverDataSize))) {
+      YTTRIUM_WARN("yttrium: ERROR shared image metadata rejected owner=resource_import resource_magic=0x%x trailer_magic=0x%x resource_bytes=%u allocation_bytes=%u reason=invalid-wire-record action=fail-import\n",
+                   resource_magic, trailer_magic, open.PrivateDriverDataSize,
+                   open_info[0].PrivateDriverDataSize);
+      goto out;
+   }
+   if (mesa_shared) {
+      memcpy(&shared_image, open_info[0].pPrivateDriverData, sizeof(shared_image));
+      mesa_optimal = shared_image.version == 2 ||
+                     shared_image.version == YTTRIUM_OPTIMAL_IMAGE_DRM_VERSION;
+      mesa_endpoint = shared_image.version == 3;
+      if (!mesa_optimal && !mesa_endpoint) {
+         YTTRIUM_WARN("yttrium: ERROR shared image metadata rejected owner=resource_import component=venus version=%u reason=%s action=fail-import\n",
+                      shared_image.version, shared_image.version == 1 ?
+                         "shared-render-mirror-contract-removed" :
+                         "unsupported-storage-version");
+         goto out;
+      }
+      const size_t expected_size = shared_image.version == 2 ?
+         YTTRIUM_OPTIMAL_IMAGE_V2_BYTES :
+         shared_image.version == YTTRIUM_OPTIMAL_IMAGE_DRM_VERSION ?
+         YTTRIUM_OPTIMAL_IMAGE_DRM_BYTES : sizeof(endpoint_image);
+      if (open_info[0].PrivateDriverDataSize != expected_size) {
+         YTTRIUM_WARN("yttrium: ERROR shared image metadata rejected owner=resource_import version=%u allocation_bytes=%u expected_bytes=%u reason=version-size-mismatch action=fail-import\n",
+                      shared_image.version, open_info[0].PrivateDriverDataSize,
+                      (unsigned)expected_size);
+         goto out;
+      }
+      if (mesa_optimal) {
+         /* Version 2 ends at the UUIDs; keep the appended DRM fields zero. */
+         memcpy(&optimal_image, open_info[0].pPrivateDriverData, expected_size);
+      }
+      if (mesa_endpoint)
+         memcpy(&endpoint_image, open_info[0].pPrivateDriverData, sizeof(endpoint_image));
+      const bool valid = mesa_optimal ?
+         yttrium_mesa_optimal_image_valid(&optimal_image) :
+         yttrium_display_endpoint_valid(&endpoint_image);
+      if (!valid) {
+         YTTRIUM_WARN("yttrium: ERROR shared image metadata rejected owner=resource_import version=%u bytes=%u format=%u reason=unsupported-version-or-invalid-fields action=fail-import\n",
+                      shared_image.version, shared_image.bytes, shared_image.format);
+         goto out;
+      }
+   }
+   if (!open_info[0].pPrivateDriverData ||
        open_info[0].PrivateDriverDataSize <
           sizeof(VIOGPU_CREATE_ALLOCATION_EXCHANGE)) {
       yttrium_trace_resource_import_state(
@@ -2172,6 +2114,8 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
                    open.PrivateDriverDataSize);
       goto out;
    }
+   memcpy(&alloc_copy, open_info[0].pPrivateDriverData, sizeof(alloc_copy));
+   const VIOGPU_CREATE_ALLOCATION_EXCHANGE *alloc = &alloc_copy;
 
    res = CALLOC_STRUCT(yttrium_resource);
    if (!res)
@@ -2184,6 +2128,15 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
    res->base.target = (enum pipe_texture_target)alloc->ResourceOptions.target;
    res->base.format =
       yttrium_resource_to_pipe_format(alloc->ResourceOptions.format);
+   if (mesa_endpoint) {
+      /* The prefix is a physical UNORM plane, not the API view format. */
+      switch (endpoint_image.format) {
+      case 28: res->base.format = PIPE_FORMAT_R8G8B8A8_UNORM; break;
+      case 29: res->base.format = PIPE_FORMAT_R8G8B8A8_SRGB; break;
+      case 87: res->base.format = PIPE_FORMAT_B8G8R8A8_UNORM; break;
+      case 91: res->base.format = PIPE_FORMAT_B8G8R8A8_SRGB; break;
+      }
+   }
    res->base.bind = alloc->ResourceOptions.bind;
    res->base.width0 = alloc->ResourceOptions.width;
    res->base.height0 = alloc->ResourceOptions.height;
@@ -2205,6 +2158,9 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
    res->venus_mem_id = alloc->BlobId;
    res->size = alloc->Size;
    res->display_target = res->base.bind & PIPE_BIND_DISPLAY_TARGET;
+   res->optimal_shared_image = mesa_optimal;
+   if (mesa_optimal)
+      res->optimal_shared_data = optimal_image;
    res->classic_display = alloc->BlobMem == 0;
    res->owns_allocation = false;
    yttrium_resource_size(&res->base, &res->stride, &res->layer_stride);
@@ -2237,6 +2193,40 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
 
    res->venus_res_id = resinfo.ResourceInfo.Id;
 
+   if (mesa_shared) {
+      /* A versioned tag requires its matching storage contract, including
+       * when the opened-display import option is disabled. */
+      VIOGPU_ESCAPE attach_wait = {0};
+      attach_wait.Type = VIOGPU_RES_ATTACH_WAIT;
+      attach_wait.DataLength = sizeof(VIOGPU_RES_ATTACH_WAIT_REQ);
+      attach_wait.ResourceAttachWait.ResHandle = res->hAllocation;
+      const bool ready = res->venus_res_id &&
+         yttrium_venus_get_kmt_context(screen->venus) &&
+         yttrium_venus_flush_labeled(screen->venus, "versioned shared image import attach flush");
+      status = ready ? screen->device->escape(screen->device, &attach_wait,
+                                              sizeof(attach_wait)) : STATUS_INVALID_PARAMETER;
+      const bool attached = NT_SUCCESS(status) &&
+         attach_wait.ResourceAttachWait.Id == res->venus_res_id;
+      const bool imported = attached && (mesa_optimal ?
+         yttrium_venus_import_optimal_shared_image(
+            screen->venus, &res->venus, res->venus_res_id, &optimal_image) :
+         yttrium_venus_import_display_endpoint(
+            screen->venus, &res->venus, res->venus_res_id, &endpoint_image));
+      if (!imported) {
+         YTTRIUM_WARN("yttrium: ERROR shared image import failed owner=resource_import version=%u res_id=%u attach_id=%u status=0x%lx allocation=0x%lx action=fail-import\n",
+                      shared_image.version,
+                      res->venus_res_id, attach_wait.ResourceAttachWait.Id,
+                      (unsigned long)status, (unsigned long)res->hAllocation);
+         yttrium_resource_free(res);
+         res = NULL;
+         goto out;
+      }
+      res->stride = alloc->Stride;
+      res->layer_stride = mesa_optimal ? 0 :
+         (unsigned)MIN2(res->size, (uint64_t)UINT32_MAX);
+      goto skip_opened_display_import;
+   }
+
    if (res->display_target && res->classic_display) {
       yttrium_trace_resource_import_state(
          YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_FAILED, 0, &open, templ, res,
@@ -2256,27 +2246,7 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
    }
 
    if (res->display_target && !res->classic_display && res->venus_res_id) {
-      /* Opened display allocations may name resources owned by another Venus
-       * context.  The attach-wait escape makes the cross-context import path
-       * safe enough for normal use, but keep the option as an emergency
-       * opt-out while the display ownership model is still settling.
-       */
-      const bool import_opened_display =
-         yttrium_gdi_debug_get_bool_option(
-            "D3D10UMD_YTTRIUM_IMPORT_OPENED_DISPLAY", true);
-      if (!res->owns_allocation && !import_opened_display) {
-         yttrium_trace_resource_import_state(
-            YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_SKIPPED, 0, &open, templ,
-            res, import_opened_display);
-         YTTRIUM_LOG("yttrium: opened display allocation Venus import skipped res_id=%u hAllocation=0x%lx reason=debug_option_disabled\n",
-                      res->venus_res_id,
-                      (unsigned long)res->hAllocation);
-         goto skip_opened_display_import;
-      }
       if (!res->owns_allocation) {
-         YTTRIUM_LOG("yttrium: opened display allocation Venus import enabled res_id=%u hAllocation=0x%lx reason=cross_context_display\n",
-                     res->venus_res_id,
-                     (unsigned long)res->hAllocation);
 
          /* The attach-wait escape must run after the Venus render context
           * exists, because the following Venus import query is context-scoped.
@@ -2287,7 +2257,7 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
          if (!yttrium_venus_get_kmt_context(screen->venus)) {
             yttrium_trace_resource_import_state(
                YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_FAILED, 0, &open,
-               templ, res, import_opened_display);
+               templ, res, true);
             YTTRIUM_WARN("yttrium: opened display allocation Venus import skipped; missing Venus KMT context res_id=%u hAllocation=0x%lx\n",
                          res->venus_res_id,
                          (unsigned long)res->hAllocation);
@@ -2297,7 +2267,7 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
                                           "opened display import attach flush")) {
             yttrium_trace_resource_import_state(
                YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_FAILED, 0, &open,
-               templ, res, import_opened_display);
+               templ, res, true);
             YTTRIUM_WARN("yttrium: opened display allocation Venus import skipped; Venus flush failed before attach res_id=%u hAllocation=0x%lx\n",
                          res->venus_res_id,
                          (unsigned long)res->hAllocation);
@@ -2314,7 +2284,7 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
          if (!NT_SUCCESS(status)) {
             yttrium_trace_resource_import_state(
                YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_FAILED, status, &open,
-               templ, res, import_opened_display);
+               templ, res, true);
             YTTRIUM_WARN("yttrium: opened display allocation attach-wait failed status=0x%lx res_id=%u hAllocation=0x%lx\n",
                          status, res->venus_res_id,
                          (unsigned long)res->hAllocation);
@@ -2326,12 +2296,10 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
                          res->venus_res_id, attach_wait.ResourceAttachWait.Id,
                          (unsigned long)res->hAllocation);
          }
-         YTTRIUM_LOG("yttrium: opened display allocation attach-wait ok res_id=%u hAllocation=0x%lx\n",
-                     res->venus_res_id, (unsigned long)res->hAllocation);
       }
       yttrium_trace_resource_import_state(
          YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_BEGIN, 0, &open, templ, res,
-         import_opened_display);
+         true);
 
       uint64_t memory_id = 0;
       uint64_t allocation_size = 0;
@@ -2357,19 +2325,13 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
          }
          if (allocation_size)
             res->size = MAX2(res->size, allocation_size);
-         YTTRIUM_LOG("yttrium: imported opened display allocation into Venus res_id=%u image_id=%llu memory_id=%llu size=0x%llx stride=%u\n",
-                      res->venus_res_id,
-                      (unsigned long long)res->venus.image_obj.id,
-                      (unsigned long long)memory_id,
-                      (unsigned long long)res->size,
-                      res->stride);
          yttrium_trace_resource_import_state(
             YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_OK, 0, &open, templ, res,
-            import_opened_display);
+            true);
       } else {
          yttrium_trace_resource_import_state(
             YTTRIUM_TRACE_RESOURCE_IMPORT_VENUS_FAILED, 0, &open, templ, res,
-            import_opened_display);
+            true);
          YTTRIUM_WARN("yttrium: opened display allocation Venus import failed res_id=%u hAllocation=0x%lx\n",
                       res->venus_res_id,
                       (unsigned long)res->hAllocation);
@@ -2452,21 +2414,6 @@ yttrium_resource_from_handle(struct pipe_screen *pscreen,
    }
 
 skip_opened_display_import:
-   YTTRIUM_LOG("yttrium: opened resource handle=0x%lx hResource=%p hAllocation=0x%lx res_id=%u %ux%u format=%u bind=0x%x display=%u shared=%u mem_id=0x%llx blob_mem=0x%lx size=0x%llx stride=%u classic=%u venus_initialized=%u buffer_backed=%u image_id=%llu buffer_id=%llu\n",
-                (unsigned long)open.hGlobalHandle,
-                res->hResource,
-                (unsigned long)res->hAllocation, res->venus_res_id,
-                res->base.width0, res->base.height0, res->base.format,
-                res->base.bind, res->display_target,
-                (res->base.bind & PIPE_BIND_SHARED) != 0,
-                (unsigned long long)res->venus_mem_id,
-                (unsigned long)alloc->BlobMem,
-                (unsigned long long)res->size, res->stride,
-                res->classic_display,
-                res->venus.initialized,
-                res->venus.buffer_backed,
-                (unsigned long long)res->venus.image_obj.id,
-                (unsigned long long)res->venus.buffer_obj.id);
    yttrium_trace_resource_import_state(
       YTTRIUM_TRACE_RESOURCE_IMPORT_OPENED, 0, &open, templ, res,
       0xffffffffu);
@@ -2737,12 +2684,6 @@ yttrium_ensure_context_image_copy_staging(struct pipe_context *ctx,
       yctx->image_copy_staging.memory_obj.id;
    yctx->image_copy_staging_size =
       yctx->image_copy_staging.image_size;
-   YTTRIUM_LOG("yttrium: private device-local image copy staging buffer res_id=%u mem_id=0x%llx buffer_id=0x%llx size=0x%llx usage=0x%x\n",
-               (uint32_t)yctx->image_copy_staging_mem_id,
-               (unsigned long long)yctx->image_copy_staging_mem_id,
-               (unsigned long long)yctx->image_copy_staging.buffer_obj.id,
-               (unsigned long long)yctx->image_copy_staging_size,
-               yctx->image_copy_staging.buffer_usage);
    return true;
 }
 
@@ -2792,12 +2733,6 @@ yttrium_ensure_context_upload_staging(struct pipe_context *ctx,
 
    yctx->upload_staging_size = yctx->upload_staging.allocation_size;
    yctx->upload_staging_offset = 0;
-   YTTRIUM_LOG("yttrium: upload staging buffer hAllocation=0x%lx res_id=%u mem_id=0x%llx size=0x%llx stride=%u\n",
-               (unsigned long)yctx->upload_staging_mapping.hAllocation,
-               yctx->upload_staging_mapping.venus_res_id,
-               (unsigned long long)yctx->upload_staging_mem_id,
-               (unsigned long long)yctx->upload_staging_size,
-               stride);
    return true;
 }
 
@@ -2810,11 +2745,34 @@ yttrium_transfer_map(struct pipe_context *ctx,
                      struct pipe_transfer **ptransfer)
 {
    struct yttrium_resource *res = yttrium_resource(resource);
+   const bool legacy_optimal_present =
+      yttrium_resource_is_legacy_optimal_present(res);
+   if ((usage & PIPE_MAP_WRITE) &&
+       yttrium_endpoint_write_rejected(ctx, res, "Map-write"))
+      return NULL;
+   if (res->optimal_shared_image && res->display_target) {
+      YTTRIUM_WARN("yttrium: ERROR optimal composition Map rejected owner=yttrium-resource component=optimal-shared reason=opaque-storage-requires-explicit-staging action=fail-map allocation=0x%lx\n",
+                   (unsigned long)res->hAllocation);
+      return NULL;
+   }
+   if (res->optimal_present_image && !legacy_optimal_present) {
+      YTTRIUM_WARN("yttrium: ERROR optimal primary Map rejected owner=yttrium-resource component=display-endpoint reason=CPU-map-not-qualified action=fail-map allocation=0x%lx\n",
+                   (unsigned long)res->hAllocation);
+      return NULL;
+   }
+   /* A fresh canonical-image staging copy cannot complete synchronously
+    * without a GPU wait. Never start that work for a nonblocking Map. */
+   if (legacy_optimal_present && (usage & PIPE_MAP_DONTBLOCK))
+      return NULL;
+
    struct yttrium_transfer *ytransfer;
    struct pipe_transfer *transfer;
    uint8_t *ptr;
 
-   if (res->display_target) {
+   /* The legacy endpoint is only a published consumer copy. Explicit CPU
+    * transfers must stage the canonical optimal image, never map stale
+    * endpoint bytes. Primary scanout resources remain unmappable above. */
+   if (res->display_target && !legacy_optimal_present) {
       if (level != 0) {
          YTTRIUM_WARN("yttrium: unsupported display target CPU map level=%u\n",
                       level);
@@ -2869,16 +2827,6 @@ yttrium_transfer_map(struct pipe_context *ctx,
          ytransfer->upload_to_venus = true;
          *ptransfer = transfer;
 
-         YTTRIUM_LOG("yttrium: Venus display CPU write map staging resource=%p hAllocation=0x%lx image_id=%llu res_id=%u box=%d,%d,%d %dx%dx%d stride=%u layer_stride=%llu usage=0x%x\n",
-                     (void *)res,
-                     (unsigned long)res->hAllocation,
-                     (unsigned long long)res->venus.image_obj.id,
-                     res->venus_res_id,
-                     box->x, box->y, box->z,
-                     box->width, box->height, box->depth,
-                     transfer->stride,
-                     (unsigned long long)transfer->layer_stride,
-                     usage);
          return ytransfer->staging;
       }
 
@@ -2900,8 +2848,7 @@ yttrium_transfer_map(struct pipe_context *ctx,
       *ptransfer = transfer;
 
       ptr = (uint8_t *)res->map +
-            yttrium_resource_offset(resource, level, box->x, box->y,
-                                    box->z);
+            yttrium_resource_offset(resource, level, box->x, box->y, box->z);
       return ptr;
    }
 
@@ -3056,15 +3003,6 @@ yttrium_transfer_map(struct pipe_context *ctx,
       ytransfer->upload_to_venus = true;
       transfer->stride = (unsigned)row_bytes;
       transfer->layer_stride = (uintptr_t)layer_bytes;
-      YTTRIUM_LOG("yttrium: Venus image CPU write map staging resource=%p image_id=%llu res_id=%u box=%d,%d,%d %dx%dx%d stride=%u layer_stride=%llu usage=0x%x\n",
-                  (void *)res,
-                  (unsigned long long)res->venus.image_obj.id,
-                  res->venus_res_id,
-                  box->x, box->y, box->z,
-                  box->width, box->height, box->depth,
-                  transfer->stride,
-                  (unsigned long long)transfer->layer_stride,
-                  usage);
       return ytransfer->staging;
    }
 
@@ -3338,6 +3276,8 @@ yttrium_texture_subdata(struct pipe_context *ctx,
                         uintptr_t layer_stride)
 {
    struct yttrium_resource *dst = yttrium_resource(resource);
+   if (yttrium_endpoint_write_rejected(ctx, dst, "texture_subdata"))
+      return;
 
    (void)usage;
 
@@ -3508,7 +3448,7 @@ yttrium_clear_render_target(struct pipe_context *ctx,
    struct yttrium_resource *res =
       dst && dst->texture ? yttrium_resource(dst->texture) : NULL;
 
-   if (!res)
+   if (!res || yttrium_endpoint_write_rejected(ctx, res, "clear-render-target"))
       return;
 
    if (res->display_target || yttrium_resource_is_venus_color_attachment(res)) {
@@ -3533,12 +3473,6 @@ yttrium_clear_render_target(struct pipe_context *ctx,
       if (!width || !height)
          return;
 
-      YTTRIUM_LOG("yttrium: clear color target hAllocation=0x%lx res_id=%u display=%u level=%u layers=%u+%u color_f=%f,%f,%f,%f color_ui=%u,%u,%u,%u color_i=%d,%d,%d,%d\n",
-                   (unsigned long)res->hAllocation, res->venus_res_id,
-                   res->display_target, level, first_layer, layer_count,
-                   color->f[0], color->f[1], color->f[2], color->f[3],
-                   color->ui[0], color->ui[1], color->ui[2], color->ui[3],
-                   color->i[0], color->i[1], color->i[2], color->i[3]);
 
       union pipe_color_union clear_color = *color;
       if (util_format_is_srgb(view_format) &&
@@ -3810,15 +3744,6 @@ yttrium_copy_cpu_to_venus_image(struct pipe_context *ctx,
                                   dstx, dsty, dstz,
                                   width, height,
                                   src_stride, staging_stride);
-      YTTRIUM_LOG("yttrium: resource_copy_region copied CPU to display image src=%p dst hAllocation=0x%lx res_id=%u src=%u,%u layer=%u dst_level=%u dst=%u,%u layer=%u %ux%ux%u stride=%u/%u staging_res_id=%u\n",
-                  ysrc->data,
-                  (unsigned long)ydst->hAllocation,
-                  ydst->venus_res_id,
-                  src_x, src_y, src_layer,
-                  dst_level, dstx, dsty, dstz,
-                  width, height, depth,
-                  src_stride, staging_stride,
-                  yctx->upload_staging_mapping.venus_res_id);
    } else {
       yttrium_trace_resource_copy_unsupported(0, 0, ydst->hAllocation,
                                               ydst->venus_res_id,
@@ -3880,6 +3805,18 @@ yttrium_copy_venus_image_to_cpu(struct pipe_context *ctx,
    const bool d24s8_readback =
       ysrc->base.format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
       ysrc->base.format == PIPE_FORMAT_S8_UINT_Z24_UNORM;
+   /* The copied depth aspect has the representation of the actual Vulkan
+    * image format. D24 copies leave the upper eight bits undefined; their
+    * contents cannot distinguish packed UNORM from floating-point depth. */
+   if (d24s8_readback &&
+       ysrc->venus.vk_format != VK_FORMAT_D24_UNORM_S8_UINT &&
+       ysrc->venus.vk_format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+      YTTRIUM_WARN("yttrium: ERROR depth readback rejected owner=resource_copy_region component=venus reason=unsupported-depth-storage-format pipe_format=%u vk_format=%u action=fail-copy\n",
+                   ysrc->base.format, ysrc->venus.vk_format);
+      return false;
+   }
+   const bool float_depth_readback =
+      ysrc->venus.vk_format == VK_FORMAT_D32_SFLOAT_S8_UINT;
    const uint32_t stencil_readback_stride = d24s8_readback ? width : 0;
    const uint64_t stencil_readback_size =
       d24s8_readback ? (uint64_t)stencil_readback_stride * rows : 0;
@@ -3994,9 +3931,8 @@ yttrium_copy_venus_image_to_cpu(struct pipe_context *ctx,
             const uint32_t depth_bits =
                ((const uint32_t *)(const void *)src_row)[x];
             uint32_t z24;
-            /* Depth copies return zero-extended Z24 or floats. */
-            if (!(depth_bits & 0xff000000u)) {
-               z24 = depth_bits;
+            if (!float_depth_readback) {
+               z24 = depth_bits & 0x00ffffffu;
             } else {
                float depth;
                memcpy(&depth, &depth_bits, sizeof(depth));
@@ -4033,15 +3969,6 @@ yttrium_copy_venus_image_to_cpu(struct pipe_context *ctx,
                                dstx, dsty, dstz,
                                width, height,
                                readback_stride, dst_stride);
-   YTTRIUM_LOG("yttrium: resource_copy_region copied display image to CPU src hAllocation=0x%lx res_id=%u src_level=%u src=%u,%u layer=%u dst=%p dst_level=%u dst=%u,%u layer=%u %ux%u stride=%u/%u readback_res_id=%u\n",
-               (unsigned long)ysrc->hAllocation,
-               ysrc->venus_res_id,
-               src_level, src_x, src_y, src_layer,
-               ydst->data,
-               dst_level, dstx, dsty, dstz,
-               width, height,
-               readback_stride, dst_stride,
-               mapping.venus_res_id);
    ok = true;
 
 out:
@@ -4378,6 +4305,8 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
    struct yttrium_screen *screen = yttrium_screen(ctx->screen);
    struct yttrium_resource *ydst = yttrium_resource(dst);
    struct yttrium_resource *ysrc = yttrium_resource(src);
+   if (yttrium_endpoint_write_rejected(ctx, ydst, "resource-copy-region"))
+      return;
    uint32_t copy_id = 0;
    uint32_t copy_path = 0;
 
@@ -4592,10 +4521,6 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
          goto unsupported;
       }
 
-      if (ydst->data)
-         YTTRIUM_LOG("yttrium: resource_copy_region retired CPU shadow after full GPU depth-to-sampled copy dst=%p res_id=%u data=%p capacity=0x%llx extent=%ux%u\n",
-                     (void *)ydst, ydst->venus_res_id, ydst->data,
-                     (unsigned long long)ydst->data_capacity, width, height);
       FREE(ydst->data);
       ydst->data = NULL;
       ydst->data_capacity = 0;
@@ -4648,13 +4573,6 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
                                      dstx, dsty, dstz,
                                      width, height,
                                      src_stride, dst_stride);
-         YTTRIUM_LOG("yttrium: resource_copy_region copied CPU to CPU src=%p dst=%p src_level=%u src=%u,%u layer=%u dst_level=%u dst=%u,%u layer=%u %ux%u stride=%u/%u\n",
-                     ysrc->data,
-                     ydst->data,
-                     src_level, src_x, src_y, src_layer,
-                     dst_level, dstx, dsty, dstz,
-                     width, height,
-                     src_stride, dst_stride);
          copy_path = YTTRIUM_TRACE_COPY_CPU_TO_CPU;
          goto copied;
       }
@@ -4694,14 +4612,6 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
                                      dstx, dsty, dstz,
                                      width, height,
                                      src_stride, dst_stride);
-         YTTRIUM_LOG("yttrium: resource_copy_region copied CPU to display buffer src=%p dst hAllocation=0x%lx res_id=%u src_level=%u src=%u,%u layer=%u dst_level=%u dst=%u,%u layer=%u %ux%u stride=%u/%u\n",
-                     ysrc->data,
-                     (unsigned long)ydst->hAllocation,
-                     ydst->venus_res_id,
-                     src_level, src_x, src_y, src_layer,
-                     dst_level, dstx, dsty, dstz,
-                     width, height,
-                     src_stride, dst_stride);
          copy_path = YTTRIUM_TRACE_COPY_CPU_TO_DISPLAY_BUFFER;
          goto copied;
       }
@@ -4754,14 +4664,6 @@ yttrium_resource_copy_region(struct pipe_context *ctx,
          dstx, dsty, dstz,
          width, height,
          ysrc->stride, ydst->stride);
-      YTTRIUM_LOG("yttrium: resource_copy_region copied display image src hAllocation=0x%lx res_id=%u %u,%u layer=%u dst hAllocation=0x%lx res_id=%u %u,%u layer=%u %ux%u\n",
-                  (unsigned long)ysrc->hAllocation,
-                  ysrc->venus_res_id,
-                  src_x, src_y, src_layer,
-                  (unsigned long)ydst->hAllocation,
-                  ydst->venus_res_id,
-                  dstx, dsty, dstz,
-                  width, height);
       copy_path = YTTRIUM_TRACE_COPY_DISPLAY_IMAGE_TO_DISPLAY_IMAGE;
       goto copied;
    }
@@ -4808,18 +4710,29 @@ unsupported:
    return;
 
 copied:
-   if (buffer_copy && ydst->gpu_buffer_written && ydst->data &&
+   if (buffer_copy && ydst->data &&
+       ((ydst->base.bind & PIPE_BIND_STREAM_OUTPUT) ||
+        ydst->gpu_buffer_written) &&
        (copy_path == YTTRIUM_TRACE_COPY_CPU_TO_CPU ||
         copy_path == YTTRIUM_TRACE_COPY_BUFFER_TO_CPU)) {
-      /* Ordered uploader writes carry only this byte range.  Do not publish
-       * untouched shadow bytes over an adjacent GPU-written counter. */
+      /* Stream-output buffers have a detached CPU shadow even before their
+       * first GPU write.  Publish the copied range to their native backing;
+       * a HOST_WRITE barrier cannot upload heap storage.  Leave untouched
+       * shadow bytes alone, since adjacent GPU-written data may be newer. */
+      const bool update_aligned =
+         !(dstx & 3) && (!(width & 3) || dstx + width == ydst->size);
       if (!yttrium_resource_uses_mapped_venus_buffer(ydst) &&
-          !yttrium_venus_update_buffer(screen->venus, &ydst->venus, dstx,
-                                        width, (uint8_t *)ydst->data + dstx)) {
-         YTTRIUM_WARN("yttrium: buffer range publication failed owner=yttrium_resource reason=counter-buffer-range-upload-failed action=fail-draw\n");
+          (!update_aligned ||
+           !yttrium_venus_update_buffer(screen->venus, &ydst->venus, dstx,
+                                         width, (uint8_t *)ydst->data + dstx))) {
+         YTTRIUM_WARN("yttrium: buffer range publication failed owner=yttrium_resource reason=native-buffer-range-upload-failed action=fail-draw resource=%p offset=0x%x size=0x%x aligned=%u\n",
+                      (void *)ydst, dstx, width, update_aligned);
+         ydst->data_dirty = true;
          InterlockedExchange(&yttrium_context(ctx)->draw_failure, 1);
+         return;
       }
       ydst->data_dirty = false;
+      ydst->venus.contents_initialized = true;
       ydst->contents_serial++;
       return;
    }
@@ -4886,15 +4799,6 @@ yttrium_blit_ensure_image(struct pipe_context *ctx,
    if (!res->venus_mem_id)
       res->venus_mem_id = res->venus.memory_obj.id;
 
-   YTTRIUM_LOG("yttrium: blit promoted texture to Venus image resource=%p "
-               "res_id=%u image_id=%llu memory_id=%llu target=%u "
-               "%ux%ux%u levels=%u array=%u format=%u bind=0x%x\n",
-               (void *)res, res->venus_res_id,
-               (unsigned long long)res->venus.image_obj.id,
-               (unsigned long long)res->venus.memory_obj.id,
-               res->base.target, res->base.width0, res->base.height0,
-               res->base.depth0, res->base.last_level + 1,
-               res->base.array_size, res->base.format, bind);
    return true;
 }
 
@@ -4943,6 +4847,8 @@ yttrium_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       struct yttrium_screen *screen = yttrium_screen(ctx->screen);
       struct yttrium_resource *src = yttrium_resource(info->src.resource);
       struct yttrium_resource *dst = yttrium_resource(info->dst.resource);
+      if (yttrium_endpoint_write_rejected(ctx, dst, "blit"))
+         return;
       const struct pipe_box *src_box = &info->src.box;
       const struct pipe_box *dst_box = &info->dst.box;
       const bool src_3d = src->base.target == PIPE_TEXTURE_3D;
@@ -4961,8 +4867,7 @@ yttrium_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
          src_box->width == dst_box->width &&
          src_box->height == dst_box->height &&
          src_box->depth == dst_box->depth &&
-         src->base.nr_samples == dst->base.nr_samples &&
-         src->base.nr_samples <= 1;
+         dst->base.nr_samples <= 1;
       const bool supported_blit_shape =
          screen && src && dst &&
          !src->classic_display && !dst->classic_display &&
@@ -4986,6 +4891,9 @@ yttrium_blit(struct pipe_context *ctx, const struct pipe_blit_info *info)
       if (screen && depth_stencil_copy &&
           !src->classic_display && !dst->classic_display &&
           supported_targets &&
+          !info->scissor_enable &&
+          info->src.level <= src->base.last_level &&
+          info->dst.level <= dst->base.last_level &&
           src_box->x >= 0 && src_box->y >= 0 && src_box->z >= 0 &&
           dst_box->x >= 0 && dst_box->y >= 0 && dst_box->z >= 0 &&
           src_box->width > 0 && src_box->height > 0 &&
@@ -5150,9 +5058,12 @@ yttrium_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
 
    screen = yttrium_screen(ctx->screen);
    res = yttrium_resource(resource);
-   if (!screen || !screen->venus || !res->venus.initialized)
+   if (!screen || !screen->venus || !res->venus.initialized ||
+       gdikmt_device_get_reset_status(screen->device) != PIPE_NO_RESET)
       return;
 
+   /* This hook retires frontend allocations. Display endpoint publication
+    * belongs to Present; destruction needs no display copy-out. */
    if (!yttrium_venus_flush_async_labeled(screen->venus,
                                            "pipe resource flush")) {
       YTTRIUM_WARN("yttrium: resource flush submit failed owner=yttrium_resource reason=pending Venus batch submission failed resource=%p res_id=%u\n",

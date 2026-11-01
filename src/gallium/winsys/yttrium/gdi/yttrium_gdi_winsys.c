@@ -5,6 +5,8 @@
 
 #include <windows.h>
 #include <winternl.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "util/u_memory.h"
 
@@ -36,7 +38,6 @@ yttrium_gdi_screen_create(struct gdikmt_device *device)
       return NULL;
 
    screen->device = device;
-   yttrium_init_screen_options(screen);
    bool etw_log =
       yttrium_gdi_debug_get_bool_option("D3D10UMD_YTTRIUM_ETW_LOG", false);
    yttrium_trace_init(etw_log, false);
@@ -48,7 +49,6 @@ yttrium_gdi_screen_create(struct gdikmt_device *device)
       YTTRIUM_ERROR("yttrium: D3DKMTQueryAdapterInfo failed status=0x%lx\n",
                     status);
       yttrium_trace_shutdown();
-      yttrium_free_screen_options(screen);
       FREE(screen);
       return NULL;
    }
@@ -60,14 +60,12 @@ yttrium_gdi_screen_create(struct gdikmt_device *device)
                 screen->adapter_info.Flags.has_context_init,
                 screen->adapter_info.Flags.has_capset_query_fix,
                 (unsigned long long)screen->adapter_info.SupportedCapsetIDs);
-   yttrium_log_screen_config_and_options(screen);
 
    if (screen->adapter_info.IamVioGPU != VIOGPU_IAM ||
        !screen->adapter_info.Flags.Supports3d ||
        !screen->adapter_info.Flags.has_resource_blob) {
       YTTRIUM_ERROR("yttrium: adapter is not a blob-capable viogpu 3D adapter\n");
       yttrium_trace_shutdown();
-      yttrium_free_screen_options(screen);
       FREE(screen);
       return NULL;
    }
@@ -76,7 +74,6 @@ yttrium_gdi_screen_create(struct gdikmt_device *device)
          (1ull << VIRTGPU_DRM_CAPSET_VENUS))) {
       YTTRIUM_ERROR("yttrium: Venus capset is not available on this adapter\n");
       yttrium_trace_shutdown();
-      yttrium_free_screen_options(screen);
       FREE(screen);
       return NULL;
    }
@@ -85,7 +82,6 @@ yttrium_gdi_screen_create(struct gdikmt_device *device)
    if (!screen->venus) {
       YTTRIUM_ERROR("yttrium: failed to create Venus transport state\n");
       yttrium_trace_shutdown();
-      yttrium_free_screen_options(screen);
       FREE(screen);
       return NULL;
    }

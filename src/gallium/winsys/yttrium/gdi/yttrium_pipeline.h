@@ -71,6 +71,8 @@ struct yttrium_pipeline_key {
    VkFrontFace front_face;
    VkBool32 depth_bias_enable;
    VkBool32 depth_clamp_enable;
+   enum pipe_format depth_bias_format;
+   VkBool32 depth_bias_units_unscaled;
    float depth_bias_constant_factor;
    float depth_bias_clamp;
    float depth_bias_slope_factor;

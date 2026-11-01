@@ -25,6 +25,7 @@
 
 #include "yttrium_shader.h"
 #include "yttrium_venus.h"
+#include "yttrium_shared_image.h"
 
 struct yttrium_pipeline;
 struct yttrium_compute_pipeline_cache_entry;
@@ -75,12 +76,6 @@ struct yttrium_screen {
    struct gdikmt_device *device;
    VIOGPU_ADAPTERINFO adapter_info;
    struct yttrium_venus *venus;
-   char *capture_textured_draw_path;
-   unsigned capture_textured_draw_limit;
-   unsigned capture_textured_draw_count;
-   char *capture_skipped_draw_path;
-   unsigned capture_skipped_draw_limit;
-   unsigned capture_skipped_draw_count;
    struct nir_shader_compiler_options nir_options;
    bool glsl_type_singleton_ref;
 };
@@ -201,12 +196,6 @@ struct yttrium_context {
    struct yttrium_query *queries;
    struct yttrium_query *active_queries;
    struct pipe_framebuffer_state fb;
-   /* Diagnostic state for RT_STATS_EVERY; see yttrium_report_rt_stats. */
-   unsigned rt_stats_draw_index;
-   unsigned rt_stats_prev_frame_draws;
-   unsigned rt_stats_frame_seen;
-   uint32_t rt_stats_fb_sig;
-   bool rt_stats_sampling;
    struct pipe_vertex_buffer vertex_buffers[PIPE_MAX_ATTRIBS];
    unsigned num_vertex_buffers;
    struct yttrium_vertex_elements_state *vertex_elements;
@@ -328,6 +317,9 @@ struct yttrium_resource {
    unsigned layer_stride;
    bool display_target;
    bool primary_target;
+   bool optimal_shared_image;
+   bool optimal_present_image;
+   struct yttrium_optimal_image_data optimal_shared_data;
    bool classic_display;
    bool owns_allocation;
    bool allocation_destroyed_by_runtime;

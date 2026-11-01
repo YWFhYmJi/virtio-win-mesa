@@ -8,6 +8,8 @@
 
 #include "vn_common.h"
 
+struct yttrium_optimal_image_data;
+
 struct vn_renderer_shmem {
    struct vn_refcount refcount;
 
@@ -161,11 +163,13 @@ struct vn_renderer_bo_ops {
                                    struct vn_renderer_bo **out_bo);
 
 #if defined(HAVE_YTTRIUM)
-   VkResult (*create_from_win32_handle)(struct vn_renderer *renderer,
-                                        VkDeviceSize size,
-                                        void *handle,
-                                        VkMemoryPropertyFlags flags,
-                                        struct vn_renderer_bo **out_bo);
+   VkResult (*create_from_win32_handle)(
+      struct vn_renderer *renderer,
+      VkDeviceSize size,
+      void *handle,
+      VkMemoryPropertyFlags flags,
+      struct yttrium_optimal_image_data *image_data,
+      struct vn_renderer_bo **out_bo);
 #endif
 
    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
@@ -368,18 +372,20 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
 
 #if defined(HAVE_YTTRIUM)
 static inline VkResult
-vn_renderer_bo_create_from_win32_handle(struct vn_renderer *renderer,
-                                        VkDeviceSize size,
-                                        void *handle,
-                                        VkMemoryPropertyFlags flags,
-                                        struct vn_renderer_bo **out_bo)
+vn_renderer_bo_create_from_win32_handle(
+   struct vn_renderer *renderer,
+   VkDeviceSize size,
+   void *handle,
+   VkMemoryPropertyFlags flags,
+   struct yttrium_optimal_image_data *image_data,
+   struct vn_renderer_bo **out_bo)
 {
    if (!renderer->bo_ops.create_from_win32_handle)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    struct vn_renderer_bo *bo;
    VkResult result = renderer->bo_ops.create_from_win32_handle(
-      renderer, size, handle, flags, &bo);
+      renderer, size, handle, flags, image_data, &bo);
    if (result != VK_SUCCESS)
       return result;
 

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MPL-2.0
  */
 
+#include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include "util/u_math.h"
 #include "util/u_inlines.h"
 #include "util/hash_table.h"
+#include "yttrium_internal.h"
 
 #include "yttrium_venus2_ring.h"
 #include "yttrium_venus2_private.h"
@@ -39,13 +41,29 @@
 #include "venus-protocol/vn_protocol_driver_shader_module.h"
 #include "venus-protocol/vn_protocol_driver_transport.h"
 
+/* Device loss cancels waits; it never proves that batch ownership retired. */
+static bool
+yttrium_venus_batch_cancelled(const struct yttrium_venus *venus)
+{
+   return !venus || venus->failed ||
+          gdikmt_device_get_reset_status(venus->device) != PIPE_NO_RESET;
+}
+
 static bool
 yttrium_venus_queue_submit(struct yttrium_venus *venus,
-                          const VkSubmitInfo *info, VkFence fence)
+                          const VkSubmitInfo *info, VkFence fence,
+                          const D3DKMT_HANDLE *primary_writes,
+                          uint32_t primary_write_count,
+                          bool *may_have_submitted)
 {
+   *may_have_submitted = false;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
+
    if (!venus->kmt_ctx->scheduled_present_mode) {
+      *may_have_submitted = true;
       vn_async_vkQueueSubmit(&venus->vn_ring, venus->queue, 1, info, fence);
-      return !venus->failed;
+      return !yttrium_venus_batch_cancelled(venus);
    }
 
    /* Recording stays on the shared ring. Windows owns execution of QueueSubmit.
@@ -63,10 +81,16 @@ yttrium_venus_queue_submit(struct yttrium_venus *venus,
    struct vn_cs_encoder enc = VN_CS_ENCODER_INITIALIZER_LOCAL(data, size);
    vn_encode_vkWaitRingSeqnoMESA(&enc, 0, venus->ring.id, seqno);
    vn_encode_vkQueueSubmit(&enc, 0, venus->queue, 1, info, fence);
-   ok = !enc.fatal_error && yttrium_venus_submit_gpu(venus, data, vn_cs_encoder_get_len(&enc));
+   if (enc.fatal_error) {
+      ok = false;
+   } else {
+      *may_have_submitted = true;
+      ok = yttrium_venus_submit_gpu(venus, data, vn_cs_encoder_get_len(&enc),
+                                     primary_writes, primary_write_count);
+   }
    FREE(data);
    yttrium_venus2_ring_unlock();
-   return ok;
+   return ok && !yttrium_venus_batch_cancelled(venus);
 }
 
 bool
@@ -102,6 +126,11 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
 
 static struct yttrium_venus_batch *
 yttrium_venus_latest_busy_batch(struct yttrium_venus *venus);
+
+static bool
+yttrium_venus_begin_command_batch_internal(
+   struct yttrium_venus *venus, const char *label,
+   bool native_draw_batch, bool async_submit, bool may_wait);
 
 static bool
 yttrium_venus_wait_batch(struct yttrium_venus *venus,
@@ -577,10 +606,6 @@ yttrium_venus_destroy_retired_allocation(
       return;
 
    if (retired->allocation_destroyed_by_runtime) {
-      YTTRIUM_LOG("yttrium: Venus release runtime-owned allocation without "
-                  "DeallocateCb hAllocation=0x%lx size=0x%llx\n",
-                  (unsigned long)retired->hAllocation,
-                  (unsigned long long)retired->allocation_size);
       retired->hAllocation = 0;
       retired->hResource = NULL;
       retired->map = NULL;
@@ -589,7 +614,8 @@ yttrium_venus_destroy_retired_allocation(
       return;
    }
 
-   if (retired->map && retired->map_is_blob) {
+   if (retired->map && retired->map_is_blob &&
+       !gdikmt_device_is_removed(venus->device)) {
       VIOGPU_ESCAPE unmap;
       memset(&unmap, 0, sizeof(unmap));
       unmap.Type = VIOGPU_RES_UNMAP_BLOB;
@@ -609,14 +635,6 @@ yttrium_venus_destroy_retired_allocation(
    NTSTATUS status =
       venus->device->destroyAllocation(venus->device, retired->hResource,
                                        retired->hAllocation);
-   YTTRIUM_LOG("yttrium: Venus retired allocation %s hAllocation=0x%lx hResource=%p status=0x%lx size=0x%llx map=%p map_blob=%u\n",
-               retired->owns_allocation ? "destroy" : "close",
-               (unsigned long)retired->hAllocation,
-               retired->hResource,
-               (unsigned long)status,
-               (unsigned long long)retired->allocation_size,
-               retired->map,
-               retired->map_is_blob);
    if (!NT_SUCCESS(status)) {
       YTTRIUM_WARN("yttrium: Venus retired allocation destroy failed owner=venus2 status=0x%lx hAllocation=0x%lx hResource=%p owns=%u runtime_destroyed=%u size=0x%llx map=%p map_blob=%u image_id=%llu buffer_id=%llu memory_id=%llu pid=%lu tid=%lu\n",
                    status, (unsigned long)retired->hAllocation,
@@ -937,9 +955,87 @@ yttrium_venus_destroy_draw_backing_pool(struct yttrium_venus *venus)
       venus, &venus->draw_backing_pool);
 }
 
-bool
-yttrium_venus_cmd_batch_track_resource(struct yttrium_venus *venus,
-                                       struct yttrium_venus_resource *resource)
+static void
+yttrium_venus_shared_image_transition(struct yttrium_venus *venus,
+                                      struct yttrium_venus_resource *resource,
+                                      VkImageLayout layout, VkAccessFlags access)
+{
+   const VkImageMemoryBarrier barrier = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .srcAccessMask = resource->layout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 :
+         VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+      .dstAccessMask = access,
+      .oldLayout = resource->layout, .newLayout = layout,
+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+      .image = resource->image,
+      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                          .levelCount = 1, .layerCount = 1},
+   };
+   vn_async_vkCmdPipelineBarrier(&venus->vn_ring, venus->command_buffer,
+      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      0, 0, NULL, 0, NULL, 1, &barrier);
+   resource->layout = layout;
+}
+
+static void
+yttrium_venus_shared_image_copy(struct yttrium_venus *venus,
+                                struct yttrium_venus_resource *src,
+                                struct yttrium_venus_resource *dst)
+{
+   yttrium_venus_shared_image_transition(venus, src,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT);
+   yttrium_venus_shared_image_transition(venus, dst,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT);
+   const VkImageCopy copy = {
+      .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+      .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
+      .extent = {src->width, src->height, 1},
+   };
+   vn_async_vkCmdCopyImage(&venus->vn_ring, venus->command_buffer,
+      src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      dst->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+   /* Copy-in initializes private contents but is not a producer write. A
+    * read-only imported alias must never publish back over the producer. */
+   dst->initialized_aspects |= VK_IMAGE_ASPECT_COLOR_BIT;
+   dst->contents_initialized = true;
+}
+
+static void
+yttrium_venus_display_endpoint_begin_recording(
+   struct yttrium_venus_resource *resource)
+{
+   if (!resource->display_endpoint || resource->display_endpoint_recording)
+      return;
+   resource->display_endpoint_saved_state = resource->display_endpoint_state;
+   resource->display_endpoint_saved_layout = resource->layout;
+   resource->display_endpoint_saved_aspects = resource->initialized_aspects;
+   resource->display_endpoint_saved_contents = resource->contents_initialized;
+   resource->display_endpoint_recording = true;
+}
+
+static void
+yttrium_venus_display_endpoint_finish_recording(
+   struct yttrium_venus_resource **resources, uint32_t count, bool submitted)
+{
+   for (uint32_t i = 0; i < count; i++) {
+      struct yttrium_venus_resource *resource = resources[i];
+      if (!resource || !resource->display_endpoint_recording)
+         continue;
+      if (!submitted) {
+         resource->display_endpoint_state = resource->display_endpoint_saved_state;
+         resource->layout = resource->display_endpoint_saved_layout;
+         resource->initialized_aspects = resource->display_endpoint_saved_aspects;
+         resource->contents_initialized = resource->display_endpoint_saved_contents;
+      }
+      resource->display_endpoint_recording = false;
+   }
+}
+
+/* Retain each image before recording work or changing external ownership. */
+static bool
+yttrium_venus_cmd_batch_retain_resource(struct yttrium_venus *venus,
+                                      struct yttrium_venus_resource *resource)
 {
    if (!resource)
       return true;
@@ -960,7 +1056,154 @@ yttrium_venus_cmd_batch_track_resource(struct yttrium_venus *venus,
    if (resource->owner)
       pipe_resource_reference(&venus->cmd_batch_pending_resource_refs[index],
                               resource->owner);
+   VkImageMemoryBarrier acquire;
+   if (yttrium_venus_external_acquire(&venus->external_images,
+          &resource->external_image, venus->queue_family_index, &acquire)) {
+      /* References are retained before ownership changes. Deferred render
+       * passes have not begun yet, so acquisition is outside a render pass
+       * and precedes both immediate commands and deferred layout barriers. */
+      resource->layout = VK_IMAGE_LAYOUT_GENERAL;
+      vn_async_vkCmdPipelineBarrier(&venus->vn_ring, venus->command_buffer,
+         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+         0, 0, NULL, 0, NULL, 1, &acquire);
+   }
    return true;
+}
+
+bool
+yttrium_venus_cmd_batch_track_resource(struct yttrium_venus *venus,
+                                     struct yttrium_venus_resource *resource)
+{
+   if (!yttrium_venus_cmd_batch_retain_resource(venus, resource))
+      return false;
+   if (resource)
+      yttrium_venus_display_endpoint_begin_recording(resource);
+   return true;
+}
+
+static bool
+yttrium_venus_primary_writes_add(struct yttrium_venus_primary_writes *writes,
+                                D3DKMT_HANDLE allocation, uint32_t limit)
+{
+   for (uint32_t i = 0; i < writes->count; i++) {
+      if (writes->allocations[i] == allocation)
+         return true;
+   }
+   if (writes->count >= limit)
+      return false;
+   if (writes->count == writes->capacity) {
+      const uint32_t capacity = MIN2(limit, MAX2(writes->capacity * 2, 8));
+      D3DKMT_HANDLE *allocations =
+         realloc(writes->allocations, (size_t)capacity * sizeof(*allocations));
+      if (!allocations)
+         return false;
+      writes->allocations = allocations;
+      writes->capacity = capacity;
+   }
+   writes->allocations[writes->count++] = allocation;
+   return true;
+}
+
+static bool
+yttrium_venus_primary_writes_merge(struct yttrium_venus_primary_writes *dst,
+                                  const struct yttrium_venus_primary_writes *src,
+                                  uint32_t limit)
+{
+   for (uint32_t i = 0; i < src->count; i++) {
+      if (!yttrium_venus_primary_writes_add(dst, src->allocations[i], limit))
+         return false;
+   }
+   return true;
+}
+
+/* The caller retains the pipe owner before snapshotting its physical handle.
+ * A local optimal render image does not write the owner's LINEAR endpoint;
+ * publication records the endpoint child as the actual write destination. */
+static bool
+yttrium_venus_cmd_batch_record_primary_write(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource)
+{
+   if (!resource || !resource->owner || resource->display_endpoint)
+      return true;
+
+   const struct yttrium_resource *owner = yttrium_resource(resource->owner);
+   /* primary_target follows DXGI identity rotation. Display/scanout binding
+    * continues to identify the backings which can become the frontbuffer. */
+   if (!owner->display_target && !owner->primary_target &&
+       !(owner->base.bind & PIPE_BIND_SCANOUT))
+      return true;
+
+   if (!venus->cmd_batch_primary_writes_failed && owner->hAllocation &&
+       yttrium_venus_primary_writes_add(&venus->cmd_batch_primary_writes,
+          owner->hAllocation, YTTRIUM_VENUS_CMD_BATCH_PENDING_RESOURCE_REF_LIMIT))
+      return true;
+
+   if (!venus->cmd_batch_primary_writes_failed)
+      YTTRIUM_WARN("yttrium: ERROR primary write tracking failed owner=venus2 allocation=0x%lx count=%u reason=missing-allocation-or-write-list-capacity action=reject-command-batch\n",
+                   (unsigned long)owner->hAllocation,
+                   venus->cmd_batch_primary_writes.count);
+   venus->cmd_batch_primary_writes_failed = true;
+   gdikmt_device_report_reset(venus->device, PIPE_UNKNOWN_CONTEXT_RESET);
+   return false;
+}
+
+bool
+yttrium_venus_cmd_batch_track_write(struct yttrium_venus *venus,
+                                   struct yttrium_venus_resource *resource)
+{
+   if (!yttrium_venus_cmd_batch_track_resource(venus, resource))
+      return false;
+   return yttrium_venus_cmd_batch_record_primary_write(venus, resource);
+}
+
+bool
+yttrium_venus2_publish_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   const char *label)
+{
+   if (!yttrium_venus_ensure_initialized(venus) || !resource ||
+       !resource->initialized || !resource->display_endpoint ||
+       resource->display_endpoint_imported) {
+      YTTRIUM_WARN("yttrium: ERROR display endpoint publication rejected owner=venus2 reason=missing-local-producer-endpoint action=fail-present\n");
+      return false;
+   }
+   struct yttrium_venus_resource *endpoint = resource->display_endpoint;
+   /* Publication preserves encoded bytes; the LINEAR endpoint uses the
+    * corresponding UNORM format even when the render image is sRGB. */
+   const bool compatible_format =
+      (endpoint->vk_format == VK_FORMAT_R8G8B8A8_UNORM &&
+       (resource->vk_format == VK_FORMAT_R8G8B8A8_UNORM ||
+        resource->vk_format == VK_FORMAT_R8G8B8A8_SRGB)) ||
+      (endpoint->vk_format == VK_FORMAT_B8G8R8A8_UNORM &&
+       (resource->vk_format == VK_FORMAT_B8G8R8A8_UNORM ||
+        resource->vk_format == VK_FORMAT_B8G8R8A8_SRGB));
+   if (!endpoint->initialized || !endpoint->external_image.enabled ||
+       !compatible_format ||
+       endpoint->width != resource->width || endpoint->height != resource->height ||
+       !(resource->image_usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+       !(endpoint->image_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      YTTRIUM_WARN("yttrium: ERROR display endpoint publication rejected owner=venus2 reason=invalid-endpoint-copy-contract action=fail-present\n");
+      return false;
+   }
+   if (!yttrium_venus_shared_image_publish_needed(&resource->display_endpoint_state))
+      return true;
+   const char *owner = label ? label : "final display endpoint publication";
+   /* Select the ordinary transfer recording path so earlier deferred draws
+    * are emitted before the copy. Its normal submit owns the Present signal. */
+   if (!yttrium_venus_begin_command_batch_internal(
+          venus, owner, false, true, true))
+      return false;
+   if (!yttrium_venus_cmd_batch_track_resource(venus, resource) ||
+       !yttrium_venus_cmd_batch_track_write(venus, endpoint)) {
+      yttrium_venus_cancel_command_batch_setup_failure(
+         venus, "display endpoint publication tracking failure");
+      return false;
+   }
+   yttrium_venus_shared_image_copy(venus, resource, endpoint);
+   yttrium_venus_shared_image_published(&resource->display_endpoint_state);
+   venus->cmd_batch_native_draw_only = false;
+   venus->cmd_batch_has_transfer_ops = true;
+   return yttrium_venus_cmd_batch_after_record(venus, owner);
 }
 
 static bool
@@ -1829,6 +2072,8 @@ yttrium_venus_cmd_batch_clear_pending_refs(struct yttrium_venus *venus)
           pipeline_count * sizeof(venus->cmd_batch_pending_pipelines[0]));
    venus->cmd_batch_pending_resource_count = 0;
    venus->cmd_batch_pending_pipeline_count = 0;
+   venus->cmd_batch_primary_writes.count = 0;
+   venus->cmd_batch_primary_writes_failed = false;
 }
 
 void
@@ -1846,6 +2091,12 @@ yttrium_venus_cmd_batch_clear_transient_upload_state(
 void
 yttrium_venus_cmd_batch_clear_state(struct yttrium_venus *venus)
 {
+   /* End released submitted recordings. An aborted recording never acquired
+    * ownership on the GPU and must restore only the provisional state. */
+   yttrium_venus_external_cancel(&venus->external_images);
+   yttrium_venus_display_endpoint_finish_recording(
+      venus->cmd_batch_pending_resources, venus->cmd_batch_pending_resource_count,
+      false);
    venus->display_copy_batch_recording = false;
    venus->cmd_batch_native_draw_only = false;
    venus->cmd_batch_async_submit = false;
@@ -1923,7 +2174,8 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
    struct yttrium_venus_batch *batch = venus->cmd_batch;
    if (batch)
       venus->command_buffer = batch->command_buffer;
-   bool ok = yttrium_venus_cmd_batch_emit_deferred_draws(venus, label);
+   bool ok = !venus->cmd_batch_primary_writes_failed &&
+      yttrium_venus_cmd_batch_emit_deferred_draws(venus, label);
    if (ok)
       ok = yttrium_venus_end_command_buffer(venus, label);
    /* A failed emission may leave the buffer recording.  Reset it before
@@ -1973,6 +2225,10 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
                 venus->cmd_batch_pending_resource_count *
                 sizeof(batch->resource_refs[0]));
          batch->resource_count = venus->cmd_batch_pending_resource_count;
+         struct yttrium_venus_primary_writes reusable = batch->primary_writes;
+         batch->primary_writes = venus->cmd_batch_primary_writes;
+         venus->cmd_batch_primary_writes = reusable;
+         venus->cmd_batch_primary_writes.count = 0;
          memset(venus->cmd_batch_pending_resources, 0,
                 venus->cmd_batch_pending_resource_count *
                 sizeof(venus->cmd_batch_pending_resources[0]));
@@ -1992,6 +2248,18 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
                 venus->cmd_batch_transient_count *
                 sizeof(batch->transients[0]));
          batch->transient_count = venus->cmd_batch_transient_count;
+         /* Handles point at the embedded object IDs, so the copied objects
+          * need handles into their new owner before recording slots reset. */
+         for (uint32_t i = 0; i < batch->transient_count; i++) {
+            struct yttrium_venus_cmd_batch_transient *transient =
+               &batch->transients[i];
+            transient->view =
+               YTTRIUM_VENUS_HANDLE(VkImageView, &transient->view_obj);
+            transient->render_pass =
+               YTTRIUM_VENUS_HANDLE(VkRenderPass, &transient->render_pass_obj);
+            transient->framebuffer =
+               YTTRIUM_VENUS_HANDLE(VkFramebuffer, &transient->framebuffer_obj);
+         }
          memset(venus->cmd_batch_transients, 0,
                 venus->cmd_batch_transient_count *
                 sizeof(venus->cmd_batch_transients[0]));
@@ -2006,6 +2274,8 @@ yttrium_venus_flush_command_batch(struct yttrium_venus *venus,
          if (ok)
             ok = yttrium_venus_submit_batch_async(venus, batch, op_count,
                                                    label);
+         yttrium_venus_display_endpoint_finish_recording(
+            batch->resources, batch->resource_count, ok || batch->busy);
          /* A failed ring notify can be reported after the command buffer was
           * submitted and ownership moved to the busy batch.  Keep all batch
           * references alive until that batch is retired or destroyed. */
@@ -2261,6 +2531,7 @@ yttrium_venus_batch_clear_refs(struct yttrium_venus_batch *batch)
    memset(batch->resource_refs, 0,
           resource_count * sizeof(batch->resource_refs[0]));
    batch->resource_count = 0;
+   batch->primary_writes.count = 0;
    memset(batch->pipelines, 0,
           pipeline_count * sizeof(batch->pipelines[0]));
    batch->pipeline_count = 0;
@@ -2520,10 +2791,9 @@ yttrium_venus_ensure_batch_feedback_buffer(struct yttrium_venus *venus)
       .allocationSize = MAX2(requirements.size, buffer_size),
       .memoryTypeIndex = memory_type_index,
    };
-   result = vn_call_vkAllocateMemory(&venus->vn_ring,
-                                     venus->device_handle,
-                                     &memory_info, NULL,
-                                     &venus->batch_feedback_memory);
+   result = yttrium_venus_allocate_memory(
+      venus, &memory_info, &requirements, &venus->batch_feedback_memory,
+      venus->batch_feedback_memory_obj.id, "batch-fence-feedback", true);
    if (result != VK_SUCCESS) {
       YTTRIUM_WARN("yttrium: ERROR: mapped batch-fence feedback setup failed owner=venus2 reason=vkAllocateMemory result=%d type=%u size=%llu\n",
                    result, memory_type_index,
@@ -2684,6 +2954,9 @@ yttrium_venus_batch_feedback_reset(struct yttrium_venus *venus,
                                    uint32_t index,
                                    const char *label)
 {
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
+
    volatile LONG *slot = yttrium_venus_batch_feedback_slot(venus, index);
    if (!slot) {
       YTTRIUM_WARN("yttrium: ERROR: mapped batch-fence feedback reset failed owner=venus2 reason=invalid_slot index=%u label=%s\n",
@@ -2728,6 +3001,9 @@ yttrium_venus_wait_batch_feedback(struct yttrium_venus *venus,
                                   VkFence fence,
                                   const char *label)
 {
+   if (yttrium_venus_batch_cancelled(venus))
+      return VK_ERROR_DEVICE_LOST;
+
    volatile LONG *slot = yttrium_venus_batch_feedback_slot(venus, index);
    if (!slot) {
       YTTRIUM_WARN("yttrium: ERROR: mapped batch-fence feedback wait failed owner=venus2 reason=invalid_slot index=%u label=%s\n",
@@ -2736,6 +3012,8 @@ yttrium_venus_wait_batch_feedback(struct yttrium_venus *venus,
    }
 
    VkResult status = yttrium_venus_batch_feedback_load(venus, slot);
+   if (yttrium_venus_batch_cancelled(venus))
+      return VK_ERROR_DEVICE_LOST;
    if (status == VK_SUCCESS)
       return VK_SUCCESS;
    if (status != VK_NOT_READY) {
@@ -2745,25 +3023,41 @@ yttrium_venus_wait_batch_feedback(struct yttrium_venus *venus,
    }
 
    const uint64_t start_ms = GetTickCount64();
+   uint64_t last_report_ms = start_ms;
    uint32_t iterations = 0;
    do {
-      if (GetTickCount64() - start_ms > YTTRIUM_VENUS_FENCE_WAIT_MS) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return VK_ERROR_DEVICE_LOST;
+      if (GetTickCount64() - last_report_ms >= YTTRIUM_VENUS_FENCE_WAIT_MS) {
          const VkResult host_fence_status =
             vn_call_vkGetFenceStatus(&venus->vn_ring,
                                      venus->device_handle, fence);
+         if (yttrium_venus_batch_cancelled(venus))
+            return VK_ERROR_DEVICE_LOST;
          const VkResult feedback_status_after_host_query =
             yttrium_venus_batch_feedback_load(venus, slot);
+         if (yttrium_venus_batch_cancelled(venus))
+            return VK_ERROR_DEVICE_LOST;
+         if (feedback_status_after_host_query != VK_SUCCESS &&
+             feedback_status_after_host_query != VK_NOT_READY)
+            return feedback_status_after_host_query;
+         if (host_fence_status != VK_SUCCESS &&
+             host_fence_status != VK_NOT_READY)
+            return host_fence_status;
          if (host_fence_status == VK_SUCCESS ||
              feedback_status_after_host_query == VK_SUCCESS)
             return VK_SUCCESS;
-         YTTRIUM_WARN("yttrium: FATAL: mapped batch-fence feedback timeout owner=venus2 wait_ms=%u index=%u iterations=%u host_fence_status=%d feedback_after_host_query=%d label=%s\n",
-                      YTTRIUM_VENUS_FENCE_WAIT_MS, index, iterations,
+         last_report_ms = GetTickCount64();
+         YTTRIUM_WARN("yttrium: mapped batch-fence feedback still pending owner=venus2 wait_ms=%llu index=%u iterations=%u host_fence_status=%d feedback_after_host_query=%d label=%s action=keep-waiting\n",
+                      (unsigned long long)(last_report_ms - start_ms),
+                      index, iterations,
                       host_fence_status, feedback_status_after_host_query,
                       label ? label : "<unknown>");
-         return VK_TIMEOUT;
       }
       yttrium_venus_batch_feedback_backoff(&iterations);
       status = yttrium_venus_batch_feedback_load(venus, slot);
+      if (yttrium_venus_batch_cancelled(venus))
+         return VK_ERROR_DEVICE_LOST;
    } while (status == VK_NOT_READY);
 
    if (status != VK_SUCCESS) {
@@ -2774,6 +3068,43 @@ yttrium_venus_wait_batch_feedback(struct yttrium_venus *venus,
    return status;
 }
 
+/* Shared-image initialization must complete before publishing its blob.
+ * Query status so every VkResult is observed without holding the shared reply
+ * lock over a GPU wait. Host display delays keep the same fence pending.
+ */
+static VkResult
+yttrium_venus_wait_fence_completion(struct yttrium_venus *venus,
+                                    VkFence fence,
+                                    const char *label)
+{
+   const uint64_t start_ms = GetTickCount64();
+   uint64_t last_report_ms = start_ms;
+   DWORD poll_interval_ms = 1;
+
+   for (;;) {
+      if (!yttrium_venus_ring_probe(venus, "internal-fence-wait-ring-probe"))
+         return VK_ERROR_DEVICE_LOST;
+
+      const VkResult result = vn_call_vkGetFenceStatus(
+         &venus->vn_ring, venus->device_handle, fence);
+      if (yttrium_venus_batch_cancelled(venus))
+         return VK_ERROR_DEVICE_LOST;
+      if (result != VK_NOT_READY)
+         return result;
+
+      const uint64_t now_ms = GetTickCount64();
+      if (now_ms - last_report_ms >= YTTRIUM_VENUS_FENCE_WAIT_MS) {
+         YTTRIUM_WARN("yttrium: internal fence completion still pending owner=venus2 wait_ms=%llu fence_id=%llu label=%s action=keep-waiting\n",
+                      (unsigned long long)(now_ms - start_ms),
+                      (unsigned long long)YTTRIUM_VENUS_HANDLE_TO_U64(fence),
+                      label ? label : "<unknown>");
+         last_report_ms = now_ms;
+      }
+      Sleep(poll_interval_ms);
+      poll_interval_ms = MIN2(poll_interval_ms * 2, 16);
+   }
+}
+
 static bool
 yttrium_venus_queue_host_fence_wait(struct yttrium_venus *venus,
                                     VkFence fence,
@@ -2781,12 +3112,14 @@ yttrium_venus_queue_host_fence_wait(struct yttrium_venus *venus,
 {
    if (dependency)
       *dependency = yttrium_venus_ring_dependency_none();
-   if (!venus || !fence || !dependency)
+   if (yttrium_venus_batch_cancelled(venus) || !fence || !dependency)
       return false;
 
    struct vn_ring_submit_command submit;
    vn_submit_vkWaitForFences(&venus->vn_ring, 0, venus->device_handle,
                              1, &fence, VK_TRUE, UINT64_MAX, &submit);
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
    if (!submit.ring_seqno_valid) {
       YTTRIUM_WARN("yttrium: ERROR: asynchronous host fence retirement failed owner=venus2 reason=invalid_ring_seqno fence_id=%llu\n",
                    (unsigned long long)YTTRIUM_VENUS_HANDLE_TO_U64(fence));
@@ -2796,6 +3129,153 @@ yttrium_venus_queue_host_fence_wait(struct yttrium_venus *venus,
    *dependency =
       yttrium_venus_ring_dependency_create(submit.ring_seqno);
    return true;
+}
+
+bool
+yttrium_venus_initialize_shared_public_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource)
+{
+   if (!venus || !resource || !resource->initialized || !resource->image)
+      return false;
+
+   /* Screen resource creation can run beside the ordered context worker.
+    * Initialize only this unpublished image, without touching its recording,
+    * pending submissions or completion bookkeeping. Keep handle storage alive
+    * if a failed submission leaves GPU ownership uncertain. */
+   struct shared_image_init {
+      struct yttrium_venus_object pool_obj, command_obj, fence_obj;
+      VkCommandPool pool;
+      VkCommandBuffer command;
+      VkFence fence;
+   } *init = CALLOC_STRUCT(shared_image_init);
+   const char *operation = "allocate-initializer";
+   VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
+   bool may_have_submitted = false;
+   bool completed = false;
+   if (!init)
+      goto cleanup;
+
+   const VkCommandPoolCreateInfo pool_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+      .queueFamilyIndex = venus->queue_family_index,
+   };
+   yttrium_venus_init_object(venus, &init->pool_obj);
+   init->pool = YTTRIUM_VENUS_HANDLE(VkCommandPool, &init->pool_obj);
+   operation = "vkCreateCommandPool";
+   result = vn_call_vkCreateCommandPool(&venus->vn_ring, venus->device_handle,
+                                        &pool_info, NULL, &init->pool);
+   if (result != VK_SUCCESS) {
+      if (!venus->failed)
+         init->pool = VK_NULL_HANDLE;
+      goto cleanup;
+   }
+   const VkCommandBufferAllocateInfo allocate = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+      .commandPool = init->pool,
+      .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+      .commandBufferCount = 1,
+   };
+   yttrium_venus_init_object(venus, &init->command_obj);
+   init->command = YTTRIUM_VENUS_HANDLE(VkCommandBuffer, &init->command_obj);
+   operation = "vkAllocateCommandBuffers";
+   result = vn_call_vkAllocateCommandBuffers(&venus->vn_ring,
+      venus->device_handle, &allocate, &init->command);
+   if (result != VK_SUCCESS)
+      goto cleanup;
+   const VkFenceCreateInfo fence_info = {
+      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+   };
+   yttrium_venus_init_object(venus, &init->fence_obj);
+   init->fence = YTTRIUM_VENUS_HANDLE(VkFence, &init->fence_obj);
+   operation = "vkCreateFence";
+   result = vn_call_vkCreateFence(&venus->vn_ring, venus->device_handle,
+                                  &fence_info, NULL, &init->fence);
+   if (result != VK_SUCCESS) {
+      if (!venus->failed)
+         init->fence = VK_NULL_HANDLE;
+      goto cleanup;
+   }
+   const VkCommandBufferBeginInfo begin = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   operation = "vkBeginCommandBuffer";
+   result = vn_call_vkBeginCommandBuffer(&venus->vn_ring, init->command, &begin);
+   if (result != VK_SUCCESS)
+      goto cleanup;
+
+   VkImageMemoryBarrier barrier = yttrium_venus_external_barrier(
+      resource->image, venus->queue_family_index, false);
+   barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+   barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+   barrier.srcAccessMask = 0;
+   barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   vn_async_vkCmdPipelineBarrier(&venus->vn_ring, init->command,
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      0, 0, NULL, 0, NULL, 1, &barrier);
+   const VkClearColorValue zero = {.uint32 = {0, 0, 0, 0}};
+   vn_async_vkCmdClearColorImage(&venus->vn_ring, init->command,
+      resource->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero,
+      1, &barrier.subresourceRange);
+   barrier = yttrium_venus_external_barrier(resource->image,
+                                           venus->queue_family_index, false);
+   barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+   vn_async_vkCmdPipelineBarrier(&venus->vn_ring, init->command,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+      0, 0, NULL, 0, NULL, 1, &barrier);
+   operation = "vkEndCommandBuffer";
+   result = vn_call_vkEndCommandBuffer(&venus->vn_ring, init->command);
+   if (result != VK_SUCCESS)
+      goto cleanup;
+   const VkSubmitInfo submit_info = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1, .pCommandBuffers = &init->command,
+   };
+   operation = "vkQueueSubmit";
+   result = VK_ERROR_UNKNOWN;
+   if (!yttrium_venus_queue_submit(venus, &submit_info, init->fence,
+                                  NULL, 0, &may_have_submitted))
+      goto cleanup;
+
+   /* The constructor already requires readiness before publishing its blob.
+    * Wait for this fence without holding the shared reply-buffer lock over
+    * GPU completion, and inspect its result before destroying any objects. */
+   operation = "vkGetFenceStatus";
+   result = yttrium_venus_wait_fence_completion(
+      venus, init->fence, "shared public initial release");
+   if (result != VK_SUCCESS)
+      goto cleanup;
+   completed = true;
+   resource->layout = VK_IMAGE_LAYOUT_GENERAL;
+   resource->contents_initialized = true;
+
+cleanup:
+   if (venus->failed || (may_have_submitted && !completed)) {
+      yttrium_venus2_retain_on_teardown(venus);
+      YTTRIUM_WARN("yttrium: ERROR shared public initial release failed owner=venus2 operation=%s result=%d action=retain-initializer-images-and-backing-until-reset\n",
+                   operation, result);
+      return false;
+   }
+   if (init && init->pool)
+      vn_async_vkDestroyCommandPool(&venus->vn_ring, venus->device_handle,
+                                     init->pool, NULL);
+   if (init && init->fence)
+      vn_async_vkDestroyFence(&venus->vn_ring, venus->device_handle,
+                               init->fence, NULL);
+   if (venus->failed) {
+      yttrium_venus2_retain_on_teardown(venus);
+      YTTRIUM_WARN("yttrium: ERROR shared public initializer cleanup failed owner=venus2 action=retain-initializer-images-and-backing-until-reset\n");
+      return false;
+   }
+   FREE(init);
+   if (!completed)
+      YTTRIUM_WARN("yttrium: ERROR shared public initial release failed owner=venus2 operation=%s result=%d action=discard-unpublished-images\n",
+                   operation, result);
+   return completed;
 }
 
 /* Release a batch's guest-side state.  The GPU feedback and its queued host
@@ -2818,6 +3298,9 @@ static void
 yttrium_venus_retire_batch(struct yttrium_venus *venus,
                            struct yttrium_venus_batch *batch)
 {
+   if (yttrium_venus_batch_cancelled(venus))
+      return;
+
    if (batch->busy && venus->live_batch_count)
       venus->live_batch_count--;
    batch->busy = false;
@@ -2853,18 +3336,24 @@ yttrium_venus_retire_completed_batches(struct yttrium_venus *venus,
    uint64_t completed_order = 0;
    VkFence completed_fence = VK_NULL_HANDLE;
 
-   if (!venus)
+   if (yttrium_venus_batch_cancelled(venus))
       return false;
 
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (batch && batch->busy && batch->host_retirement.valid &&
           yttrium_venus_ring_seqno_complete(
              venus, &batch->host_retirement))
          yttrium_venus_retire_batch(venus, batch);
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
    }
 
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (!batch || !batch->busy || batch->pending_submit ||
           batch->host_retirement.valid || !batch->submit_order)
@@ -2889,6 +3378,8 @@ yttrium_venus_retire_completed_batches(struct yttrium_venus *venus,
 
       const VkResult status =
          yttrium_venus_batch_feedback_load(venus, slot);
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       if (status == VK_NOT_READY)
          continue;
       if (status != VK_SUCCESS) {
@@ -2905,16 +3396,20 @@ yttrium_venus_retire_completed_batches(struct yttrium_venus *venus,
    }
 
    if (!completed_order)
-      return true;
+      return !yttrium_venus_batch_cancelled(venus);
 
    struct yttrium_venus_ring_dependency host_retirement =
       yttrium_venus_ring_dependency_none();
    if (!yttrium_venus_queue_host_fence_wait(
           venus, completed_fence, &host_retirement))
       return false;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
    if (completed_order > venus->last_completed_submit_order)
       venus->last_completed_submit_order = completed_order;
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (batch && batch->busy && !batch->host_retirement.valid &&
           batch->submit_order && batch->submit_order <= completed_order) {
@@ -2922,7 +3417,7 @@ yttrium_venus_retire_completed_batches(struct yttrium_venus *venus,
       }
    }
 
-   return true;
+   return !yttrium_venus_batch_cancelled(venus);
 }
 
 static struct yttrium_venus_batch *
@@ -2956,6 +3451,8 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
 
    if (!venus || !batch || !batch->busy)
       return true;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
 
    if (batch->host_retirement.valid) {
       if (!wait_for_host_retirement)
@@ -2964,12 +3461,14 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
              venus, &batch->host_retirement, label))
          return false;
       yttrium_venus_retire_batch(venus, batch);
-      return true;
+      return !yttrium_venus_batch_cancelled(venus);
    }
 
    if (batch->pending_submit &&
        !yttrium_venus_flush_pending_submits(venus, label))
       pending_flush_ok = false;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
    if (batch->pending_submit || !batch->submit_order) {
       YTTRIUM_WARN("yttrium: ERROR: Venus2 batch wait rejected owner=venus2 reason=unsubmitted_batch label=%s\n",
                    label ? label : "<unknown>");
@@ -3008,6 +3507,8 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
 
       result = yttrium_venus_wait_batch_feedback(
          venus, batch->completion_feedback_index, completion_fence, label);
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       if (result == VK_SUCCESS) {
          /*
           * The mapped write precedes the real fence signal.  Keep host fence
@@ -3019,11 +3520,31 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
             return false;
       }
    } else {
-      result =
-         vn_call_vkWaitForFences(&venus->vn_ring, venus->device_handle, 1,
-                                 &completion_fence, VK_TRUE,
-                                 YTTRIUM_VENUS_FENCE_WAIT_NS);
+      const uint64_t start_ms = GetTickCount64();
+      uint64_t last_report_ms = start_ms;
+      for (;;) {
+         if (!yttrium_venus_ring_probe(venus, "batch-fence-wait-ring-probe")) {
+            result = VK_ERROR_DEVICE_LOST;
+            break;
+         }
+         result = vn_call_vkWaitForFences(
+            &venus->vn_ring, venus->device_handle, 1,
+            &completion_fence, VK_TRUE, YTTRIUM_VENUS_FENCE_WAIT_NS);
+         if (result != VK_TIMEOUT)
+            break;
+
+         const uint64_t now_ms = GetTickCount64();
+         if (now_ms - last_report_ms >= YTTRIUM_VENUS_FENCE_WAIT_MS) {
+            YTTRIUM_WARN("yttrium: batch fence completion still pending owner=venus2 wait_ms=%llu fence_id=%llu label=%s action=keep-waiting\n",
+                         (unsigned long long)(now_ms - start_ms),
+                         (unsigned long long)YTTRIUM_VENUS_HANDLE_TO_U64(completion_fence),
+                         label ? label : "<unknown>");
+            last_report_ms = now_ms;
+         }
+      }
    }
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
    if (feedback_enabled && start_us) {
       yttrium_venus_debug_sync_wait(
          venus, YTTRIUM_VENUS_SYNC_WAIT_BATCH_COMPLETION,
@@ -3040,9 +3561,9 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
                               start_us, label, 0,
                               YTTRIUM_VENUS_FENCE_WAIT_NS, 2, 0);
    if (result != VK_SUCCESS) {
-      YTTRIUM_WARN("yttrium: Venus batch fence wait failed owner=venus2 path=%s label=%s result=%d timeout_ns=%llu\n",
+      YTTRIUM_WARN("yttrium: Venus batch fence wait failed owner=venus2 path=%s label=%s result=%d wait_slice_ns=%llu\n",
                    feedback_enabled ?
-                      "mapped_feedback" : "synchronous_reply",
+                      "mapped_feedback" : "host_fence",
                    label ? label : "<unknown>", result,
                    (unsigned long long)YTTRIUM_VENUS_FENCE_WAIT_NS);
       return false;
@@ -3056,6 +3577,8 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
          venus->last_completed_submit_order = completed_order;
       if (feedback_enabled) {
          for (uint32_t i = 0; i < venus->batch_count; i++) {
+            if (yttrium_venus_batch_cancelled(venus))
+               return false;
             struct yttrium_venus_batch *completed = venus->batches[i];
             if (completed && completed->busy &&
                 !completed->host_retirement.valid &&
@@ -3068,6 +3591,8 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
                    venus, &host_retirement, label))
                return false;
             for (uint32_t i = 0; i < venus->batch_count; i++) {
+               if (yttrium_venus_batch_cancelled(venus))
+                  return false;
                struct yttrium_venus_batch *completed = venus->batches[i];
                if (completed && completed->busy &&
                    completed->host_retirement.valid &&
@@ -3078,6 +3603,8 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
          }
       } else {
          for (uint32_t i = 0; i < venus->batch_count; i++) {
+            if (yttrium_venus_batch_cancelled(venus))
+               return false;
             struct yttrium_venus_batch *completed = venus->batches[i];
             if (completed && completed->busy &&
                 completed->submit_order &&
@@ -3088,7 +3615,7 @@ yttrium_venus_wait_batch_internal(struct yttrium_venus *venus,
    } else {
       yttrium_venus_retire_batch(venus, batch);
    }
-   return pending_flush_ok;
+   return pending_flush_ok && !yttrium_venus_batch_cancelled(venus);
 }
 
 static bool
@@ -3120,7 +3647,7 @@ bool
 yttrium_venus2_submit_order_complete(struct yttrium_venus *venus,
                                      uint64_t submit_order)
 {
-   if (!venus)
+   if (yttrium_venus_batch_cancelled(venus))
       return false;
    if (!submit_order || submit_order <= venus->last_completed_submit_order)
       return true;
@@ -3137,25 +3664,31 @@ yttrium_venus_drain_batches(struct yttrium_venus *venus, const char *label)
 {
    bool ok = true;
 
-   if (!venus)
+   if (yttrium_venus_batch_cancelled(venus))
       return false;
 
    if (!yttrium_venus_flush_pending_submits(venus, label))
       ok = false;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
 
    if (yttrium_venus_batch_epoch_wait_enabled()) {
       struct yttrium_venus_batch *latest =
          yttrium_venus_latest_busy_batch(venus);
       if (latest && !yttrium_venus_wait_batch(venus, latest, label))
          ok = false;
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
    }
 
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       if (!yttrium_venus_wait_batch(venus, venus->batches[i], label))
          ok = false;
    }
 
-   return ok;
+   return ok && !yttrium_venus_batch_cancelled(venus);
 }
 
 static bool
@@ -3249,6 +3782,7 @@ yttrium_venus_discard_uninitialized_batch(
                                     venus->device_handle,
                                     venus->command_pool, 1,
                                     &batch->feedback_command_buffer);
+   free(batch->primary_writes.allocations);
    memset(batch, 0, sizeof(*batch));
 }
 
@@ -3357,12 +3891,14 @@ yttrium_venus_grow_batch_pool_for_pressure(struct yttrium_venus *venus)
 }
 
 static struct yttrium_venus_batch *
-yttrium_venus_acquire_batch(struct yttrium_venus *venus, const char *label)
+yttrium_venus_acquire_batch(struct yttrium_venus *venus, const char *label,
+                          bool may_wait)
 {
    if (!yttrium_venus_ensure_batches(venus))
       return NULL;
 
-   yttrium_venus_grow_batch_pool_for_pressure(venus);
+   if (may_wait)
+      yttrium_venus_grow_batch_pool_for_pressure(venus);
 
    if (!yttrium_venus_retire_completed_batches(venus, label))
       return NULL;
@@ -3387,6 +3923,8 @@ yttrium_venus_acquire_batch(struct yttrium_venus *venus, const char *label)
          return NULL;
       batch = yttrium_venus_find_free_batch(venus, &index);
       if (!batch) {
+         if (!may_wait)
+            return NULL;
          struct yttrium_venus_batch *oldest = NULL;
          for (uint32_t i = 0; i < venus->batch_count; i++) {
             struct yttrium_venus_batch *candidate = venus->batches[i];
@@ -3414,7 +3952,7 @@ static bool
 yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
                                     const char *label)
 {
-   if (!venus)
+   if (yttrium_venus_batch_cancelled(venus))
       return false;
 
    const uint32_t count = venus->pending_submit_count;
@@ -3437,6 +3975,8 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
 
    VkCommandBuffer
       command_buffers[YTTRIUM_VENUS_GROUP_QUEUE_SUBMIT_MAX + 1];
+   struct yttrium_venus_primary_writes *writes = &venus->submit_primary_writes;
+   writes->count = 0;
    for (uint32_t i = 0; i < count; i++) {
       struct yttrium_venus_batch *batch =
          venus->pending_submit_batches[i];
@@ -3449,6 +3989,14 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
          return false;
       }
       command_buffers[i] = batch->command_buffer;
+      if (!yttrium_venus_primary_writes_merge(writes, &batch->primary_writes,
+             YTTRIUM_VENUS_CMD_BATCH_PENDING_RESOURCE_REF_LIMIT *
+                YTTRIUM_VENUS_GROUP_QUEUE_SUBMIT_MAX)) {
+         YTTRIUM_WARN("yttrium: ERROR grouped primary write tracking failed owner=venus2 count=%u action=reject-submit label=%s\n",
+                      writes->count, label ? label : "<unknown>");
+         gdikmt_device_report_reset(venus->device, PIPE_UNKNOWN_CONTEXT_RESET);
+         return false;
+      }
    }
 
    struct yttrium_venus_batch *tail =
@@ -3483,8 +4031,21 @@ yttrium_venus_flush_pending_submits(struct yttrium_venus *venus,
       .pCommandBuffers = command_buffers,
    };
    start_us = yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
-   if (!yttrium_venus_queue_submit(venus, &submit_info, tail->fence))
+   bool may_have_submitted = false;
+   if (!yttrium_venus_queue_submit(venus, &submit_info, tail->fence,
+                                  writes->allocations, writes->count,
+                                  &may_have_submitted)) {
+      if (may_have_submitted) {
+         /* Every group member is already busy and retains its references.
+          * Submission may have reached the host: preserve planned authority
+          * and prevent a second transport attempt or premature reclamation.
+          */
+         yttrium_venus2_retain_on_teardown(venus);
+         YTTRIUM_WARN("yttrium: ERROR: grouped queue submit uncertain owner=venus2 count=%u label=%s action=retain-batches-and-backing-until-reset\n",
+                      count, label ? label : "<unknown>");
+      }
       return false;
+   }
    yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_QUEUE_SUBMIT,
                               0, start_us, label, 0, count, 2, 0);
 
@@ -3524,7 +4085,8 @@ yttrium_venus_submit_batch_async(struct yttrium_venus *venus,
                                  uint32_t op_count,
                                  const char *label)
 {
-   if (!venus || !batch || !batch->initialized || batch->busy)
+   if (yttrium_venus_batch_cancelled(venus) ||
+       !batch || !batch->initialized || batch->busy)
       return false;
 
    if (venus->group_queue_submits) {
@@ -3593,8 +4155,23 @@ yttrium_venus_submit_batch_async(struct yttrium_venus *venus,
       .pCommandBuffers = command_buffers,
    };
    start_us = yttrium_trace_is_enabled() ? yttrium_trace_now_us() : 0;
-   if (!yttrium_venus_queue_submit(venus, &submit_info, batch->fence))
+   bool may_have_submitted = false;
+   if (!yttrium_venus_queue_submit(venus, &submit_info, batch->fence,
+                                  batch->primary_writes.allocations,
+                                  batch->primary_writes.count,
+                                  &may_have_submitted)) {
+      if (may_have_submitted) {
+         yttrium_venus_mark_batch_live(venus, batch);
+         batch->submit_order = ++venus->next_batch_submit_order;
+         batch->completion_feedback_index =
+            feedback_enabled ? batch->feedback_index : UINT32_MAX;
+         yttrium_venus2_retain_on_teardown(venus);
+         YTTRIUM_WARN("yttrium: ERROR: queue submit uncertain owner=venus2 submit_order=%llu label=%s action=retain-batch-and-backing-until-reset\n",
+                      (unsigned long long)batch->submit_order,
+                      label ? label : "<unknown>");
+      }
       return false;
+   }
    yttrium_venus_trace_timing(YTTRIUM_TRACE_TIMING_VENUS_QUEUE_SUBMIT,
                               0, start_us, label, 0, 1, 2, 0);
 
@@ -3698,6 +4275,76 @@ yttrium_venus_find_latest_pipeline_batch(
 }
 
 bool
+yttrium_venus_resource_batches_ready(struct yttrium_venus *venus,
+                                   struct yttrium_venus_resource *resource)
+{
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
+   if (!resource)
+      return true;
+
+   /* A recording is not complete, even when no queue submission exists yet.
+    * The caller may explicitly publish/submit before polling, but this helper
+    * neither flushes recording work nor waits for GPU completion.
+    */
+   for (uint32_t i = 0; i < venus->cmd_batch_pending_resource_count; i++) {
+      if (venus->cmd_batch_pending_resources[i] == resource)
+         return false;
+   }
+   /* CPU readiness needs GPU completion, not host-object retirement. Do not
+    * retire/free batches here: freeing an unrelated retired allocation can
+    * drain the transport ring. References remain owned by the ordinary batch
+    * retirement path even when this pure completion poll authorizes a read.
+    */
+   for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
+      struct yttrium_venus_batch *batch = venus->batches[i];
+      if (!batch || !batch->busy ||
+          !yttrium_venus_batch_uses_resource(batch, resource))
+         continue;
+      if (batch->pending_submit || !batch->submit_order)
+         return false;
+
+      const uint64_t order = batch->completion_order ?
+         batch->completion_order : batch->submit_order;
+      if (order <= venus->last_completed_submit_order)
+         continue;
+      const VkFence fence = batch->completion_fence ?
+         batch->completion_fence : batch->fence;
+      if (!fence || (venus->group_queue_submits && !batch->completion_order))
+         return false;
+
+      VkResult status;
+      if (yttrium_venus_batch_fence_feedback_enabled()) {
+         volatile LONG *slot = yttrium_venus_batch_feedback_slot(
+            venus, batch->completion_feedback_index);
+         if (!slot)
+            return false;
+         status = yttrium_venus_batch_feedback_load(venus, slot);
+      } else {
+         status = vn_call_vkGetFenceStatus(&venus->vn_ring,
+                                            venus->device_handle, fence);
+      }
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
+      if (status == VK_NOT_READY)
+         return false;
+      if (status != VK_SUCCESS) {
+         YTTRIUM_WARN("yttrium: ERROR resource completion poll failed owner=venus2 status=%d submit_order=%llu completion_order=%llu action=fail-map\n",
+                      status, (unsigned long long)batch->submit_order,
+                      (unsigned long long)order);
+         return false;
+      }
+      /* One Vulkan queue orders all batches; a group uses its tail fence and
+       * completion order. Advancing this prefix does not release any object.
+       */
+      venus->last_completed_submit_order = order;
+   }
+   return !yttrium_venus_batch_cancelled(venus);
+}
+
+bool
 yttrium_venus_wait_resource_batches(struct yttrium_venus *venus,
                                     struct yttrium_venus_resource *resource,
                                     const char *label)
@@ -3706,11 +4353,17 @@ yttrium_venus_wait_resource_batches(struct yttrium_venus *venus,
 
    if (!venus || !resource)
       return true;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
 
    if (!yttrium_venus_flush_pending_submits(venus, label))
       ok = false;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
 
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (!batch)
          continue;
@@ -3720,7 +4373,7 @@ yttrium_venus_wait_resource_batches(struct yttrium_venus *venus,
          ok = false;
    }
 
-   return ok;
+   return ok && !yttrium_venus_batch_cancelled(venus);
 }
 
 bool
@@ -3732,11 +4385,17 @@ yttrium_venus_wait_pipeline_batches(struct yttrium_venus *venus,
 
    if (!venus || !pipeline)
       return true;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
 
    if (!yttrium_venus_flush_pending_submits(venus, label))
       ok = false;
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
 
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (!batch)
          continue;
@@ -3746,7 +4405,7 @@ yttrium_venus_wait_pipeline_batches(struct yttrium_venus *venus,
          ok = false;
    }
 
-   return ok;
+   return ok && !yttrium_venus_batch_cancelled(venus);
 }
 
 void
@@ -3754,25 +4413,35 @@ yttrium_venus_destroy_batches(struct yttrium_venus *venus)
 {
    if (!venus)
       return;
+   if (yttrium_venus_batch_cancelled(venus)) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return;
+   }
 
-   const bool drained =
-      yttrium_venus_drain_batches(venus, "batch queue destroy");
+   if (!yttrium_venus_drain_batches(venus, "batch queue destroy")) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return;
+   }
+   if (yttrium_venus_batch_cancelled(venus)) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return;
+   }
+   if (venus->retain_unretired_resources)
+      return;
    for (uint32_t i = 0; i < venus->batch_count; i++) {
+      if (yttrium_venus_batch_cancelled(venus)) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
       struct yttrium_venus_batch *batch = venus->batches[i];
       if (!batch)
          continue;
       if (!batch->initialized && !batch->fence &&
           !batch->command_buffer && !batch->feedback_command_buffer)
          continue;
-      if (batch->retired_resources) {
-         if (batch->busy && !drained) {
-            YTTRIUM_LOG("yttrium: Venus destroying busy batch with retired resources slot=%u label=batch queue destroy\n",
-                        i);
-         } else {
-            yttrium_venus_destroy_retired_resources(
-               venus, &batch->retired_resources);
-         }
-      }
+      if (batch->retired_resources)
+         yttrium_venus_destroy_retired_resources(
+            venus, &batch->retired_resources);
       yttrium_venus_destroy_cmd_batch_transients(
          venus, batch->transients, &batch->transient_count);
       yttrium_venus_cmd_batch_destroy_descriptor_pool(
@@ -3790,6 +4459,11 @@ yttrium_venus_destroy_batches(struct yttrium_venus *venus)
                                        venus->device_handle,
                                        venus->command_pool, 1,
                                        &batch->feedback_command_buffer);
+      if (yttrium_venus_batch_cancelled(venus)) {
+         yttrium_venus2_retain_on_teardown(venus);
+         return;
+      }
+      free(batch->primary_writes.allocations);
       memset(batch, 0, sizeof(*batch));
    }
    /*
@@ -3797,9 +4471,17 @@ yttrium_venus_destroy_batches(struct yttrium_venus *venus)
     * wait.  Teardown is an explicit synchronization edge: let the renderer
     * pass every queued wait before unmapping the guest allocation.
     */
-   if (venus->draw_backing_pool)
-      yttrium_venus_drain_ring(venus, "draw backing pool destroy");
+   if ((venus->draw_backing_pool &&
+        !yttrium_venus_drain_ring(venus, "draw backing pool destroy")) ||
+       yttrium_venus_batch_cancelled(venus)) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return;
+   }
    yttrium_venus_destroy_draw_backing_pool(venus);
+   if (yttrium_venus_batch_cancelled(venus)) {
+      yttrium_venus2_retain_on_teardown(venus);
+      return;
+   }
    yttrium_venus_destroy_batch_feedback_buffer(venus);
 }
 
@@ -3809,19 +4491,39 @@ yttrium_venus_begin_command_buffer(
    const char *label,
    const VkCommandBufferBeginInfo *begin_info)
 {
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
+
    (void)label;
    vn_async_vkBeginCommandBuffer(&venus->vn_ring, venus->command_buffer,
                                  begin_info);
-   return true;
+   return !yttrium_venus_batch_cancelled(venus);
 }
 
 bool
 yttrium_venus_end_command_buffer(struct yttrium_venus *venus,
                                  const char *label)
 {
+   if (yttrium_venus_batch_cancelled(venus))
+      return false;
+
    (void)label;
+   while (venus->external_images) {
+      struct yttrium_venus_external_image *image = venus->external_images;
+      VkImageMemoryBarrier release = yttrium_venus_external_barrier(
+         image->image, venus->queue_family_index, false);
+      release.oldLayout = *image->layout;
+      /* Every exported alias returns to the contract's GENERAL/EXTERNAL
+       * state before the command buffer signals its normal completion. */
+      vn_async_vkCmdPipelineBarrier(&venus->vn_ring, venus->command_buffer,
+         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+         0, 0, NULL, 0, NULL, 1, &release);
+      if (yttrium_venus_batch_cancelled(venus))
+         return false;
+      yttrium_venus_external_pop(&venus->external_images);
+   }
    vn_async_vkEndCommandBuffer(&venus->vn_ring, venus->command_buffer);
-   return true;
+   return !yttrium_venus_batch_cancelled(venus);
 }
 
 static void
@@ -3869,13 +4571,12 @@ yttrium_venus_cmd_batch_barrier_transfer_to_deferred_draws(
                                  1, &barrier, 0, NULL, 0, NULL);
 }
 
-bool
-yttrium_venus_begin_command_batch(struct yttrium_venus *venus,
-                                  const char *label,
-                                  bool native_draw_batch,
-                                  bool async_submit)
+static bool
+yttrium_venus_begin_command_batch_internal(
+   struct yttrium_venus *venus, const char *label,
+   bool native_draw_batch, bool async_submit, bool may_wait)
 {
-   if (!venus)
+   if (yttrium_venus_batch_cancelled(venus))
       return false;
 
    /*
@@ -3887,8 +4588,20 @@ yttrium_venus_begin_command_batch(struct yttrium_venus *venus,
    async_submit = true;
 
    if (venus->display_copy_batch_recording) {
-      if (venus->cmd_batch_async_submit && venus->cmd_batch)
-         venus->command_buffer = venus->cmd_batch->command_buffer;
+      if (!venus->cmd_batch || !venus->cmd_batch->command_buffer) {
+         YTTRIUM_WARN("yttrium: ERROR command recording failed owner=venus2 reason=missing-active-batch-command-buffer label=%s action=abandon-recording\n",
+                      label ? label : "<unknown>");
+         yttrium_venus_restore_draw_mirror_updates(
+            venus->cmd_batch_draw_mirror_updates,
+            &venus->cmd_batch_draw_mirror_update_count);
+         if (venus->cmd_batch && !venus->cmd_batch->busy)
+            yttrium_venus_destroy_retired_resources(
+               venus, &venus->cmd_batch->retired_resources);
+         yttrium_venus_cmd_batch_clear_state(venus);
+         return false;
+      }
+      venus->command_buffer = venus->cmd_batch->command_buffer;
+      assert(venus->command_buffer != VK_NULL_HANDLE);
 
       if (venus->cmd_batch_deferred_draw_count && !native_draw_batch) {
          if (venus->cmd_batch_async_submit != async_submit ||
@@ -3922,7 +4635,7 @@ yttrium_venus_begin_command_batch(struct yttrium_venus *venus,
    }
 
    struct yttrium_venus_batch *batch =
-      yttrium_venus_acquire_batch(venus, label);
+      yttrium_venus_acquire_batch(venus, label, may_wait);
    if (!batch)
       return false;
 
@@ -3946,6 +4659,16 @@ yttrium_venus_begin_command_batch(struct yttrium_venus *venus,
    venus->cmd_batch_async_submit = async_submit;
    venus->cmd_batch_has_transfer_ops = !native_draw_batch;
    return true;
+}
+
+bool
+yttrium_venus_begin_command_batch(struct yttrium_venus *venus,
+                                 const char *label,
+                                 bool native_draw_batch,
+                                 bool async_submit)
+{
+   return yttrium_venus_begin_command_batch_internal(
+      venus, label, native_draw_batch, async_submit, true);
 }
 
 bool

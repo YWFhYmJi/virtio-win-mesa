@@ -39,6 +39,7 @@ struct yttrium_gdi_flush_issuance {
    volatile LONG references;
    volatile LONG state;
    uint64_t id;
+   struct gdikmt_device *device;
 };
 
 struct yttrium_gdi_present_ticket {
@@ -60,8 +61,7 @@ yttrium_flush_issuance_release_internal(
 
 static void
 yttrium_complete_flush_issuance(struct yttrium_context *yctx,
-                                bool issued,
-                                const char *label)
+                                bool issued)
 {
    struct yttrium_gdi_flush_issuance *issuance =
       yctx ? yctx->pending_flush_issuance : NULL;
@@ -69,9 +69,6 @@ yttrium_complete_flush_issuance(struct yttrium_context *yctx,
       return;
 
    yctx->pending_flush_issuance = NULL;
-   YTTRIUM_LOG("yttrium: present publication worker result id=%llu issued=%u label=%s\n",
-               (unsigned long long)issuance->id, issued ? 1 : 0,
-               label && label[0] ? label : "<missing-pipe-flush-owner>");
    InterlockedExchange(&issuance->state,
                        issued ? YTTRIUM_FLUSH_ISSUANCE_ISSUED :
                                 YTTRIUM_FLUSH_ISSUANCE_FAILED);
@@ -80,9 +77,7 @@ yttrium_complete_flush_issuance(struct yttrium_context *yctx,
 }
 
 static void
-yttrium_complete_present_ticket(struct yttrium_context *yctx,
-                                bool accepted,
-                                const char *label)
+yttrium_complete_present_ticket(struct yttrium_context *yctx)
 {
    struct yttrium_gdi_present_ticket *ticket =
       yctx ? yctx->pending_present_ticket : NULL;
@@ -90,10 +85,6 @@ yttrium_complete_present_ticket(struct yttrium_context *yctx,
       return;
 
    yctx->pending_present_ticket = NULL;
-   YTTRIUM_LOG("yttrium: fullscreen present worker publication id=%llu accepted=%u label=%s\n",
-               (unsigned long long)ticket->id,
-               accepted ? 1 : 0,
-               label && label[0] ? label : "<missing-pipe-flush-owner>");
    FREE(ticket);
 }
 
@@ -136,8 +127,7 @@ yttrium_threaded_set_flush_label(void *data)
                       (unsigned long long)
                          queued->yctx->pending_present_ticket->id,
                       (unsigned long long)queued->ticket->id);
-         yttrium_complete_present_ticket(
-            queued->yctx, false, "overlapping present publication");
+         yttrium_complete_present_ticket(queued->yctx);
       }
       queued->yctx->pending_present_ticket = queued->ticket;
    }
@@ -147,8 +137,7 @@ yttrium_threaded_set_flush_label(void *data)
                       (unsigned long long)
                          queued->yctx->pending_flush_issuance->id,
                       (unsigned long long)queued->issuance->id);
-         yttrium_complete_flush_issuance(
-            queued->yctx, false, "overlapping present issuance");
+         yttrium_complete_flush_issuance(queued->yctx, false);
       }
       queued->yctx->pending_flush_issuance = queued->issuance;
    }
@@ -324,7 +313,8 @@ yttrium_flush_internal(struct pipe_context *ctx,
          yctx->pending_present_ticket->publish.scanout_id;
    }
 
-   if (screen && screen->venus) {
+   if (screen && screen->venus &&
+       gdikmt_device_get_reset_status(screen->device) == PIPE_NO_RESET) {
       if ((present_publication || flush_issuance) &&
           !(flags & PIPE_FLUSH_ASYNC)) {
          YTTRIUM_WARN("yttrium: ERROR: present publication failed owner=yttrium-context reason=non-async-worker-flush id=%llu label=%s\n",
@@ -352,11 +342,9 @@ yttrium_flush_internal(struct pipe_context *ctx,
       flush_ok = SUCCEEDED(signal_context->signal_present(
          signal_context, yctx->pending_present_ticket->publish.signal_value));
    if (present_publication)
-      yttrium_complete_present_ticket(
-         yctx, flush_called && flush_ok, label);
+      yttrium_complete_present_ticket(yctx);
    if (flush_issuance)
-      yttrium_complete_flush_issuance(
-         yctx, flush_called && flush_ok, label);
+      yttrium_complete_flush_issuance(yctx, flush_called && flush_ok);
 
    if (fence) {
       struct pipe_reference *ref = MALLOC_STRUCT(pipe_reference);
@@ -409,6 +397,58 @@ yttrium_gdi_flush_labeled(struct pipe_context *ctx,
                              "<missing-pipe-flush-owner>");
 }
 
+struct yttrium_display_endpoint_publication {
+   struct pipe_resource *resource;
+   char label[96];
+};
+
+static bool
+yttrium_record_display_endpoint(struct pipe_resource *resource, const char *label)
+{
+   struct yttrium_screen *screen = yttrium_screen(resource->screen);
+   struct yttrium_resource *res = yttrium_resource(resource);
+   if (!yttrium_venus_publish_display_endpoint(screen->venus, &res->venus, label)) {
+      YTTRIUM_WARN("yttrium: ERROR display endpoint publication failed owner=yttrium-context component=venus reason=recording-failed action=report-device-failure allocation=0x%lx\n",
+                   (unsigned long)res->hAllocation);
+      gdikmt_device_report_reset(screen->device, PIPE_UNKNOWN_CONTEXT_RESET);
+      return false;
+   }
+   return true;
+}
+
+static void
+yttrium_threaded_publish_display_endpoint(void *data)
+{
+   struct yttrium_display_endpoint_publication *publication = data;
+   yttrium_record_display_endpoint(publication->resource, publication->label);
+   pipe_resource_reference(&publication->resource, NULL);
+   FREE(publication);
+}
+
+bool
+yttrium_gdi_publish_display_endpoint(struct pipe_context *ctx,
+                                       struct pipe_resource *resource,
+                                       const char *label)
+{
+   if (!ctx || !resource || !yttrium_resource(resource)->optimal_present_image)
+      return false;
+   const char *owner = label ? label : "display endpoint publication";
+   if (ctx->flush == yttrium_flush)
+      return yttrium_record_display_endpoint(resource, owner);
+   if (!ctx->callback) {
+      YTTRIUM_WARN("yttrium: ERROR display endpoint publication failed owner=yttrium-context component=ordered-worker reason=missing-callback action=fail-present\n");
+      return false;
+   }
+   struct yttrium_display_endpoint_publication *publication =
+      CALLOC_STRUCT(yttrium_display_endpoint_publication);
+   if (!publication)
+      return false;
+   pipe_resource_reference(&publication->resource, resource);
+   strncpy(publication->label, owner, sizeof(publication->label) - 1);
+   ctx->callback(ctx, yttrium_threaded_publish_display_endpoint, publication, false);
+   return true;
+}
+
 struct yttrium_gdi_flush_issuance *
 yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
                                  const char *label)
@@ -427,6 +467,7 @@ yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
 
    issuance->references = 2;
    issuance->state = YTTRIUM_FLUSH_ISSUANCE_PENDING;
+   issuance->device = yttrium_screen(ctx->screen)->device;
    issuance->id =
       (uint64_t)InterlockedIncrement64(&yttrium_next_flush_issuance_id);
 
@@ -442,10 +483,6 @@ yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
          return NULL;
       }
 
-      YTTRIUM_LOG("yttrium: present publication enqueue id=%llu threaded=1 label=%s\n",
-                  (unsigned long long)issuance->id,
-                  label && label[0] ? label :
-                     "<missing-pipe-flush-owner>");
       ctx->flush(ctx, NULL, PIPE_FLUSH_ASYNC);
       return issuance;
    }
@@ -465,60 +502,53 @@ yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
            sizeof(yctx->pending_flush_label) - 1);
    yctx->pending_flush_label[sizeof(yctx->pending_flush_label) - 1] = '\0';
    yctx->pending_flush_issuance = issuance;
-   YTTRIUM_LOG("yttrium: present publication enqueue id=%llu threaded=0 label=%s\n",
-               (unsigned long long)issuance->id,
-               yctx->pending_flush_label);
    yttrium_flush_internal(ctx, NULL, PIPE_FLUSH_ASYNC,
                           yctx->pending_flush_label);
    return issuance;
 }
 
 bool
-yttrium_gdi_wait_flush_issuance(struct yttrium_gdi_flush_issuance *issuance,
-                                uint32_t timeout_ms)
+yttrium_gdi_wait_flush_issuance(struct yttrium_gdi_flush_issuance *issuance)
 {
    if (!issuance)
       return false;
 
    const ULONGLONG start = GetTickCount64();
-   const ULONGLONG deadline = start + timeout_ms;
+   ULONGLONG last_warning_ms = start;
+   const DWORD warning_interval_ms = 5000;
    LONG state = InterlockedCompareExchange(
       &issuance->state, YTTRIUM_FLUSH_ISSUANCE_PENDING,
       YTTRIUM_FLUSH_ISSUANCE_PENDING);
-   YTTRIUM_LOG("yttrium: present publication wait begin id=%llu state=%ld timeout_ms=%u\n",
-               (unsigned long long)issuance->id, state, timeout_ms);
 
    while (state == YTTRIUM_FLUSH_ISSUANCE_PENDING) {
-      const ULONGLONG now = GetTickCount64();
-      if (now >= deadline)
-         break;
-      const ULONGLONG remaining64 = deadline - now;
-      const DWORD remaining = remaining64 > UINT32_MAX ?
-         UINT32_MAX : (DWORD)remaining64;
+      if (gdikmt_device_get_reset_status(issuance->device) != PIPE_NO_RESET)
+         return false;
       LONG pending = YTTRIUM_FLUSH_ISSUANCE_PENDING;
       if (!WaitOnAddress((volatile VOID *)&issuance->state, &pending,
-                         sizeof(pending), remaining) &&
-          GetLastError() == ERROR_TIMEOUT)
-         break;
+                         sizeof(pending), warning_interval_ms)) {
+         const DWORD error = GetLastError();
+         if (error != ERROR_TIMEOUT) {
+            YTTRIUM_WARN("yttrium: ERROR: present publication wait failed owner=yttrium-present reason=wait-error id=%llu error=%lu\n",
+                         (unsigned long long)issuance->id, error);
+            return false;
+         }
+      }
       state = InterlockedCompareExchange(
          &issuance->state, YTTRIUM_FLUSH_ISSUANCE_PENDING,
          YTTRIUM_FLUSH_ISSUANCE_PENDING);
+      const ULONGLONG now = GetTickCount64();
+      if (state == YTTRIUM_FLUSH_ISSUANCE_PENDING &&
+          now - last_warning_ms >= warning_interval_ms) {
+         YTTRIUM_WARN("yttrium: present publication still pending owner=yttrium-present reason=awaiting-worker-issuance id=%llu elapsed_ms=%llu\n",
+                      (unsigned long long)issuance->id,
+                      (unsigned long long)(now - start));
+         last_warning_ms = now;
+      }
    }
 
    state = InterlockedCompareExchange(
       &issuance->state, YTTRIUM_FLUSH_ISSUANCE_PENDING,
       YTTRIUM_FLUSH_ISSUANCE_PENDING);
-   const uint64_t elapsed_ms = GetTickCount64() - start;
-   if (state == YTTRIUM_FLUSH_ISSUANCE_PENDING) {
-      YTTRIUM_WARN("yttrium: ERROR: present publication wait failed owner=yttrium-present reason=worker-issuance-timeout id=%llu timeout_ms=%u\n",
-                   (unsigned long long)issuance->id, timeout_ms);
-      return false;
-   }
-
-   YTTRIUM_LOG("yttrium: present publication wait end id=%llu issued=%u elapsed_ms=%llu\n",
-               (unsigned long long)issuance->id,
-               state == YTTRIUM_FLUSH_ISSUANCE_ISSUED ? 1 : 0,
-               (unsigned long long)elapsed_ms);
    return state == YTTRIUM_FLUSH_ISSUANCE_ISSUED;
 }
 
@@ -527,6 +557,21 @@ yttrium_gdi_flush_issuance_release(
    struct yttrium_gdi_flush_issuance *issuance)
 {
    yttrium_flush_issuance_release_internal(issuance);
+}
+
+bool
+yttrium_gdi_flush_handoff(struct pipe_context *ctx, const char *label)
+{
+   struct yttrium_gdi_flush_issuance *issuance =
+      yttrium_gdi_flush_async_issuance(ctx, label);
+   if (!issuance)
+      return false;
+   /* Queuing a flush is insufficient: ReleaseSync may signal through the
+    * runtime as soon as the DDI returns, before the worker calls pfnRenderCb.
+    * Reuse the Present issuance contract without waiting for a GPU fence. */
+   const bool issued = yttrium_gdi_wait_flush_issuance(issuance);
+   yttrium_gdi_flush_issuance_release(issuance);
+   return issued;
 }
 
 bool
@@ -563,6 +608,7 @@ yttrium_gdi_flush_async_present(
       }
       issuance->references = 2;
       issuance->state = YTTRIUM_FLUSH_ISSUANCE_PENDING;
+      issuance->device = yttrium_screen(ctx->screen)->device;
       issuance->id = (uint64_t)InterlockedIncrement64(&yttrium_next_flush_issuance_id);
    }
 
@@ -577,10 +623,6 @@ yttrium_gdi_flush_async_present(
          return false;
       }
 
-      YTTRIUM_LOG("yttrium: present publication enqueue id=%llu threaded=1 label=%s\n",
-                  (unsigned long long)ticket->id,
-                  label && label[0] ? label :
-                     "<missing-pipe-flush-owner>");
       ctx->flush(ctx, NULL, PIPE_FLUSH_ASYNC);
       if (issued)
          *issued = issuance;
@@ -605,9 +647,6 @@ yttrium_gdi_flush_async_present(
    yctx->pending_present_ticket = ticket;
    if (issuance)
       yctx->pending_flush_issuance = issuance;
-   YTTRIUM_LOG("yttrium: present publication enqueue id=%llu threaded=0 label=%s\n",
-               (unsigned long long)ticket->id,
-               yctx->pending_flush_label);
    yttrium_flush_internal(ctx, NULL, PIPE_FLUSH_ASYNC,
                           yctx->pending_flush_label);
    if (issued)

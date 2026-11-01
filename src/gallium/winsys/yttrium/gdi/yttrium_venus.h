@@ -15,6 +15,8 @@
 #include "compiler/shader_enums.h"
 #include "pipe/p_state.h"
 #include "util/format/u_formats.h"
+#include "yttrium_venus2_external.h"
+#include "yttrium_venus2_shared_image.h"
 
 #define YTTRIUM_SHADER_PUSH_CONSTANT_BYTES 256
 #define YTTRIUM_SHADER_VS_PUSH_CONSTANT_OFFSET 0
@@ -25,6 +27,8 @@
 struct gdikmt_context;
 struct gdikmt_device;
 struct yttrium_pipeline;
+struct yttrium_optimal_image_data;
+struct yttrium_display_endpoint_data;
 
 struct yttrium_venus_object {
    uint64_t id;
@@ -321,6 +325,16 @@ struct yttrium_venus_resource {
    struct yttrium_venus_memory_mapping draw_vertex_mapping;
    struct yttrium_venus_memory_mapping draw_index_mapping;
    VkImageLayout layout;
+   struct yttrium_venus_external_image external_image;
+   /* Local primary rendering publishes only at the linear consumer boundary. */
+   struct yttrium_venus_resource *display_endpoint;
+   bool display_endpoint_imported;
+   struct yttrium_venus_shared_image_state display_endpoint_state;
+   struct yttrium_venus_shared_image_state display_endpoint_saved_state;
+   bool display_endpoint_recording;
+   VkImageLayout display_endpoint_saved_layout;
+   VkImageAspectFlags display_endpoint_saved_aspects;
+   bool display_endpoint_saved_contents;
    VkImageUsageFlags image_usage;
    VkImageAspectFlags initialized_aspects;
    VkBufferUsageFlags buffer_usage;
@@ -417,6 +431,9 @@ struct yttrium_venus_draw_state {
    VkFrontFace front_face;
    VkBool32 depth_bias_enable;
    VkBool32 depth_clamp_enable;
+   /* Bias units follow the logical depth view, not substituted storage. */
+   enum pipe_format depth_bias_format;
+   VkBool32 depth_bias_units_unscaled;
    float depth_bias_constant_factor;
    float depth_bias_clamp;
    float depth_bias_slope_factor;
@@ -487,6 +504,9 @@ yttrium_venus_get_kmt_context(struct yttrium_venus *venus);
 
 void
 yttrium_venus_destroy(struct yttrium_venus *venus);
+
+void
+yttrium_venus_retain_on_teardown(struct yttrium_venus *venus);
 
 bool
 yttrium_venus_create_shader_module(struct yttrium_venus *venus,
@@ -563,7 +583,7 @@ yttrium_venus_storage_image_without_format_supported(
 bool
 yttrium_venus_storage_image_formatless_format_supported(
    struct yttrium_venus *venus, enum pipe_format format,
-   bool read, bool write);
+   bool read, bool write, bool buffer);
 
 bool
 yttrium_venus_compute_pipeline_init(
@@ -807,6 +827,10 @@ const char *
 yttrium_venus_current_flush_label(void);
 
 bool
+yttrium_venus_resource_ready(struct yttrium_venus *venus,
+                            struct yttrium_venus_resource *resource);
+
+bool
 yttrium_venus_wait_resource(struct yttrium_venus *venus,
                             struct yttrium_venus_resource *resource,
                             const char *label);
@@ -953,6 +977,34 @@ yttrium_venus_create_display_image(struct yttrium_venus *venus,
                                    uint64_t min_allocation_size,
                                    uint64_t *out_memory_id,
                                    uint64_t *out_allocation_size);
+
+bool
+yttrium_venus_create_optimal_shared_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format,
+   unsigned bind, struct yttrium_optimal_image_data *data,
+   uint64_t *out_memory_id, uint64_t *out_allocation_size);
+
+bool
+yttrium_venus_import_optimal_shared_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_optimal_image_data *data);
+
+bool
+yttrium_venus_create_presentable_image(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format, unsigned bind,
+   uint64_t *out_endpoint_memory_id, uint64_t *out_endpoint_allocation_size);
+
+bool
+yttrium_venus_import_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_display_endpoint_data *data);
+
+bool
+yttrium_venus_publish_display_endpoint(
+   struct yttrium_venus *venus, struct yttrium_venus_resource *resource,
+   const char *label);
 
 bool
 yttrium_venus_create_color_attachment_image(struct yttrium_venus *venus,

@@ -10,6 +10,8 @@
 
 #include "vn_image.h"
 
+#include "util/log.h"
+
 #include "venus-protocol/vn_protocol_driver_image.h"
 #include "venus-protocol/vn_protocol_driver_image_view.h"
 #include "venus-protocol/vn_protocol_driver_sampler.h"
@@ -679,6 +681,14 @@ vn_CreateImage(VkDevice device,
    } else if (swapchain_info) {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
       result = vn_image_create_deferred(dev, pCreateInfo, alloc, &img);
+#elif defined(_WIN32) && defined(HAVE_YTTRIUM)
+      /* The backing is selected later by BindImageMemorySwapchainInfoKHR.
+       * Recreating an image from a chain-wide guessed descriptor would lose
+       * that backing's explicit modifier. Support requires deferred images. */
+      mesa_loge("venus: Win32 swapchain image alias unsupported "
+                "owner=venus-image reason=per-backing-modifier-required "
+                "action=fail-image");
+      result = VK_ERROR_FEATURE_NOT_PRESENT;
 #else
       result = wsi_common_create_swapchain_image(
          &dev->physical_device->wsi_device, pCreateInfo,

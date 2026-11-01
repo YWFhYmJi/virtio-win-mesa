@@ -469,18 +469,6 @@ D3D9CloseAdapter(HANDLE hAdapter)
 static HRESULT APIENTRY
 D3D9CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *data)
 {
-   D3D9Tracef("CreateDevice hAdapter=%p data=%p pDeviceFuncs=%p hRTDevice=%p "
-              "interface=0x%08x version=0x%08x flags=0x%08x "
-              "cmd=%p/%u alloc=%p/%u patch=%p/%u\n",
-              hAdapter, data, data ? data->pDeviceFuncs : NULL,
-              data ? data->hDevice : NULL, data ? data->Interface : 0,
-              data ? data->Version : 0, data ? data->Flags.Value : 0,
-              data ? data->pCommandBuffer : NULL,
-              data ? data->CommandBufferSize : 0,
-              data ? data->pAllocationList : NULL,
-              data ? data->AllocationListSize : 0,
-              data ? data->pPatchLocationList : NULL,
-              data ? data->PatchLocationListSize : 0);
 
    if (!hAdapter || !data || !data->pDeviceFuncs)
       return E_INVALIDARG;
@@ -510,7 +498,6 @@ D3D9CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *data)
 
    device->screen = d3d10_create_screen(&device->gdi_device.base);
    if (!device->screen) {
-      D3D9Tracef("CreateDevice failed to create Yttrium screen\n");
       device->gdi_device.base.destroy(&device->gdi_device.base);
       free(device);
       return E_FAIL;
@@ -518,7 +505,6 @@ D3D9CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *data)
 
    device->pipe = device->screen->context_create(device->screen, NULL, 0);
    if (!device->pipe) {
-      D3D9Tracef("CreateDevice failed to create Yttrium context\n");
       device->screen->destroy(device->screen);
       device->gdi_device.base.destroy(&device->gdi_device.base);
       free(device);
@@ -583,9 +569,6 @@ D3D9CreateDevice(HANDLE hAdapter, D3DDDIARG_CREATEDEVICE *data)
 static HRESULT APIENTRY
 D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
 {
-   D3D9Tracef("GetCaps enter hAdapter=%p data=%p type=%u pInfo=%p pData=%p size=%u\n",
-              hAdapter, data, data ? data->Type : 0, data ? data->pInfo : NULL,
-              data ? data->pData : NULL, data ? data->DataSize : 0);
 
    if (!hAdapter || !data)
       return E_INVALIDARG;
@@ -602,22 +585,16 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
       ((DDRAW_CAPS *)data->pData)->Caps2 = DDRAW_CAPS2_DYNAMICTEXTURES;
       ((DDRAW_CAPS *)data->pData)->CKeyCaps = 0;
       ((DDRAW_CAPS *)data->pData)->FxCaps = 0;
-      D3D9Tracef("GetCaps DDRAW caps=0x%08x caps2=0x%08x\n",
-                 ((DDRAW_CAPS *)data->pData)->Caps,
-                 ((DDRAW_CAPS *)data->pData)->Caps2);
       return S_OK;
    case D3DDDICAPS_DDRAW_MODE_SPECIFIC:
       if (FAILED(D3D9ValidateData(data, sizeof(DDRAW_MODE_SPECIFIC_CAPS))))
          return E_INVALIDARG;
       memset(data->pData, 0, data->DataSize);
-      D3D9Tracef("GetCaps DDRAW_MODE_SPECIFIC head=%u\n",
-                 ((DDRAW_MODE_SPECIFIC_CAPS *)data->pData)->Head);
       return S_OK;
    case D3DDDICAPS_GETFORMATCOUNT:
       if (FAILED(D3D9ValidateData(data, sizeof(UINT))))
          return E_INVALIDARG;
       *(UINT *)data->pData = ARRAYSIZE(g_format_ops);
-      D3D9Tracef("GetCaps FORMATCOUNT count=%u\n", *(UINT *)data->pData);
       return S_OK;
    case D3DDDICAPS_GETFORMATDATA:
       if (FAILED(D3D9ValidateData(data, sizeof(g_format_ops))))
@@ -628,10 +605,6 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
          format_op->BltMsTypes &= adapter->ms_types;
          format_op->FlipMsTypes &= adapter->ms_types;
       }
-      D3D9Tracef("GetCaps FORMATDATA bytes=%u count=%u x8r8g8b8=0x%08x "
-                 "a8r8g8b8=0x%08x\n",
-                 data->DataSize, (unsigned)ARRAYSIZE(g_format_ops),
-                 g_format_ops[0].Operations, g_format_ops[2].Operations);
       return S_OK;
    case D3DDDICAPS_GETMULTISAMPLEQUALITYLEVELS:
       if (FAILED(D3D9ValidateData(data, sizeof(DDIMULTISAMPLEQUALITYLEVELSDATA))))
@@ -642,22 +615,17 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
          ms->QualityLevels =
             D3D9FormatSupportsMultisample(adapter, ms->Format, ms->Flip,
                                           ms->MsType) ? 1 : 0;
-         D3D9Tracef("GetCaps MSAA format=%u flip=%u type=%u quality=%u\n",
-                    ms->Format, ms->Flip, ms->MsType, ms->QualityLevels);
       }
       return S_OK;
    case D3DDDICAPS_GETD3DQUERYCOUNT:
       if (FAILED(D3D9ValidateData(data, sizeof(UINT))))
          return E_INVALIDARG;
       *(UINT *)data->pData = ARRAYSIZE(g_query_types);
-      D3D9Tracef("GetCaps QUERYCOUNT count=%u\n", *(UINT *)data->pData);
       return S_OK;
    case D3DDDICAPS_GETD3DQUERYDATA:
       if (FAILED(D3D9ValidateData(data, sizeof(g_query_types))))
          return E_INVALIDARG;
       memcpy(data->pData, g_query_types, sizeof(g_query_types));
-      D3D9Tracef("GetCaps QUERYDATA bytes=%u count=%u\n",
-                 data->DataSize, (unsigned)ARRAYSIZE(g_query_types));
       return S_OK;
    case D3DDDICAPS_GETD3D3CAPS:
       if (FAILED(D3D9ValidateData(data,
@@ -665,40 +633,19 @@ D3D9GetCaps(HANDLE hAdapter, const D3DDDIARG_GETCAPS *data)
          return E_INVALIDARG;
       D3D9FillLegacyCaps(adapter,
                          (D3D9LegacyGlobalDriverData *)data->pData);
-      D3D9Tracef("GetCaps D3D3 size=%lu dev=0x%08lx render=0x%08lx "
-                 "z=0x%08lx\n",
-                 ((D3D9LegacyGlobalDriverData *)data->pData)->dwSize,
-                 ((D3D9LegacyGlobalDriverData *)data->pData)
-                    ->hwCaps.dwDevCaps,
-                 ((D3D9LegacyGlobalDriverData *)data->pData)
-                    ->hwCaps.dwDeviceRenderBitDepth,
-                 ((D3D9LegacyGlobalDriverData *)data->pData)
-                    ->hwCaps.dwDeviceZBufferBitDepth);
       return S_OK;
    case D3DDDICAPS_GETD3D9CAPS:
       if (FAILED(D3D9ValidateData(data, sizeof(D3DCAPS9))))
          return E_INVALIDARG;
       D3D9FillCaps(adapter, (D3DCAPS9 *)data->pData);
-      D3D9Tracef("GetCaps D3D9 caps=0x%08lx caps2=0x%08lx "
-                 "dev=0x%08lx dev2=0x%08lx vs=0x%08lx ps=0x%08lx\n",
-                 ((D3DCAPS9 *)data->pData)->Caps,
-                 ((D3DCAPS9 *)data->pData)->Caps2,
-                 ((D3DCAPS9 *)data->pData)->DevCaps,
-                 ((D3DCAPS9 *)data->pData)->DevCaps2,
-                 ((D3DCAPS9 *)data->pData)->VertexShaderVersion,
-                 ((D3DCAPS9 *)data->pData)->PixelShaderVersion);
       return S_OK;
    case D3DDDICAPS_GETGAMMARAMPCAPS:
       if (FAILED(D3D9ValidateData(data, sizeof(DDIGAMMACAPS))))
          return E_INVALIDARG;
       memset(data->pData, 0, data->DataSize);
       ((DDIGAMMACAPS *)data->pData)->GammaCaps = GAMMA_CAP_RGB256x3x16;
-      D3D9Tracef("GetCaps GAMMA caps=0x%08x\n",
-                 ((DDIGAMMACAPS *)data->pData)->GammaCaps);
       return S_OK;
    default:
-      D3D9Tracef("GetCaps unsupported type=%u size=%u\n",
-                 data->Type, data->DataSize);
       return E_NOTIMPL;
    }
 }
@@ -708,12 +655,6 @@ OpenAdapter(D3DDDIARG_OPENADAPTER *open_data)
 {
    const UINT driver_version = D3D9DriverVersion(open_data);
 
-   D3D9Tracef("OpenAdapter data=%p hAdapter=%p funcs=%p callbacks=%p version=0x%08x runtimeInterface=0x%08x runtimeVersion=0x%08x\n",
-              open_data, open_data ? open_data->hAdapter : NULL,
-              open_data ? open_data->pAdapterFuncs : NULL,
-              open_data ? open_data->pAdapterCallbacks : NULL,
-              driver_version, open_data ? open_data->Interface : 0,
-              open_data ? open_data->Version : 0);
 
    if (!open_data || !open_data->pAdapterFuncs)
       return E_INVALIDARG;

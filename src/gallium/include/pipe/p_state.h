@@ -342,6 +342,10 @@ struct pipe_shader_state
 
    /* Borrowed for the duration of create_*_state. */
    const struct pipe_shader_sampler_binding_map *sampler_binding_map;
+
+   /* Typed buffer image slots take their channel layout from the bound view.
+    * Raw/structured DWORD images leave their bits clear. */
+   uint64_t typed_buffer_image_mask;
 };
 
 static inline void
@@ -352,6 +356,7 @@ pipe_shader_state_from_tgsi(struct pipe_shader_state *state,
    state->tokens = tokens;
    memset(&state->stream_output, 0, sizeof(state->stream_output));
    state->sampler_binding_map = NULL;
+   state->typed_buffer_image_mask = 0;
 }
 
 struct pipe_stencil_state
@@ -1371,6 +1376,10 @@ struct pipe_compute_state
 
    /* Optional combined sampled-image mapping, borrowed during create_compute_state. */
    const struct pipe_shader_sampler_binding_map *sampler_binding_map;
+
+   /* Typed buffer image slots take their channel layout from the bound view.
+    * Raw/structured DWORD images leave their bits clear. */
+   uint64_t typed_buffer_image_mask;
 };
 
 struct pipe_compute_state_object_info

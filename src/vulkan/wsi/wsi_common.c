@@ -851,14 +851,20 @@ wsi_create_image(const struct wsi_swapchain *chain,
       image->explicit_sync[i].fd = -1;
 #endif
 
-   result = wsi->CreateImage(chain->device, &info->create,
-                             &chain->alloc, &image->image);
-   if (result != VK_SUCCESS)
-      goto fail;
+   if (info->create_image_and_memory) {
+      result = info->create_image_and_memory(chain, info, image);
+      if (result != VK_SUCCESS)
+         goto fail;
+   } else {
+      result = wsi->CreateImage(chain->device, &info->create,
+                                &chain->alloc, &image->image);
+      if (result != VK_SUCCESS)
+         goto fail;
 
-   result = info->create_mem(chain, info, image);
-   if (result != VK_SUCCESS)
-      goto fail;
+      result = info->create_mem(chain, info, image);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
 
    result = wsi->BindImageMemory(chain->device, image->image,
                                  image->memory, 0);

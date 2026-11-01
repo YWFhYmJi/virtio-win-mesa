@@ -13,6 +13,7 @@
 #undef yttrium_venus_create
 #undef yttrium_venus_get_kmt_context
 #undef yttrium_venus_destroy
+#undef yttrium_venus_retain_on_teardown
 #undef yttrium_venus_create_shader_module
 #undef yttrium_venus_pipe_format
 #undef yttrium_venus_destroy_shader_module
@@ -45,6 +46,7 @@
 #undef yttrium_venus_last_submit_order
 #undef yttrium_venus_submit_order_complete
 #undef yttrium_venus_wait_resource
+#undef yttrium_venus_resource_ready
 #undef yttrium_venus_blit_display_image
 #undef yttrium_venus_resolve_display_image
 #undef yttrium_venus_copy_buffer_to_display_image
@@ -65,6 +67,11 @@
 #undef yttrium_venus_create_sampled_buffer
 #undef yttrium_venus_ensure_null_sampled_buffer
 #undef yttrium_venus_create_display_image
+#undef yttrium_venus_create_optimal_shared_image
+#undef yttrium_venus_import_optimal_shared_image
+#undef yttrium_venus_create_presentable_image
+#undef yttrium_venus_import_display_endpoint
+#undef yttrium_venus_publish_display_endpoint
 #undef yttrium_venus_create_color_attachment_image
 #undef yttrium_venus_create_sampled_texture_image
 #undef yttrium_venus_create_texture_image_for_bind

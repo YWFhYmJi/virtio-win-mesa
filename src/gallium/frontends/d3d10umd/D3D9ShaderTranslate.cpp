@@ -106,13 +106,6 @@ D3D9TranslateVertexShaderForState(D3D9Device *device, D3D9Object *shader,
    info.lconstf.data = NULL;
    info.lconstf.ranges = NULL;
 
-   D3D9Tracef("translated D3D9 VS with Nine shader=%p version=%u.%u "
-              "size=%zu byte_size=%u fog=%u position_t=%u clip_planes=0x%02x "
-              "point_size=%u cso=%p\n",
-              shader, (version >> 8) & 0xff, version & 0xff, shader->size,
-              info.byte_size, fog_enable ? 1u : 0u, position_t ? 1u : 0u,
-              clip_plane_mask, info.point_size ? 1u : 0u,
-              shader->translated_vs_cso);
    return S_OK;
 }
 
@@ -205,18 +198,6 @@ D3D9TranslatePixelShaderForState(D3D9Device *device, D3D9Object *shader,
    info.lconstf.data = NULL;
    info.lconstf.ranges = NULL;
 
-   D3D9Tracef("translated D3D9 PS with Nine shader=%p version=%u.%u "
-              "size=%zu byte_size=%u fog=%u mode=%u zfog=%u "
-              "projected=0x%02x flatshade=%u ps1x_samplers=0x%04x "
-              "sampler_overrides=0x%016llx/0x%04x fetch4=0x%04x "
-              "ati1=0x%04x projected_fallback=0x%04x cso=%p\n",
-              shader, (version >> 8) & 0xff, version & 0xff, shader->size,
-              info.byte_size, fog_enable ? 1u : 0u, fog_mode,
-              zfog ? 1u : 0u, projected, info.color_flatshade ? 1u : 0u,
-              sampler_ps1xtypes,
-              (unsigned long long)sampler_type_overrides,
-              sampler_type_override_mask, fetch4, fetch4_ati1,
-              fetch4_projected_fallback, shader->translated_ps_cso);
    return S_OK;
 }
 

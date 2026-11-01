@@ -23,6 +23,7 @@
 
 static float D3D9RenderStateFloat(UINT value);
 static float D3D9PointSize(const D3D9Device *device);
+static bool D3D9ActiveVertexDeclHasPositionT(const D3D9Device *device);
 
 static constexpr UINT D3D9_DEFAULT_VERTEX_INPUT_BUFFER = 16;
 static constexpr UINT D3D9_SAMPLER_FETCH4 =
@@ -358,6 +359,21 @@ D3D9StoreNineBoolConstant(uint32_t dst[4], const BOOL *src,
    }
 }
 
+/* POSITIONT depth is already in window space.  Keep its Z unchanged in the
+ * inverse viewport transform, and clamp fragments to [0, 1] at rasterization.
+ * Using the application viewport range here would clamp pretransformed depth
+ * to MinZ/MaxZ instead, which are only relevant to transformed vertices.
+ */
+static D3DDDIARG_ZRANGE
+D3D9RasterDepthRange(const D3D9Device *device)
+{
+   if (D3D9ActiveVertexDeclHasPositionT(device))
+      return {0.0f, 1.0f};
+
+   return {device->zrange.MinZ,
+           device->zrange.MaxZ ? device->zrange.MaxZ : 1.0f};
+}
+
 static void
 D3D9StoreNineVsConstantSlot(D3D9Device *device, uint32_t dst[4],
                             unsigned slot, bool native_integers)
@@ -394,8 +410,9 @@ D3D9StoreNineVsConstantSlot(D3D9Device *device, uint32_t dst[4],
             (float)device->viewport.Width : 1.0f;
          const float height = device->viewport.Height ?
             (float)device->viewport.Height : 1.0f;
-         const float min_z = device->zrange.MinZ;
-         const float max_z = device->zrange.MaxZ ? device->zrange.MaxZ : 1.0f;
+         const D3DDDIARG_ZRANGE zrange = D3D9RasterDepthRange(device);
+         const float min_z = zrange.MinZ;
+         const float max_z = zrange.MaxZ;
          const float scale_x = width / 2.0f;
          const float scale_y = -height / 2.0f;
          const float scale_z = max_z - min_z;
@@ -412,7 +429,7 @@ D3D9StoreNineVsConstantSlot(D3D9Device *device, uint32_t dst[4],
             (float)device->viewport.Width : 1.0f;
          const float height = device->viewport.Height ?
             (float)device->viewport.Height : 1.0f;
-         const float min_z = device->zrange.MinZ;
+         const float min_z = D3D9RasterDepthRange(device).MinZ;
          const float half_width = width / 2.0f;
          const float half_height = height / 2.0f;
          const float translate_x = half_width + (float)device->viewport.X;
@@ -1089,9 +1106,6 @@ D3D9CreatePositionTPsInputFixedFunctionVs(D3D9Device *device,
       1.0f;
    const float height = device->viewport.Height ?
       (float)device->viewport.Height : 1.0f;
-   const float min_z = device->zrange.MinZ;
-   const float max_z = device->zrange.MaxZ;
-   const float z_scale = max_z != min_z ? 1.0f / (max_z - min_z) : 0.0f;
 
    struct ureg_src inputs[PIPE_MAX_ATTRIBS];
    memset(inputs, 0, sizeof(inputs));
@@ -1106,10 +1120,10 @@ D3D9CreatePositionTPsInputFixedFunctionVs(D3D9Device *device,
    ureg_ADD(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XYZ),
             ureg_src(tmp),
             ureg_imm4f(ureg, -(float)device->viewport.X,
-                       -(float)device->viewport.Y, -min_z, 0.0f));
+                       -(float)device->viewport.Y, 0.0f, 0.0f));
    ureg_MUL(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XYZ),
             ureg_src(tmp),
-            ureg_imm4f(ureg, 2.0f / width, 2.0f / height, z_scale, 0.0f));
+            ureg_imm4f(ureg, 2.0f / width, 2.0f / height, 1.0f, 0.0f));
    ureg_ADD(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XY),
             ureg_src(tmp), ureg_imm4f(ureg, -1.0f, -1.0f, 0.0f, 0.0f));
    ureg_MOV(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_Y),
@@ -1273,9 +1287,6 @@ D3D9CreatePositionTDiffuseFixedFunctionVs(D3D9Device *device)
       1.0f;
    const float height = device->viewport.Height ?
       (float)device->viewport.Height : 1.0f;
-   const float min_z = device->zrange.MinZ;
-   const float max_z = device->zrange.MaxZ;
-   const float z_scale = max_z != min_z ? 1.0f / (max_z - min_z) : 0.0f;
 
    struct ureg_src pos = ureg_DECL_vs_input(ureg, 0);
    struct ureg_src color = ureg_DECL_vs_input(ureg, 1);
@@ -1289,10 +1300,10 @@ D3D9CreatePositionTDiffuseFixedFunctionVs(D3D9Device *device)
    ureg_ADD(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XYZ),
             ureg_src(tmp),
             ureg_imm4f(ureg, -(float)device->viewport.X,
-                       -(float)device->viewport.Y, -min_z, 0.0f));
+                       -(float)device->viewport.Y, 0.0f, 0.0f));
    ureg_MUL(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XYZ),
             ureg_src(tmp),
-            ureg_imm4f(ureg, 2.0f / width, 2.0f / height, z_scale, 0.0f));
+            ureg_imm4f(ureg, 2.0f / width, 2.0f / height, 1.0f, 0.0f));
    ureg_ADD(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_XY),
             ureg_src(tmp), ureg_imm4f(ureg, -1.0f, -1.0f, 0.0f, 0.0f));
    ureg_MOV(ureg, ureg_writemask(tmp, TGSI_WRITEMASK_Y),
@@ -1573,7 +1584,7 @@ D3D9CreateBlendState(D3D9Device *device)
 
 static void *
 D3D9CreateRasterizerState(D3D9Device *device, bool depth_clamp,
-                          bool point_position_gs)
+                          bool point_position_gs, enum mesa_prim mode)
 {
    struct pipe_context *pipe = device->pipe;
    struct pipe_rasterizer_state state;
@@ -1587,6 +1598,19 @@ D3D9CreateRasterizerState(D3D9Device *device, bool depth_clamp,
    state.depth_clip_near = depth_clamp ? 0 : 1;
    state.depth_clip_far = depth_clamp ? 0 : 1;
    state.depth_clamp = depth_clamp ? 1 : 0;
+   /* D3D9 specifies a normalized floating-point bias, independent of the
+    * depth format.  It applies to triangles, not points or lines (including
+    * points expanded into triangles by our geometry shader).
+    */
+   if (mode == MESA_PRIM_TRIANGLES || mode == MESA_PRIM_TRIANGLE_STRIP ||
+       mode == MESA_PRIM_TRIANGLE_FAN) {
+      state.offset_tri = 1;
+      state.offset_units_unscaled = 1;
+      state.offset_units =
+         D3D9RenderStateFloat(device->render_states[D3DDDIRS_DEPTHBIAS]);
+      state.offset_scale =
+         D3D9RenderStateFloat(device->render_states[D3DDDIRS_SLOPESCALEDEPTHBIAS]);
+   }
    state.scissor =
       device->render_states[D3DDDIRS_SCISSORTESTENABLE] ? 1 : 0;
    state.line_last_pixel =
@@ -1724,8 +1748,9 @@ D3D9BindViewport(D3D9Device *device)
       1.0f;
    const float height = device->viewport.Height ? (float)device->viewport.Height :
       1.0f;
-   const float min_z = device->zrange.MinZ;
-   const float max_z = device->zrange.MaxZ ? device->zrange.MaxZ : 1.0f;
+   const D3DDDIARG_ZRANGE zrange = D3D9RasterDepthRange(device);
+   const float min_z = zrange.MinZ;
+   const float max_z = zrange.MaxZ;
    const float half_width = width / 2.0f;
    const float half_height = height / 2.0f;
 
@@ -2890,7 +2915,7 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
       D3D9ActiveVertexDeclHasPositionT(device);
    void *rasterizer = D3D9CreateRasterizerState(device,
                                                 position_t_depth_clamp,
-                                                point_position_gs);
+                                                point_position_gs, mode);
    void *dsa = D3D9CreateDepthStencilState(device);
    void *point_gs = NULL;
    if (point_position_gs) {
@@ -3098,11 +3123,6 @@ D3D9DrawDiffuse(D3D9Device *device, D3DPRIMITIVETYPE primitive_type,
       pipe->delete_gs_state(pipe, point_gs);
    free(constants);
 
-   D3D9Tracef("Draw primitive=%u count=%u start=%u offset=%d vertices=%u "
-              "indexed=%u index_bias=%d index_start=%u index_size=%u rhw=%u\n",
-              primitive_type, primitive_count, start_vertex,
-              first_vertex_offset, vertex_count, indexed ? 1 : 0,
-              index_bias, start_index, index_size, 0);
    return D3D9ConsumeBackendDrawFailure(device) ? E_FAIL : S_OK;
 }
 
@@ -3112,9 +3132,6 @@ D3D9DrawPrimitive(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE *data,
 {
    (void)indices;
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("DrawPrimitive data=%p primitive=%u start=%u count=%u\n",
-              data, data ? data->PrimitiveType : 0, data ? data->VStart : 0,
-              data ? data->PrimitiveCount : 0);
    if (!device || !data)
       return E_INVALIDARG;
    if (!data->PrimitiveCount)
@@ -3130,14 +3147,6 @@ D3D9DrawIndexedPrimitive(HANDLE hDevice,
                          const D3DDDIARG_DRAWINDEXEDPRIMITIVE *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("DrawIndexedPrimitive data=%p primitive=%u base=%d min=%u "
-              "vertices=%u start=%u count=%u index=%p stride=%u\n",
-              data, data ? data->PrimitiveType : 0,
-              data ? data->BaseVertexIndex : 0, data ? data->MinIndex : 0,
-              data ? data->NumVertices : 0, data ? data->StartIndex : 0,
-              data ? data->PrimitiveCount : 0,
-              device ? device->index_buffer : NULL,
-              device ? device->index_stride : 0);
    if (!device || !data)
       return E_INVALIDARG;
    if (!data->PrimitiveCount)
@@ -3154,10 +3163,6 @@ HRESULT APIENTRY
 D3D9DrawPrimitive2(HANDLE hDevice, const D3DDDIARG_DRAWPRIMITIVE2 *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("DrawPrimitive2 data=%p primitive=%u first_offset=%u count=%u\n",
-              data, data ? data->PrimitiveType : 0,
-              data ? data->FirstVertexOffset : 0,
-              data ? data->PrimitiveCount : 0);
    if (!device || !data)
       return E_INVALIDARG;
    if (!data->PrimitiveCount)
@@ -3177,13 +3182,6 @@ D3D9DrawIndexedPrimitive2(HANDLE hDevice,
                           const UINT *index_remap)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("DrawIndexedPrimitive2 data=%p primitive=%u base_offset=%d "
-              "min=%u vertices=%u start_offset=%u count=%u index_size=%u "
-              "indices=%p\n",
-              data, data ? data->PrimitiveType : 0,
-              data ? data->BaseVertexOffset : 0, data ? data->MinIndex : 0,
-              data ? data->NumVertices : 0, data ? data->StartIndexOffset : 0,
-              data ? data->PrimitiveCount : 0, index_size, indices);
    if (!device || !data)
       return E_INVALIDARG;
    if (!data->PrimitiveCount)

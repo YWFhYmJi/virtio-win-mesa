@@ -2286,6 +2286,30 @@ Turnip driver environment variables
    ``forcecb``
       Force enable concurrent binning.
 
+Yttrium driver environment variables
+-----------------------------------
+
+.. envvar:: D3D10UMD_YTTRIUM_SYNC_ALLOCATIONS
+
+   Set to ``1`` to wait for the host result of every Venus ``vkAllocateMemory``
+   operation, including imported memory. This diagnostic option defaults to
+   ``0``; allocations that already require a reply remain synchronous in either
+   mode. It changes allocation timing, not memory type selection or placement.
+
+   Failed allocations are reported in
+   ``C:/ProgramData/Yttrium/yttrium-errors.log`` with the resource owner,
+   ``VkResult``, memory object ID, allocation size, memory type and heap,
+   resource requirements, and import/export information. Ring submission or
+   reply failures are identified separately from host allocation results.
+   Failed memory is not passed to subsequent bind operations.
+
+   The option can also be set as ``SYNC_ALLOCATIONS=1`` in
+   ``C:/ProgramData/Yttrium/yttrium.ini``. The process environment takes
+   precedence. Restart the affected process after changing the setting;
+   reboot Windows to apply an INI change to desktop processes. When enabled,
+   a confirmation is written to ``C:/ProgramData/Yttrium/yttrium-user.log``.
+   Waiting for replies can reduce performance; use this option for diagnosis.
+
 Freedreno driver environment variables
 --------------------------------------
 

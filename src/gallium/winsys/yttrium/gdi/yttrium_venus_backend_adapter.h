@@ -25,6 +25,12 @@ backend_destroy(void *ctx)
    YTTRIUM_VENUS_BACKEND_SYM(destroy)(ctx);
 }
 
+static void
+backend_retain_on_teardown(void *ctx)
+{
+   YTTRIUM_VENUS_BACKEND_SYM(retain_on_teardown)(ctx);
+}
+
 static bool
 backend_create_shader_module(void *ctx,
                              struct yttrium_venus_object *obj,
@@ -144,10 +150,10 @@ backend_storage_image_without_format_supported(void *ctx,
 static bool
 backend_storage_image_formatless_format_supported(void *ctx,
                                                    enum pipe_format format,
-                                                   bool read, bool write)
+                                                   bool read, bool write, bool buffer)
 {
    return YTTRIUM_VENUS_BACKEND_SYM(storage_image_formatless_format_supported)(
-      ctx, format, read, write);
+      ctx, format, read, write, buffer);
 }
 #endif
 
@@ -486,6 +492,13 @@ backend_wait_resource(void *ctx,
 }
 
 static bool
+backend_resource_ready(void *ctx,
+                        struct yttrium_venus_resource *resource)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(resource_ready)(ctx, resource);
+}
+
+static bool
 backend_blit_display_image(void *ctx,
                            struct yttrium_venus_resource *src,
                            struct yttrium_venus_resource *dst,
@@ -709,6 +722,56 @@ backend_create_display_image(void *ctx,
 }
 
 static bool
+backend_create_optimal_shared_image(
+   void *ctx, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format,
+   unsigned bind, struct yttrium_optimal_image_data *data,
+   uint64_t *out_memory_id, uint64_t *out_allocation_size)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(create_optimal_shared_image)(
+      ctx, resource, width, height, pipe_format, bind, data,
+      out_memory_id, out_allocation_size);
+}
+
+static bool
+backend_import_optimal_shared_image(
+   void *ctx, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_optimal_image_data *data)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(import_optimal_shared_image)(
+      ctx, resource, resource_id, data);
+}
+
+static bool
+backend_create_presentable_image(
+   void *ctx, struct yttrium_venus_resource *resource,
+   uint32_t width, uint32_t height, enum pipe_format pipe_format, unsigned bind,
+   uint64_t *out_endpoint_memory_id, uint64_t *out_endpoint_allocation_size)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(create_presentable_image)(
+      ctx, resource, width, height, pipe_format, bind,
+      out_endpoint_memory_id, out_endpoint_allocation_size);
+}
+
+static bool
+backend_import_display_endpoint(
+   void *ctx, struct yttrium_venus_resource *resource,
+   uint32_t resource_id, const struct yttrium_display_endpoint_data *data)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(import_display_endpoint)(
+      ctx, resource, resource_id, data);
+}
+
+static bool
+backend_publish_display_endpoint(
+   void *ctx, struct yttrium_venus_resource *resource,
+   const char *label)
+{
+   return YTTRIUM_VENUS_BACKEND_SYM(publish_display_endpoint)(
+      ctx, resource, label);
+}
+
+static bool
 backend_create_color_attachment_image(void *ctx,
                                       struct yttrium_venus_resource *resource,
                                       uint32_t width,
@@ -845,6 +908,7 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
    .create = backend_create,
    .get_kmt_context = backend_get_kmt_context,
    .destroy = backend_destroy,
+   .retain_on_teardown = backend_retain_on_teardown,
    .create_shader_module = backend_create_shader_module,
    .pipe_format = backend_pipe_format,
    .destroy_shader_module = backend_destroy_shader_module,
@@ -891,6 +955,7 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
    .last_submit_order = backend_last_submit_order,
    .submit_order_complete = backend_submit_order_complete,
    .wait_resource = backend_wait_resource,
+   .resource_ready = backend_resource_ready,
    .blit_display_image = backend_blit_display_image,
    .resolve_display_image = backend_resolve_display_image,
    .copy_buffer_to_display_image = backend_copy_buffer_to_display_image,
@@ -913,6 +978,11 @@ const struct yttrium_venus_backend YTTRIUM_VENUS_BACKEND_SYM(backend) = {
    .create_sampled_buffer = backend_create_sampled_buffer,
    .ensure_null_sampled_buffer = backend_ensure_null_sampled_buffer,
    .create_display_image = backend_create_display_image,
+   .create_optimal_shared_image = backend_create_optimal_shared_image,
+   .import_optimal_shared_image = backend_import_optimal_shared_image,
+   .create_presentable_image = backend_create_presentable_image,
+   .import_display_endpoint = backend_import_display_endpoint,
+   .publish_display_endpoint = backend_publish_display_endpoint,
    .create_color_attachment_image = backend_create_color_attachment_image,
    .create_sampled_texture_image = backend_create_sampled_texture_image,
    .create_texture_image_for_bind = backend_create_texture_image_for_bind,

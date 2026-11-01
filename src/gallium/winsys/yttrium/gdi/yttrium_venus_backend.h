@@ -14,6 +14,7 @@ struct yttrium_venus_backend {
    void *(*create)(struct gdikmt_device *device);
    struct gdikmt_context *(*get_kmt_context)(void *ctx);
    void (*destroy)(void *ctx);
+   void (*retain_on_teardown)(void *ctx);
 
    bool (*create_shader_module)(void *ctx,
                                 struct yttrium_venus_object *obj,
@@ -67,7 +68,7 @@ struct yttrium_venus_backend {
                                                   bool read, bool write);
    bool (*storage_image_formatless_format_supported)(void *ctx,
                                                       enum pipe_format format,
-                                                      bool read, bool write);
+                                                      bool read, bool write, bool buffer);
    bool (*compute_pipeline_init)(
       void *ctx,
       struct yttrium_pipeline *pipeline,
@@ -260,6 +261,8 @@ struct yttrium_venus_backend {
    bool (*wait_resource)(void *ctx,
                          struct yttrium_venus_resource *resource,
                          const char *label);
+   bool (*resource_ready)(void *ctx,
+                          struct yttrium_venus_resource *resource);
    bool (*blit_display_image)(void *ctx,
                               struct yttrium_venus_resource *src,
                               struct yttrium_venus_resource *dst,
@@ -362,6 +365,24 @@ struct yttrium_venus_backend {
                                 uint64_t min_allocation_size,
                                 uint64_t *out_memory_id,
                                 uint64_t *out_allocation_size);
+   bool (*create_optimal_shared_image)(
+      void *ctx, struct yttrium_venus_resource *resource,
+      uint32_t width, uint32_t height, enum pipe_format pipe_format,
+      unsigned bind, struct yttrium_optimal_image_data *data,
+      uint64_t *out_memory_id, uint64_t *out_allocation_size);
+   bool (*import_optimal_shared_image)(
+      void *ctx, struct yttrium_venus_resource *resource,
+      uint32_t resource_id, const struct yttrium_optimal_image_data *data);
+   bool (*create_presentable_image)(
+      void *ctx, struct yttrium_venus_resource *resource,
+      uint32_t width, uint32_t height, enum pipe_format pipe_format, unsigned bind,
+      uint64_t *out_endpoint_memory_id, uint64_t *out_endpoint_allocation_size);
+   bool (*import_display_endpoint)(
+      void *ctx, struct yttrium_venus_resource *resource,
+      uint32_t resource_id, const struct yttrium_display_endpoint_data *data);
+   bool (*publish_display_endpoint)(
+      void *ctx, struct yttrium_venus_resource *resource,
+      const char *label);
    bool (*create_color_attachment_image)(void *ctx,
                                          struct yttrium_venus_resource *resource,
                                          uint32_t width,

@@ -6,22 +6,6 @@
 #include "D3D9Private.h"
 
 void
-D3D9Tracef(const char *format, ...)
-{
-   char message[512];
-   va_list ap;
-
-   if (!yttrium_gdi_debug_get_bool_option("D3D10UMD_D3D9_TRACE", false))
-      return;
-
-   va_start(ap, format);
-   vsnprintf(message, sizeof(message), format, ap);
-   va_end(ap);
-   message[sizeof(message) - 1] = '\0';
-   yttrium_gdi_user_logf("d3d9ddi: %s", message);
-}
-
-void
 D3D9Warnf(const char *format, ...)
 {
    char message[512];

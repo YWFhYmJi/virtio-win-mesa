@@ -19,6 +19,18 @@
  * an aligned byte offset in a buffer by CopyStructureCount. */
 #define YTTRIUM_GDI_RESOURCE_FLAG_UAV_COUNTER (PIPE_RESOURCE_FLAG_DRV_PRIV << 1)
 
+/* The frontend has ruled out API-level sharing, so a local optimal render
+ * image can own a separate runtime-visible display endpoint. */
+#define YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER (PIPE_RESOURCE_FLAG_DRV_PRIV << 2)
+
+/* Canonical API-shared optimal image with no initial CPU data or CPU
+ * mapping intent. Its metadata is shared without a linear render mirror. */
+#define YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED (PIPE_RESOURCE_FLAG_DRV_PRIV << 3)
+
+/* A local primary or legacy output renders optimal and owns a distinct
+ * LINEAR endpoint registered as its real Windows display allocation. */
+#define YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT (PIPE_RESOURCE_FLAG_DRV_PRIV << 4)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,14 +48,26 @@ yttrium_gdi_flush_labeled(struct pipe_context *ctx,
                           unsigned flags,
                           const char *label);
 
+/* Enqueue publication on the context worker, before its next flush/signal.
+ * This records GPU work; success does not establish GPU or CPU readiness.
+ */
+bool
+yttrium_gdi_publish_display_endpoint(struct pipe_context *ctx,
+                                       struct pipe_resource *resource,
+                                       const char *label);
+
 struct yttrium_gdi_flush_issuance *
 yttrium_gdi_flush_async_issuance(struct pipe_context *ctx,
                                  const char *label);
 
+/* Public DDI Flush/resolve must submit before the runtime can signal a shared
+ * ownership handoff. This waits for worker issuance, never GPU completion. */
+bool
+yttrium_gdi_flush_handoff(struct pipe_context *ctx, const char *label);
+
 bool
 yttrium_gdi_wait_flush_issuance(
-   struct yttrium_gdi_flush_issuance *issuance,
-   uint32_t timeout_ms);
+   struct yttrium_gdi_flush_issuance *issuance);
 
 void
 yttrium_gdi_flush_issuance_release(
@@ -85,6 +109,14 @@ yttrium_gdi_resource_set_allocation_ownership(struct pipe_resource *resource,
 bool
 yttrium_gdi_resource_has_runtime_allocation(struct pipe_resource *resource);
 
+/* Canonical opaque optimal storage has no linear scanout representation. */
+bool
+yttrium_gdi_resource_is_optimal_shared(struct pipe_resource *resource);
+
+/* Local optimal creator publishes a separate linear display endpoint. */
+bool
+yttrium_gdi_resource_is_optimal_present(struct pipe_resource *resource);
+
 bool
 yttrium_gdi_resource_rotate_runtime_handles(
    struct pipe_resource *const *resources, unsigned count);
@@ -92,10 +124,6 @@ yttrium_gdi_resource_rotate_runtime_handles(
 uint32_t
 yttrium_gdi_pipeline_invalidate_resource(
    struct pipe_context *ctx, const struct pipe_resource *resource);
-
-void
-yttrium_gdi_resource_debug_log(struct pipe_resource *resource,
-                               const char *label);
 
 const char *
 yttrium_gdi_debug_get_option(const char *name, const char *dfault);

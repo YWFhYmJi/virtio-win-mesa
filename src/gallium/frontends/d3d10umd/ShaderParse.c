@@ -329,7 +329,7 @@ opcode_info[D3D10_SB_NUM_OPCODES] = {
    [DX10_SM5_OPCODE_IMM_ATOMIC_UMIN] = {
       _(DX10_SM5_OPCODE_IMM_ATOMIC_UMIN),               2, 2, 0},
    [DX10_SM5_OPCODE_SYNC] = {
-      _(DX10_SM5_OPCODE_SYNC),                          0, 0, OP_IGNORE_CONTROL},
+      _(DX10_SM5_OPCODE_SYNC),                          0, 0, 0},
    [DX10_SM5_OPCODE_BUFINFO] = {
       _(DX10_SM5_OPCODE_BUFINFO),                       1, 1, 0},
    [DX10_SM5_OPCODE_DERIV_RTX_COARSE] = {
@@ -732,6 +732,30 @@ Shader_parse_opcode(struct Shader_parser *parser,
          (DECODE_D3D10_SB_GLOBAL_FLAGS(token0) &
           D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL) ? 1 : 0;
       break;
+   case DX10_SM5_OPCODE_SYNC: {
+      const unsigned uav_flags =
+         D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GROUP |
+         D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL;
+      const unsigned memory_flags =
+         D3D11_SB_SYNC_THREAD_GROUP_SHARED_MEMORY | uav_flags;
+      /* Keep the raw opcode controls so reserved bits cannot be discarded. */
+      const unsigned flags = token0 & ((1u << 24) - (1u << 11));
+      opcode->specific.sync_flags = flags;
+      if ((flags & ~D3D11_SB_SYNC_FLAGS_MASK) ||
+          !(flags & memory_flags) ||
+          (flags & uav_flags) == uav_flags ||
+          (parser->header.type != DX10_SM5_COMPUTE_SHADER &&
+           flags != D3D11_SB_SYNC_UNORDERED_ACCESS_VIEW_MEMORY_GLOBAL)) {
+         yttrium_gdi_trace_warnf(
+            "yttrium: shader parse invalid sync flags=0x%x stage=%u offset=%u\n",
+            flags, parser->header.type,
+            (unsigned)(instruction_start - parser->code));
+         parser->failed = true;
+         return false;
+      }
+      /* D3D11.1 permits global UAV fences in every shader stage. */
+      break;
+   }
    case DX11_SM5_OPCODE_DCL_INPUT_CONTROL_POINT_COUNT:
       opcode->specific.dcl_input_control_point_count = (token0 >> 11) & 0x3f;
       break;

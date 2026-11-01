@@ -395,8 +395,9 @@ D3D9ResourceUsesDisplayTargetBind(const D3DDDIARG_CREATERESOURCE *data)
    if (data->MultisampleType)
       return false;
 
-   /* A swapchain backbuffer that will be presented/flipped must be an exported
-    * LINEAR Venus display image.  Legacy D3DSWAPEFFECT_DISCARD backbuffers
+   /* Windows requires a LINEAR allocation for presentation. A local resource
+    * may render into a separate OPTIMAL image, copied at the handoff.
+    * Legacy D3DSWAPEFFECT_DISCARD backbuffers
     * arrive as non-Texture render targets (or DiscardRenderTarget) and already
     * hit this.  D3D9Ex FLIPEX backbuffers instead arrive as Texture render
     * targets marked SharedResource (cross-process, for DWM); without
@@ -456,9 +457,20 @@ D3D9PipeBind(const D3DDDIARG_CREATERESOURCE *data)
       return bind;
    }
 
+   /* Private texture rendering and readback use Gallium images.  Requiring a
+    * shared allocation here also forces the winsys to choose an externally
+    * reproducible layout, even for mip chains that are never exported.
+    * Preserve allocations for shared resources and presentation/capture
+    * surfaces, including multisampled backbuffers. */
+   const bool private_texture =
+      (data->Flags.Texture || data->Flags.CubeMap || data->Flags.Volume) &&
+      !data->Flags.SharedResource && !data->Flags.Primary &&
+      !data->Flags.DiscardRenderTarget &&
+      !D3D9ResourceUsesDisplayTargetBind(data);
+   const unsigned shared_bind = private_texture ? 0 : PIPE_BIND_SHARED;
    unsigned bind = 0;
    if (D3D9ResourceIsColorTarget(data)) {
-      bind |= PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHARED;
+      bind |= PIPE_BIND_RENDER_TARGET | shared_bind;
       if (D3D9ResourceUsesDisplayTargetBind(data))
          bind |= PIPE_BIND_DISPLAY_TARGET;
    }
@@ -466,10 +478,10 @@ D3D9PipeBind(const D3DDDIARG_CREATERESOURCE *data)
       bind |= PIPE_BIND_SAMPLER_VIEW;
    if (data->Flags.AutogenMipmap &&
        D3D9ResourceCanBeColorCopyTarget(data))
-      bind |= PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHARED;
+      bind |= PIPE_BIND_RENDER_TARGET | shared_bind;
    if (D3D9PoolNeedsReadback(data->Pool) &&
        D3D9ResourceCanBeColorCopyTarget(data))
-      bind |= PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHARED;
+      bind |= PIPE_BIND_RENDER_TARGET | shared_bind;
    return bind;
 }
 
@@ -505,13 +517,18 @@ D3D9PipeTarget(const D3DDDIARG_CREATERESOURCE *data)
 }
 
 static enum pipe_resource_usage
-D3D9PipeUsage(D3DDDI_POOL pool)
+D3D9PipeUsage(const D3DDDIARG_CREATERESOURCE *data)
 {
-   switch (pool) {
+   switch (data->Pool) {
    case D3DDDIPOOL_SYSTEMMEM:
    case D3D9_POOL_STAGINGMEM:
       return PIPE_USAGE_STAGING;
    default:
+      /* Dynamic draw buffers need replaceable storage across discard locks.
+       * Queued draws must retain the bytes preceding each discard. */
+      if (data->Flags.Dynamic &&
+          (data->Flags.VertexBuffer || data->Flags.IndexBuffer))
+         return PIPE_USAGE_DYNAMIC;
       return PIPE_USAGE_DEFAULT;
    }
 }
@@ -541,7 +558,8 @@ D3D9GetPipeAllocation(D3D9Device *device, D3D9Resource *resource)
    if (!resource)
       return 0;
 
-   return D3D9GetPipeResourceAllocation(device, resource->pipe_resource);
+   return D3D9GetPipeResourceAllocation(device, resource->display_resource ?
+      resource->display_resource : resource->pipe_resource);
 }
 
 bool
@@ -1343,13 +1361,6 @@ D3D9InitBlitInfo(struct pipe_blit_info *info,
    info->src.box.depth = 1;
    info->mask = util_format_get_mask(dst_format) &
                 util_format_get_mask(src_format);
-   /* The renderer path rejects combined Z/S multisample resolves.  Resolve
-    * depth here; app-visible D24S8 MSAA StretchRect support is not exposed.
-    */
-   if ((info->mask & (PIPE_MASK_Z | PIPE_MASK_S)) ==
-       (PIPE_MASK_Z | PIPE_MASK_S) &&
-       (src_resource->nr_samples > 1 || dst_resource->nr_samples > 1))
-      info->mask = PIPE_MASK_Z;
    info->filter = PIPE_TEX_FILTER_NEAREST;
 }
 
@@ -1758,10 +1769,6 @@ D3D9GetReadbackResource(D3D9Device *device, D3D9Resource *resource,
 
    sub->readback_resource = device->screen->resource_create(device->screen,
                                                             &templ);
-   D3D9Tracef("ReadbackResource resource=%p pipe=%p readback=%p "
-              "format=%u size=%ux%ux%u\n",
-              resource, resource->pipe_resource, sub->readback_resource,
-              templ.format, templ.width0, templ.height0, templ.depth0);
    return sub->readback_resource;
 }
 
@@ -1808,10 +1815,6 @@ D3D9ReadbackTextureLock(D3D9Device *device, D3D9Resource *resource,
    sub->transfer_box = *box;
    data->Pitch = sub->transfer->stride;
    data->SlicePitch = sub->transfer->layer_stride;
-   D3D9Tracef("ReadbackTextureLock resource=%p sub=%u box=%d,%d,%d "
-              "%dx%dx%d usage=0x%x\n",
-              resource, subresource_index, box->x, box->y, box->z,
-              box->width, box->height, box->depth, usage);
    return map;
 }
 
@@ -1898,9 +1901,6 @@ D3D9CopyTextureToCpuDestination(D3D9Device *device,
 
    D3D9EndReadbackLock(device, src_sub);
    dst_sub->cpu_dirty = false;
-   D3D9Tracef("CopyTextureToCpuDestination dst=%p/%u src=%p/%u box=%ldx%ld\n",
-              dst_resource, dst_subresource_index,
-              src_resource, src_subresource_index, width, height);
    return true;
 }
 
@@ -1934,10 +1934,6 @@ D3D9UploadSubResource(D3D9Device *device, D3D9Resource *resource,
        (!sub->width || !sub->height))
       return false;
 
-   D3D9Tracef("UploadSubResource resource=%p sub=%u allocation=0x%lx "
-              "size=%ux%ux%u\n",
-              resource, subresource_index, (unsigned long)sub->allocation,
-              sub->width, sub->height, sub->depth);
 
    struct pipe_box box;
    memset(&box, 0, sizeof(box));
@@ -2254,6 +2250,50 @@ D3D9UploadVolumeTextureData(D3D9Device *device, D3D9Resource *dst,
    return true;
 }
 
+static bool
+D3D9CopyToDisplayResource(D3D9Device *device, D3D9Resource *resource,
+                           UINT subresource_index)
+{
+   if (!resource->display_resource)
+      return true;
+   D3D9SubResource *sub = D3D9GetSubResource(resource, subresource_index);
+   if (!device->pipe || !resource->pipe_resource || !sub)
+      return false;
+
+   struct pipe_resource *src = resource->pipe_resource;
+   struct pipe_resource *dst = resource->display_resource;
+   if (src->nr_samples > 1) {
+      if (!device->pipe->blit)
+         return false;
+      RECT rect = D3D9FullRect(sub);
+      struct pipe_blit_info info;
+      D3D9InitBlitInfo(&info, dst, 0, 0, dst->format, &rect,
+                        src, D3D9PipeMipLevel(resource, subresource_index),
+                        D3D9PipeLayer(resource, subresource_index),
+                        src->format, &rect);
+      device->pipe->blit(device->pipe, &info);
+   } else {
+      if (!device->pipe->resource_copy_region)
+         return false;
+      struct pipe_box box;
+      memset(&box, 0, sizeof(box));
+      box.z = D3D9PipeLayer(resource, subresource_index);
+      box.width = sub->width;
+      box.height = sub->height;
+      box.depth = 1;
+      device->pipe->resource_copy_region(device->pipe, dst, 0, 0, 0, 0,
+         src, D3D9PipeMipLevel(resource, subresource_index), &box);
+   }
+   return true;
+}
+
+bool
+D3D9PublishResource(D3D9Device *device, D3D9Resource *resource)
+{
+   return device && resource && device->pipe &&
+      D3D9CopyToDisplayResource(device, resource, 0);
+}
+
 static HRESULT
 D3D9FlushFrontbuffer(D3D9Device *device, D3D9Resource *src_resource,
                      UINT src_subresource_index, D3DKMT_HANDLE dst_allocation,
@@ -2277,16 +2317,19 @@ D3D9FlushFrontbuffer(D3D9Device *device, D3D9Resource *src_resource,
                                            src_subresource_index);
    struct pipe_resource *resolved = NULL;
 
-   if (flush_resource->nr_samples > 1 && device->pipe->blit) {
+   if (src_resource->display_resource) {
+      if (!D3D9CopyToDisplayResource(device, src_resource,
+                                      src_subresource_index))
+         return E_FAIL;
+      flush_resource = src_resource->display_resource;
+      flush_level = 0;
+   } else if (flush_resource->nr_samples > 1 && device->pipe->blit) {
       D3D9SubResource *src_sub =
          D3D9GetSubResource(src_resource, src_subresource_index);
       if (!src_sub)
          return E_INVALIDARG;
 
-      if (src_resource->primary_display_resource) {
-         pipe_resource_reference(&resolved,
-                                 src_resource->primary_display_resource);
-      } else {
+      {
          struct pipe_resource templ;
          memset(&templ, 0, sizeof(templ));
          templ.target = PIPE_TEXTURE_2D;
@@ -2301,6 +2344,15 @@ D3D9FlushFrontbuffer(D3D9Device *device, D3D9Resource *src_resource,
          templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_DISPLAY_TARGET |
                       PIPE_BIND_SHARED;
          templ.usage = PIPE_USAGE_DEFAULT;
+         if (D3D9IsYttriumScreen(device->screen)) {
+            if (!src_resource->flags.SharedResource &&
+                (src_resource->flags.Texture || src_resource->flags.Primary))
+               templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER;
+            /* The resolved image is the legacy Present source actually read
+             * by KMD. Preserve the original source's CPU-blt qualification. */
+            if (src_resource->flags.DiscardRenderTarget)
+               templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK;
+         }
 
          resolved = device->screen->resource_create(device->screen, &templ);
          if (!resolved)
@@ -2367,13 +2419,32 @@ D3D9ResourceSlicePitch(const D3DDDIARG_CREATERESOURCE *data,
 }
 
 static void
+D3D9RegisterResource(D3D9Device *device, D3D9Resource *resource)
+{
+   resource->device = device;
+   resource->next = device->resources;
+   if (resource->next)
+      resource->next->previous = resource;
+   device->resources = resource;
+}
+
+static void
 D3D9FreeResource(D3D9Resource *resource)
 {
    if (!resource)
       return;
 
+   if (resource->device) {
+      if (resource->previous)
+         resource->previous->next = resource->next;
+      else
+         resource->device->resources = resource->next;
+      if (resource->next)
+         resource->next->previous = resource->previous;
+   }
+
    pipe_resource_reference(&resource->pipe_resource, NULL);
-   pipe_resource_reference(&resource->primary_display_resource, NULL);
+   pipe_resource_reference(&resource->display_resource, NULL);
    pipe_resource_reference(&resource->managed_default_pipe_resource, NULL);
    pipe_resource_reference(&resource->managed_source_pipe_resource, NULL);
    for (UINT i = 0; i < resource->surf_count; ++i) {
@@ -2413,8 +2484,6 @@ D3D9DeallocateResource(D3D9Device *device, D3D9Resource *resource)
       deallocate.hResource = resource->runtime_handle;
       HRESULT hr = device->callbacks.pfnDeallocateCb(device->hRTDevice,
                                                      &deallocate);
-      D3D9Tracef("DeallocateCb resource=%p runtime=%p hr=0x%08lx\n",
-                 resource, resource->runtime_handle, hr);
       if (FAILED(hr)) {
          D3D9Warnf("ERROR: D3D9 resource deallocation failed "
                    "owner=d3d9-resource reason=pfnDeallocateCb-failed "
@@ -2441,8 +2510,6 @@ D3D9DeallocateResource(D3D9Device *device, D3D9Resource *resource)
       deallocate.HandleList = &allocation;
       HRESULT hr = device->callbacks.pfnDeallocateCb(device->hRTDevice,
                                                      &deallocate);
-      D3D9Tracef("DeallocateCb allocation=0x%lx hr=0x%08lx\n",
-                 (unsigned long)allocation, hr);
       if (FAILED(hr)) {
          D3D9Warnf("ERROR: D3D9 allocation deallocation failed "
                    "owner=d3d9-resource reason=pfnDeallocateCb-failed "
@@ -2598,10 +2665,6 @@ D3D9TexBlt(HANDLE hDevice, const D3DDDIARG_TEXBLT *data)
 HRESULT APIENTRY
 D3D9SetRenderTarget(HANDLE hDevice, const D3DDDIARG_SETRENDERTARGET *data)
 {
-   D3D9Tracef("SetRenderTarget hDevice=%p data=%p rt=%u resource=%p sub=%u\n",
-              hDevice, data, data ? data->RenderTargetIndex : 0,
-              data ? data->hRenderTarget : NULL,
-              data ? data->SubResourceIndex : 0);
 
    D3D9Device *device = (D3D9Device *)hDevice;
    if (!device || !data ||
@@ -2627,8 +2690,6 @@ D3D9SetRenderTarget(HANDLE hDevice, const D3DDDIARG_SETRENDERTARGET *data)
 HRESULT APIENTRY
 D3D9SetDepthStencil(HANDLE hDevice, const D3DDDIARG_SETDEPTHSTENCIL *data)
 {
-   D3D9Tracef("SetDepthStencil hDevice=%p data=%p resource=%p\n",
-              hDevice, data, data ? data->hZBuffer : NULL);
 
    D3D9Device *device = (D3D9Device *)hDevice;
    if (!device || !data)
@@ -2641,28 +2702,12 @@ D3D9SetDepthStencil(HANDLE hDevice, const D3DDDIARG_SETDEPTHSTENCIL *data)
 HRESULT APIENTRY
 D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
 {
-   D3D9Tracef("CreateResource hDevice=%p data=%p resource=%p format=%u pool=%u "
-              "surfaces=%u levels=%u flags=0x%08x rt=%u primary=%u "
-              "discard_rt=%u texture=%u vb=%u ib=%u z=%u vidpn=%u "
-              "multisample=%u\n",
-              hDevice, data, data ? data->hResource : NULL,
-              data ? data->Format : 0, data ? data->Pool : 0,
-              data ? data->SurfCount : 0, data ? data->MipLevels : 0,
-              data ? data->Flags.Value : 0,
-              data ? data->Flags.RenderTarget : 0,
-              data ? data->Flags.Primary : 0,
-              data ? data->Flags.DiscardRenderTarget : 0,
-              data ? data->Flags.Texture : 0,
-              data ? data->Flags.VertexBuffer : 0,
-              data ? data->Flags.IndexBuffer : 0,
-              data ? data->Flags.ZBuffer : 0,
-              data ? data->VidPnSourceId : 0,
-              data ? data->MultisampleType : 0);
 
    if (!hDevice || !data || !data->pSurfList || !data->SurfCount)
       return E_INVALIDARG;
 
    D3D9Device *device = (D3D9Device *)hDevice;
+   const bool yttrium = D3D9IsYttriumScreen(device->screen);
    D3D9Resource *resource = (D3D9Resource *)calloc(1, sizeof(*resource));
    bool runtime_owns_private_allocation = false;
    if (!resource)
@@ -2684,11 +2729,6 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
    for (UINT i = 0; i < data->SurfCount; ++i) {
       const D3DDDI_SURFACEINFO *surface = &data->pSurfList[i];
       D3D9SubResource *sub = &resource->surfaces[i];
-      D3D9Tracef("CreateResource surface[%u] %ux%ux%u sysmem=%p "
-                 "pitch=%u slice_pitch=%u\n",
-                 i, surface->Width, surface->Height, surface->Depth,
-                 surface->pSysMem, surface->SysMemPitch,
-                 surface->SysMemSlicePitch);
       sub->width = surface->Width;
       sub->height = surface->Height ? surface->Height : 1;
       sub->depth = surface->Depth ? surface->Depth : 1;
@@ -2706,18 +2746,14 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
       }
    }
 
+   /* Plain system-memory surfaces need no Gallium resource or screen. */
    const bool cpu_only_plain =
       !D3D9PoolNeedsReadback(data->Pool) &&
       !(data->Flags.VertexBuffer || data->Flags.IndexBuffer ||
         data->Flags.Texture || data->Flags.CubeMap || data->Flags.Volume ||
         D3D9ResourceIsColorTarget(data) || data->Flags.ZBuffer);
 
-   if (cpu_only_plain) {
-      D3D9Tracef("CreateResource CPU-only plain resource=%p format=%u "
-                 "pool=%u size=%ux%u\n",
-                 resource, data->Format, data->Pool,
-                 resource->surfaces[0].width, resource->surfaces[0].height);
-   } else if (device->screen) {
+   if (!cpu_only_plain && device->screen) {
       const enum pipe_format pipe_format = D3D9ResourcePipeFormat(data);
       if (pipe_format != PIPE_FORMAT_NONE) {
          struct pipe_resource templ;
@@ -2737,22 +2773,46 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
                MAX3(templ.width0, templ.height0, templ.depth0);
             templ.last_level = max_dimension ? util_logbase2(max_dimension) : 0;
          }
-         const bool yttrium = D3D9IsYttriumScreen(device->screen);
          const bool msaa_primary =
             yttrium && data->Flags.Primary && data->MultisampleType &&
             data->SurfCount > 1;
+         /* Both bind SHARED and the DDI SharedResource flag can describe
+          * runtime-managed storage. Keep the existing conservative split
+          * qualification; neither bit proves application sharing intent. */
+         const bool optimal_local_display = yttrium &&
+            !data->Flags.SharedResource &&
+            D3D9PoolNeedsReadback(data->Pool) &&
+            D3D9ResourceIsColorTarget(data) &&
+            templ.target == PIPE_TEXTURE_2D && templ.array_size == 1 &&
+            !templ.last_level &&
+            (D3D9PipeBind(data) & PIPE_BIND_DISPLAY_TARGET);
          templ.nr_samples = data->MultisampleType ? data->MultisampleType : 1;
          if (data->Flags.Primary && data->MultisampleType && !msaa_primary)
             templ.nr_samples = 1;
          templ.nr_storage_samples = templ.nr_samples;
          templ.bind = D3D9PipeBind(data);
-         templ.usage = D3D9PipeUsage(data->Pool);
+         templ.usage = D3D9PipeUsage(data);
+         /* Non-texture render-target surfaces can be legacy CPU-blt sources
+          * even without DiscardRenderTarget. Keep those conservative until
+          * their actual Present is qualified. */
+         if (yttrium && templ.target != PIPE_BUFFER &&
+             !data->Flags.SharedResource &&
+             (data->Flags.Texture || data->Flags.Primary))
+            templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER;
          if (yttrium && data->Flags.DiscardRenderTarget)
             templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK;
          if (msaa_primary)
             templ.bind &= ~PIPE_BIND_DISPLAY_TARGET;
          else if (yttrium && data->Flags.Primary)
             templ.flags |= PIPE_RESOURCE_FLAG_FRONTEND_PRIV;
+
+         struct pipe_resource display_templ = templ;
+         if (optimal_local_display) {
+            templ.bind &= ~(PIPE_BIND_SHARED | PIPE_BIND_DISPLAY_TARGET);
+            templ.flags &= ~(PIPE_RESOURCE_FLAG_FRONTEND_PRIV |
+                             YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK);
+            templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER;
+         }
 
          HANDLE old_hRTResource = device->gdi_device.hRTResource;
          boolean old_hRTResourceIsD3D9 =
@@ -2766,16 +2826,23 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
          device->gdi_device.isPrimary = data->Flags.Primary;
 
          D3DKMT_HANDLE display_allocation = 0;
-         if (msaa_primary) {
-            struct pipe_resource display_templ = templ;
+         if (msaa_primary || optimal_local_display) {
             display_templ.nr_samples = 1;
             display_templ.nr_storage_samples = 1;
             display_templ.bind = D3D9PipeBind(data);
-            display_templ.flags |= PIPE_RESOURCE_FLAG_FRONTEND_PRIV;
-            resource->primary_display_resource =
+            if (data->Flags.Primary)
+               display_templ.flags |= PIPE_RESOURCE_FLAG_FRONTEND_PRIV;
+            if (optimal_local_display) {
+               /* The linear child is copied and sampled, never rendered with
+                * depth; the private optimal image owns rendering. */
+               display_templ.bind &= ~PIPE_BIND_RENDER_TARGET;
+               display_templ.bind |= PIPE_BIND_DISPLAY_TARGET;
+               display_templ.flags |= YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK;
+            }
+            resource->display_resource =
                device->screen->resource_create(device->screen,
                                                &display_templ);
-            if (!resource->primary_display_resource) {
+            if (!resource->display_resource) {
                device->gdi_device.hRTResource = old_hRTResource;
                device->gdi_device.hRTResourceIsD3D9 =
                   old_hRTResourceIsD3D9;
@@ -2786,11 +2853,11 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
             }
             display_allocation =
                D3D9GetPipeResourceAllocation(
-                  device, resource->primary_display_resource);
+                  device, resource->display_resource);
             if (!display_allocation) {
-               D3D9Warnf("unsupported D3D9 MSAA primary display resource "
+               D3D9Warnf("ERROR D3D9 display resource "
                          "has no D3DKMT allocation resource=%p pipe=%p\n",
-                         resource, resource->primary_display_resource);
+                         resource, resource->display_resource);
                device->gdi_device.hRTResource = old_hRTResource;
                device->gdi_device.hRTResourceIsD3D9 =
                   old_hRTResourceIsD3D9;
@@ -2814,10 +2881,6 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
          device->gdi_device.isPrimary = old_isPrimary;
 
          if (!resource->pipe_resource) {
-            D3D9Tracef("CreateResource pipe resource failed resource=%p "
-                       "format=%u pipe_format=%u bind=0x%x size=%ux%u\n",
-                       resource, data->Format, pipe_format, templ.bind,
-                       templ.width0, templ.height0);
             D3D9FreeResource(resource);
             return E_OUTOFMEMORY;
          }
@@ -2832,35 +2895,26 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
           * ownership to the runtime once creation can no longer fail; Venus
           * object teardown remains owned by the pipe resource.
           */
-         runtime_owns_private_allocation = msaa_primary;
+         runtime_owns_private_allocation = msaa_primary && !optimal_local_display;
 
          const D3DKMT_HANDLE allocation =
             D3D9GetPipeAllocation(device, resource);
+         const D3DKMT_HANDLE render_allocation = msaa_primary &&
+            !optimal_local_display ? D3D9GetPipeResourceAllocation(
+               device, resource->pipe_resource) : allocation;
          for (UINT i = 0; i < resource->surf_count; ++i) {
-            if (msaa_primary && i == 0)
+            if (optimal_local_display || (msaa_primary && i == 0))
                resource->surfaces[i].allocation = display_allocation;
             else
-               resource->surfaces[i].allocation = allocation;
+               resource->surfaces[i].allocation = render_allocation;
          }
-         if (!allocation && D3D9ResourceIsColorTarget(data)) {
+         if (!allocation && D3D9ResourceIsColorTarget(data) &&
+             (templ.bind & (PIPE_BIND_SHARED | PIPE_BIND_DISPLAY_TARGET))) {
             D3D9Warnf("unsupported pipe resource has no D3DKMT allocation "
                       "resource=%p pipe=%p format=%u bind=0x%x\n",
                       resource, resource->pipe_resource, templ.format,
                       templ.bind);
-         } else if (!allocation) {
-            D3D9Tracef("CreateResource pipe resource has no D3DKMT "
-                       "allocation resource=%p pipe=%p format=%u bind=0x%x\n",
-                       resource, resource->pipe_resource, templ.format,
-                       templ.bind);
          }
-         D3D9Tracef("CreateResource pipe=%p allocation=0x%lx target=%u "
-                    "format=%u bind=0x%x size=%ux%u levels=%u "
-                    "display_pipe=%p display_allocation=0x%lx\n",
-                    resource->pipe_resource, (unsigned long)allocation,
-                    templ.target, templ.format, templ.bind, templ.width0,
-                    templ.height0, templ.last_level + 1,
-                    resource->primary_display_resource,
-                    (unsigned long)display_allocation);
 
          for (UINT i = 0; i < resource->surf_count; ++i) {
             if (!D3D9UploadSubResource(device, resource, i)) {
@@ -2887,7 +2941,7 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
                    "format=%u pool=%u flags=0x%08x resource=%p\n",
                    data->Format, data->Pool, data->Flags.Value, resource);
       }
-   } else {
+   } else if (!cpu_only_plain) {
       D3D9Warnf("unsupported CPU-only resource without Yttrium screen "
                 "format=%u pool=%u flags=0x%08x resource=%p\n",
                 data->Format, data->Pool, data->Flags.Value, resource);
@@ -2897,22 +2951,19 @@ D3D9CreateResource(HANDLE hDevice, D3DDDIARG_CREATERESOURCE *data)
                                                     false);
 
    data->hResource = resource;
+   D3D9RegisterResource(device, resource);
    if (D3D9ResourceIsColorTarget(data) && !device->render_targets[0]) {
       device->render_targets[0] = resource;
       device->render_target_subresources[0] = 0;
-      D3D9Tracef("CreateResource default RT0 resource=%p\n", resource);
    }
    if (data->Flags.ZBuffer && !device->depth_stencil) {
       device->depth_stencil = resource;
-      D3D9Tracef("CreateResource default depth resource=%p\n", resource);
    }
    if (data->Pool == D3DDDIPOOL_SYSTEMMEM && D3D9ResourceIsTexture(resource))
       device->last_systemmem_texture = resource;
    if (data->Pool == D3DDDIPOOL_SYSTEMMEM &&
        (data->Flags.VertexBuffer || data->Flags.IndexBuffer))
       device->last_systemmem_buffer = resource;
-   D3D9Tracef("CreateResource success resource=%p runtime=%p\n",
-              resource, resource->runtime_handle);
    return S_OK;
 }
 
@@ -2920,13 +2971,6 @@ HRESULT APIENTRY
 D3D9OpenResource(HANDLE hDevice, D3DDDIARG_OPENRESOURCE *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("OpenResource hDevice=%p data=%p resource=%p km=0x%lx "
-              "allocations=%u private=%u flags=0x%08x\n",
-              hDevice, data, data ? data->hResource : NULL,
-              data ? (unsigned long)data->hKMResource : 0,
-              data ? data->NumAllocations : 0,
-              data ? data->PrivateDriverDataSize : 0,
-              data ? data->Flags.Value : 0);
 
    if (!device || !data || !data->hKMResource || !data->NumAllocations ||
        !device->screen || !device->screen->resource_from_handle)
@@ -2995,6 +3039,7 @@ D3D9OpenResource(HANDLE hDevice, D3DDDIARG_OPENRESOURCE *data)
       }
 
       data->hResource = resource;
+      D3D9RegisterResource(device, resource);
       D3D9Warnf("WARNING: D3D9 opened runtime standard-primary fullscreen "
                 "without Gallium backing resource=%p km=0x%lx "
                 "allocation=0x%lx %ux%u format=%u bind=0x%lx blob_mem=0x%lx "
@@ -3088,14 +3133,7 @@ D3D9OpenResource(HANDLE hDevice, D3DDDIARG_OPENRESOURCE *data)
    }
 
    data->hResource = resource;
-   D3D9Tracef("OpenResource success resource=%p runtime=%p pipe=%p "
-              "allocation=0x%lx target=%u format=%u bind=0x%x size=%ux%u "
-              "levels=%u layers=%u\n",
-              resource, resource->runtime_handle, resource->pipe_resource,
-              (unsigned long)allocation, pipe_resource->target,
-              pipe_resource->format, pipe_resource->bind,
-              pipe_resource->width0, pipe_resource->height0,
-              mip_levels, array_size);
+   D3D9RegisterResource(device, resource);
    return S_OK;
 }
 
@@ -3103,18 +3141,12 @@ HRESULT APIENTRY
 D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("Lock resource=%p sub=%u flags=0x%08x\n",
-              data ? data->hResource : NULL,
-              data ? data->SubResourceIndex : 0,
-              data ? data->Flags.Value : 0);
    if (!device || !data || !data->hResource)
       return E_INVALIDARG;
 
    D3D9Resource *resource = D3D9CastResource(data->hResource);
    UINT subresource_index = D3D9ResolveNotifyLockSubResource(resource, data);
    if (subresource_index >= resource->surf_count) {
-      D3D9Tracef("Lock invalid subresource resource=%p sub=%u count=%u\n",
-                 resource, subresource_index, resource->surf_count);
       return E_INVALIDARG;
    }
 
@@ -3146,10 +3178,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
          sub->notify_only_locked = true;
          sub->notify_only_write = !data->Flags.ReadOnly;
          sub->notify_only_full_mip_chain = false;
-         D3D9Tracef("Lock notify-only maps CPU buffer backing resource=%p "
-                    "sub=%u flags=0x%08x offset=%u size=%u write=%u\n",
-                    resource, subresource_index, data->Flags.Value,
-                    offset, size, sub->notify_only_write ? 1 : 0);
          return S_OK;
       }
 
@@ -3185,12 +3213,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
             sub->notify_only_write = !data->Flags.ReadOnly;
             sub->notify_only_full_mip_chain =
                D3D9NotifyLockCoversFullMipChain(resource, data);
-            D3D9Tracef("Lock notify-only maps CPU backing resource=%p "
-                       "sub=%u flags=0x%08x box=%d,%d,%d %dx%dx%d "
-                       "pitch=%u write=%u\n",
-                       resource, subresource_index, data->Flags.Value,
-                       box.x, box.y, box.z, box.width, box.height, box.depth,
-                       data->Pitch, sub->notify_only_write ? 1 : 0);
             return S_OK;
          }
       }
@@ -3202,9 +3224,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
       data->pSurfData = NULL;
       data->Pitch = 0;
       data->SlicePitch = 0;
-      D3D9Tracef("Lock notify-only resource=%p sub=%u flags=0x%08x write=%u\n",
-                 resource, subresource_index, data->Flags.Value,
-                 sub->notify_only_write ? 1 : 0);
       return S_OK;
    }
 
@@ -3214,8 +3233,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
          data->Flags.Discard) {
          if (!device->pipe || !device->pipe->buffer_unmap)
             return E_NOTIMPL;
-         D3D9Tracef("Lock discards active buffer map resource=%p sub=%u\n",
-                    resource, subresource_index);
          device->pipe->buffer_unmap(device->pipe, sub->transfer);
          sub->transfer = NULL;
          sub->transfer_map = NULL;
@@ -3223,10 +3240,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
          sub->transfer_write = false;
          memset(&sub->transfer_box, 0, sizeof(sub->transfer_box));
       } else {
-         D3D9Tracef("Lock rejected active map resource=%p sub=%u "
-                    "transfer=%p cpu_locked=%u flags=0x%08x\n",
-                    resource, subresource_index, sub->transfer,
-                    sub->cpu_locked ? 1 : 0, data->Flags.Value);
          return E_INVALIDARG;
       }
    }
@@ -3265,10 +3278,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
          sub->cpu_locked = true;
          sub->cpu_lock_write = (usage & PIPE_MAP_WRITE) != 0;
          sub->cpu_lock_packed_mips = false;
-         D3D9Tracef("Lock maps CPU buffer backing resource=%p sub=%u "
-                    "flags=0x%08x offset=%d size=%d write=%u\n",
-                    resource, subresource_index, data->Flags.Value,
-                    box.x, box.width, sub->cpu_lock_write ? 1 : 0);
          return S_OK;
       }
 
@@ -3325,11 +3334,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
          sub->cpu_lock_write = (usage & PIPE_MAP_WRITE) != 0;
          sub->cpu_lock_packed_mips =
             packed_mip_lock && cpu_backing_size > sub->size;
-         D3D9Tracef("Lock maps CPU backing resource=%p sub=%u flags=0x%08x "
-                    "box=%d,%d,%d %dx%dx%d pitch=%u\n",
-                    resource, subresource_index, data->Flags.Value,
-                    box.x, box.y, box.z, box.width, box.height, box.depth,
-                    data->Pitch);
          return S_OK;
       }
 
@@ -3370,10 +3374,6 @@ D3D9Lock(HANDLE hDevice, D3DDDIARG_LOCK *data)
    if (!map || !sub->transfer)
       return E_FAIL;
 
-   D3D9Tracef("Lock maps pipe resource resource=%p sub=%u flags=0x%08x "
-              "box=%d,%d,%d %dx%dx%d\n",
-              resource, subresource_index, data->Flags.Value,
-              box.x, box.y, box.z, box.width, box.height, box.depth);
    data->pSurfData = map;
    return S_OK;
 }
@@ -3382,17 +3382,12 @@ HRESULT APIENTRY
 D3D9Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("Unlock resource=%p sub=%u\n",
-              data ? data->hResource : NULL,
-              data ? data->SubResourceIndex : 0);
    if (!device || !data || !data->hResource)
       return E_INVALIDARG;
 
    D3D9Resource *resource = D3D9CastResource(data->hResource);
    UINT subresource_index = D3D9ResolveNotifyUnlockSubResource(resource, data);
    if (subresource_index >= resource->surf_count) {
-      D3D9Tracef("Unlock invalid subresource resource=%p sub=%u count=%u\n",
-                 resource, subresource_index, resource->surf_count);
       return E_INVALIDARG;
    }
 
@@ -3416,10 +3411,6 @@ D3D9Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *data)
       sub->notify_only_locked = false;
       sub->notify_only_write = false;
       sub->notify_only_full_mip_chain = false;
-      D3D9Tracef("Unlock completes notify-only lock resource=%p sub=%u "
-                 "flags=0x%08x dirty=%u\n",
-                 resource, subresource_index, data->Flags.Value,
-                 sub->cpu_dirty ? 1 : 0);
       return S_OK;
    }
 
@@ -3436,14 +3427,10 @@ D3D9Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *data)
       sub->cpu_lock_packed_mips = false;
       if (FAILED(hr))
          return hr;
-      D3D9Tracef("Unlock CPU backing resource=%p sub=%u dirty=%u\n",
-                 resource, subresource_index, sub->cpu_dirty ? 1 : 0);
       return S_OK;
    }
 
    if (!sub->transfer) {
-      D3D9Tracef("Unlock without active transfer resource=%p sub=%u\n",
-                 resource, subresource_index);
       return E_INVALIDARG;
    }
 
@@ -3492,8 +3479,6 @@ D3D9Unlock(HANDLE hDevice, const D3DDDIARG_UNLOCK *data)
    sub->transfer_write = false;
    memset(&sub->transfer_box, 0, sizeof(sub->transfer_box));
    sub->cpu_dirty = false;
-   D3D9Tracef("Unlock pipe resource=%p sub=%u\n",
-              resource, subresource_index);
    return worker_upload_ok ? S_OK : E_OUTOFMEMORY;
 }
 
@@ -3549,9 +3534,6 @@ HRESULT APIENTRY
 D3D9GetPitch(HANDLE hDevice, D3DDDIARG_GETPITCH *data)
 {
    (void)hDevice;
-   D3D9Tracef("GetPitch resource=%p sub=%u\n",
-              data ? data->hResource : NULL,
-              data ? data->SubResourceIndex : 0);
    if (!data || !data->hResource)
       return E_INVALIDARG;
 
@@ -3569,8 +3551,6 @@ D3D9ResolveSharedResource(HANDLE hDevice,
                           const D3DDDIARG_RESOLVESHAREDRESOURCE *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("ResolveSharedResource resource=%p\n",
-              data ? data->hResource : NULL);
    if (!device || !data || !data->hResource)
       return E_INVALIDARG;
 
@@ -3578,9 +3558,18 @@ D3D9ResolveSharedResource(HANDLE hDevice,
    if (!resource)
       return E_INVALIDARG;
 
-   if (resource->pipe_resource && device->pipe)
-      yttrium_gdi_flush_labeled(device->pipe, NULL, 0,
+   if (resource->pipe_resource && device->pipe) {
+      const bool yttrium = D3D9IsYttriumScreen(device->screen);
+      if (yttrium && !D3D9PublishResource(device, resource))
+         return E_FAIL;
+      if (yttrium)
+         return yttrium_gdi_flush_handoff(device->pipe,
+                                          "D3D9 resolve shared resource") ?
+            S_OK : D3DDDIERR_DEVICEREMOVED;
+      yttrium_gdi_flush_labeled(device->pipe, NULL,
+                                0,
                                 "D3D9 resolve shared resource");
+   }
    return S_OK;
 }
 
@@ -3605,9 +3594,7 @@ HRESULT APIENTRY
 D3D9GetCaptureAllocationHandle(HANDLE hDevice,
                                D3DDDIARG_GETCAPTUREALLOCATIONHANDLE *data)
 {
-   (void)hDevice;
-   D3D9Tracef("GetCaptureAllocationHandle resource=%p\n",
-              data ? data->hResource : NULL);
+   D3D9Device *device = (D3D9Device *)hDevice;
    if (!data || !data->hResource)
       return E_INVALIDARG;
 
@@ -3615,6 +3602,11 @@ D3D9GetCaptureAllocationHandle(HANDLE hDevice,
    if (!sub || !sub->allocation)
       return E_INVALIDARG;
 
+   D3D9Resource *resource = D3D9CastResource(data->hResource);
+   if (resource->display_resource &&
+       (!D3D9PublishResource(device, resource) ||
+        !yttrium_gdi_flush_handoff(device->pipe, "D3D9 capture allocation")))
+      return D3DDDIERR_DEVICEREMOVED;
    data->hAllocation = sub->allocation;
    return S_OK;
 }
@@ -3623,10 +3615,6 @@ HRESULT APIENTRY
 D3D9CaptureToSysMem(HANDLE hDevice, const D3DDDIARG_CAPTURETOSYSMEM *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("CaptureToSysMem src=%p dst=%p/%u\n",
-              data ? data->hSrcResource : NULL,
-              data ? data->hDstResource : NULL,
-              data ? data->DstSubResourceIndex : 0);
    if (!device || !data || !data->hSrcResource || !data->hDstResource)
       return E_INVALIDARG;
 
@@ -3635,7 +3623,6 @@ D3D9CaptureToSysMem(HANDLE hDevice, const D3DDDIARG_CAPTURETOSYSMEM *data)
                                  &data->DstRect, data->hSrcResource, 0,
                                  &data->SrcRect,
                                  PIPE_TEX_FILTER_NEAREST) ? S_OK : E_NOTIMPL;
-   D3D9Tracef("CaptureToSysMem hr=0x%08lx\n", hr);
    return hr;
 }
 
@@ -3643,11 +3630,6 @@ HRESULT APIENTRY
 D3D9Blt(HANDLE hDevice, const D3DDDIARG_BLT *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("Blt data=%p dst=%p/%u src=%p/%u\n", data,
-              data ? data->hDstResource : NULL,
-              data ? data->DstSubResourceIndex : 0,
-              data ? data->hSrcResource : NULL,
-              data ? data->SrcSubResourceIndex : 0);
    if (!device || !data)
       return E_INVALIDARG;
 
@@ -3673,7 +3655,6 @@ D3D9Blt(HANDLE hDevice, const D3DDDIARG_BLT *data)
                                  data->Flags.Linear ? PIPE_TEX_FILTER_LINEAR :
                                                       PIPE_TEX_FILTER_NEAREST) ?
       S_OK : E_NOTIMPL;
-   D3D9Tracef("Blt hr=0x%08lx\n", hr);
    return hr;
 }
 
@@ -3681,9 +3662,6 @@ HRESULT APIENTRY
 D3D9ColorFill(HANDLE hDevice, const D3DDDIARG_COLORFILL *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("ColorFill data=%p resource=%p sub=%u color=0x%08x\n", data,
-              data ? data->hResource : NULL,
-              data ? data->SubResourceIndex : 0, data ? data->Color : 0);
    if (!device || !data)
       return E_INVALIDARG;
 
@@ -3691,7 +3669,6 @@ D3D9ColorFill(HANDLE hDevice, const D3DDDIARG_COLORFILL *data)
       D3D9ClearColorPipe(device, data->hResource, data->SubResourceIndex,
                          &data->DstRect, data->Color, false, true);
    HRESULT hr = cleared ? S_OK : E_NOTIMPL;
-   D3D9Tracef("ColorFill hr=0x%08lx\n", hr);
    return hr;
 }
 
@@ -3699,9 +3676,6 @@ HRESULT APIENTRY
 D3D9DepthFill(HANDLE hDevice, const D3DDDIARG_DEPTHFILL *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("DepthFill data=%p resource=%p sub=%u depth=%u\n", data,
-              data ? data->hResource : NULL,
-              data ? data->SubResourceIndex : 0, data ? data->Depth : 0);
    if (!device || !data)
       return E_INVALIDARG;
 
@@ -3710,7 +3684,6 @@ D3D9DepthFill(HANDLE hDevice, const D3DDDIARG_DEPTHFILL *data)
                                    data->SubResourceIndex, &data->DstRect,
                                    true, depth, false, 0) ?
       S_OK : E_NOTIMPL;
-   D3D9Tracef("DepthFill hr=0x%08lx\n", hr);
    return hr;
 }
 
@@ -3718,12 +3691,6 @@ HRESULT APIENTRY
 D3D9Present(HANDLE hDevice, const D3DDDIARG_PRESENT *data)
 {
    D3D9Device *device = (D3D9Device *)hDevice;
-   D3D9Tracef("Present data=%p src=%p/%u dst=%p/%u flags=0x%08x\n", data,
-              data ? data->hSrcResource : NULL,
-              data ? data->SrcSubResourceIndex : 0,
-              data ? data->hDstResource : NULL,
-              data ? data->DstSubResourceIndex : 0,
-              data ? data->Flags.Value : 0);
 
    if (!device || !data)
       return E_INVALIDARG;
@@ -3763,16 +3730,11 @@ D3D9Present(HANDLE hDevice, const D3DDDIARG_PRESENT *data)
    if (src->cpu_dirty &&
        !D3D9UploadSubResource(device, src_resource, src_subresource_index))
       return E_NOTIMPL;
-   D3D9Tracef("Present flush_frontbuffer src=0x%lx dst=0x%lx pipe=%p\n",
-              (unsigned long)(src ? src->allocation : 0),
-              (unsigned long)(dst ? dst->allocation : 0),
-              src_resource->pipe_resource);
    HRESULT hr = D3D9FlushFrontbuffer(device, src_resource,
                                      src_subresource_index,
                                      dst ? dst->allocation : 0,
                                      src_resource->flags.Primary != 0 &&
                                         data->Flags.Flip != 0);
-   D3D9Tracef("Present hr=0x%08lx\n", hr);
    return hr;
 }
 
@@ -3780,11 +3742,6 @@ HRESULT APIENTRY
 D3D9Clear(HANDLE hDevice, const D3DDDIARG_CLEAR *data, UINT rect_count,
           const RECT *rects)
 {
-   D3D9Tracef("Clear hDevice=%p data=%p flags=0x%08x rects=%u color=0x%08x "
-              "depth=%f stencil=%u\n",
-              hDevice, data, data ? data->Flags : 0, rect_count,
-              data ? data->FillColor : 0, data ? data->FillDepth : 0.0f,
-              data ? data->FillStencil : 0);
 
    D3D9Device *device = (D3D9Device *)hDevice;
    if (!device || !data || (rect_count && !rects))
@@ -3865,11 +3822,11 @@ D3D9DestroyResource(HANDLE hDevice, HANDLE resource)
          device->pipe->flush_resource(device->pipe,
                                       d3d9_resource->pipe_resource);
       }
-      if (d3d9_resource->primary_display_resource) {
+      if (d3d9_resource->display_resource) {
          runtime_allocation |= yttrium_gdi_resource_has_runtime_allocation(
-            d3d9_resource->primary_display_resource);
+            d3d9_resource->display_resource);
          device->pipe->flush_resource(
-            device->pipe, d3d9_resource->primary_display_resource);
+            device->pipe, d3d9_resource->display_resource);
       }
       if (runtime_allocation) {
          struct pipe_context *driver_pipe =
@@ -3878,9 +3835,9 @@ D3D9DestroyResource(HANDLE hDevice, HANDLE resource)
             yttrium_gdi_pipeline_invalidate_resource(
                driver_pipe, d3d9_resource->pipe_resource);
          }
-         if (d3d9_resource->primary_display_resource) {
+         if (d3d9_resource->display_resource) {
             yttrium_gdi_pipeline_invalidate_resource(
-               driver_pipe, d3d9_resource->primary_display_resource);
+               driver_pipe, d3d9_resource->display_resource);
          }
       }
    }

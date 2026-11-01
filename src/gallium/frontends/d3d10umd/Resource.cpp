@@ -52,6 +52,7 @@
 #if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
 #include <emmintrin.h>
 #endif
+#include <stdlib.h>
 #include <string.h>
 
 
@@ -850,87 +851,38 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    struct pipe_screen *screen = pipe->screen;
    const bool yttrium = is_yttrium_screen(screen);
    const bool has_primary_desc = pCreateResource->pPrimaryDesc != NULL;
+   const bool optional_shared_primary = yttrium && has_primary_desc &&
+      (pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) &&
+      (pCreateResource->pPrimaryDesc->Flags & DXGI_DDI_PRIMARY_OPTIONAL);
+   const bool scanout_primary = has_primary_desc && !optional_shared_primary;
 
    if (!validate_resource_dimension(pCreateResource)) {
       SetError(hDevice, DXGI_DDI_ERR_UNSUPPORTED);
       return;
    }
 
-   if ((pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) ||
-       has_primary_desc) {
-
-      DebugPrintf("%s(%dx%dx%d hResource=%p)\n",
-	       __func__,
-	       pCreateResource->pMipInfoList[0].TexelWidth,
-	       pCreateResource->pMipInfoList[0].TexelHeight,
-	       pCreateResource->pMipInfoList[0].TexelDepth,
-	       hResource.pDrvPrivate);
-      DebugPrintf("  ResourceDimension = %u\n",
-	       pCreateResource->ResourceDimension);
-      DebugPrintf("  Usage = %u\n",
-	       pCreateResource->Usage);
-      DebugPrintf("  BindFlags = 0x%x\n",
-	       pCreateResource->BindFlags);
-      DebugPrintf("  MapFlags = 0x%x\n",
-	       pCreateResource->MapFlags);
-      DebugPrintf("  MiscFlags = 0x%x\n",
-	       pCreateResource->MiscFlags);
-      DebugPrintf("  Format = %s\n",
-	       FormatToName(pCreateResource->Format));
-      DebugPrintf("  SampleDesc.Count = %u\n", pCreateResource->SampleDesc.Count);
-      DebugPrintf("  SampleDesc.Quality = %u\n", pCreateResource->SampleDesc.Quality);
-      DebugPrintf("  MipLevels = %u\n", pCreateResource->MipLevels);
-      DebugPrintf("  ArraySize = %u\n", pCreateResource->ArraySize);
-      DebugPrintf("  pPrimaryDesc = %p\n", pCreateResource->pPrimaryDesc);
-      if (pCreateResource->pPrimaryDesc) {
-	 DebugPrintf("    Flags = 0x%x\n",
-		  pCreateResource->pPrimaryDesc->Flags);
-	 DebugPrintf("    VidPnSourceId = %u\n", pCreateResource->pPrimaryDesc->VidPnSourceId);
-	 DebugPrintf("    ModeDesc.Width = %u\n", pCreateResource->pPrimaryDesc->ModeDesc.Width);
-	 DebugPrintf("    ModeDesc.Height = %u\n", pCreateResource->pPrimaryDesc->ModeDesc.Height);
-	 DebugPrintf("    ModeDesc.Format = %u)\n",
-		  pCreateResource->pPrimaryDesc->ModeDesc.Format);
-	 DebugPrintf("    ModeDesc.RefreshRate.Numerator = %u\n", pCreateResource->pPrimaryDesc->ModeDesc.RefreshRate.Numerator);
-	 DebugPrintf("    ModeDesc.RefreshRate.Denominator = %u\n", pCreateResource->pPrimaryDesc->ModeDesc.RefreshRate.Denominator);
-	 DebugPrintf("    ModeDesc.ScanlineOrdering = %u\n",
-		  pCreateResource->pPrimaryDesc->ModeDesc.ScanlineOrdering);
-	 DebugPrintf("    ModeDesc.Rotation = %u\n",
-		  pCreateResource->pPrimaryDesc->ModeDesc.Rotation);
-	 DebugPrintf("    ModeDesc.Scaling = %u\n",
-		  pCreateResource->pPrimaryDesc->ModeDesc.Scaling);
-	 DebugPrintf("    DriverFlags = 0x%x\n",
-		  pCreateResource->pPrimaryDesc->DriverFlags);
-      }
-
-   }
-
-   if (yttrium && has_primary_desc) {
+   if (optional_shared_primary) {
+      /* Fullscreen composition can offer a shared back buffer as an optional
+       * primary. Its canonical GPU allocation is a compositor input, not a
+       * linear scanout endpoint; decline optional direct scanout. */
+      pCreateResource->pPrimaryDesc->DriverFlags =
+         DXGI_DDI_PRIMARY_DRIVER_FLAG_NO_SCANOUT;
+   } else if (yttrium && scanout_primary) {
       pCreateResource->pPrimaryDesc->DriverFlags &=
          ~DXGI_DDI_PRIMARY_DRIVER_FLAG_NO_SCANOUT;
    }
 
    mtx_lock(&device->CreateResourceMtx);
    device->device.allocationVidPn =
-      (yttrium && has_primary_desc) ? pCreateResource->pPrimaryDesc->VidPnSourceId : 0;
-   device->device.isPrimary = pCreateResource->pPrimaryDesc != NULL;
+      (yttrium && scanout_primary) ? pCreateResource->pPrimaryDesc->VidPnSourceId : 0;
+   device->device.isPrimary = scanout_primary;
    device->device.hRTResource = hRTResource.handle;
    device->device.hRTResourceIsD3D9 = false;
 
    Resource *pResource = CastResource(hResource);
 
    memset(pResource, 0, sizeof *pResource);
-   pResource->yttrium_primary = yttrium && has_primary_desc;
-
-#if 0
-   if (pCreateResource->pPrimaryDesc) {
-      pCreateResource->pPrimaryDesc->DriverFlags = DXGI_DDI_PRIMARY_DRIVER_FLAG_NO_SCANOUT;
-      if (!(pCreateResource->pPrimaryDesc->DriverFlags & DXGI_DDI_PRIMARY_OPTIONAL)) {
-         // http://msdn.microsoft.com/en-us/library/windows/hardware/ff568846.aspx
-         SetError(hDevice, DXGI_DDI_ERR_UNSUPPORTED);
-         return;
-      }
-   }
-#endif
+   pResource->yttrium_primary = yttrium && scanout_primary;
 
    pResource->Format = pCreateResource->Format;
    pResource->MiscFlags = pCreateResource->MiscFlags;
@@ -976,12 +928,19 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    }
 #endif
    templat.usage      = translate_resource_usage(pCreateResource->Usage);
+   if (yttrium && templat.target != PIPE_BUFFER &&
+       !(pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
+      /* API sharing intent is distinct from the allocation's Gallium bind
+       * flags. Local rendering can keep its canonical optimal contents
+       * separate from the endpoint consumed by Windows. */
+      templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_LOCAL_RENDER;
+   }
    if (yttrium &&
        (pCreateResource->BindFlags & D3D10_DDI_BIND_PRESENT) &&
        !(pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) &&
-       !has_primary_desc)
+       !scanout_primary)
       templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK;
-   if (yttrium && has_primary_desc)
+   if (yttrium && scanout_primary)
       templat.flags |= PIPE_RESOURCE_FLAG_FRONTEND_PRIV;
 
    if (templat.bind == 0 && templat.usage != PIPE_USAGE_STAGING) {
@@ -989,6 +948,63 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
    }
    if ((pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
       templat.bind |= PIPE_BIND_SHARED;
+   }
+
+   const unsigned legacy_present_bind =
+      PIPE_BIND_RENDER_TARGET | PIPE_BIND_DISPLAY_TARGET;
+   const bool optimal_local_legacy = yttrium && !scanout_primary &&
+      !(pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) &&
+      (templat.flags & YTTRIUM_GDI_RESOURCE_FLAG_CPU_READBACK) &&
+      templat.target == PIPE_TEXTURE_2D && templat.depth0 == 1 &&
+      templat.array_size == 1 && !templat.last_level &&
+      templat.nr_samples == 1 && templat.nr_storage_samples == 1 &&
+      (templat.bind & legacy_present_bind) == legacy_present_bind &&
+      !(templat.bind & ~(legacy_present_bind | PIPE_BIND_SAMPLER_VIEW)) &&
+      (pCreateResource->Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+       pCreateResource->Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+       pCreateResource->Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+       pCreateResource->Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) &&
+      !pCreateResource->MapFlags && !pCreateResource->pInitialDataUP &&
+      templat.usage == PIPE_USAGE_DEFAULT;
+   if (optimal_local_legacy) {
+      /* The runtime's legacy Present reads a linear allocation. Rendering
+       * and readback still address canonical optimal storage; publish the
+       * separate endpoint only at the external-consumer handoff. */
+      templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT;
+   }
+
+   if (yttrium && scanout_primary) {
+      /* Creation cannot prove the eventual Present model. The screen hook
+       * rejects non-flip consumers before publishing this narrow primary. */
+      if ((pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED) ||
+          (pCreateResource->Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+           pCreateResource->Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+           pCreateResource->Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
+           pCreateResource->Format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) ||
+          pCreateResource->MapFlags || pCreateResource->pInitialDataUP ||
+          templat.usage != PIPE_USAGE_DEFAULT) {
+         debug_printf("yttrium: ERROR optimal primary rejected owner=CreateResource component=d3d10umd reason=unsupported-local-primary-format-or-cpu-access action=fail-resource\n");
+         SetError(hDevice, E_INVALIDARG);
+         goto unlock;
+      }
+      templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_PRESENT;
+   }
+
+   if (yttrium && !scanout_primary &&
+       (pCreateResource->MiscFlags & D3D10_DDI_RESOURCE_MISC_SHARED)) {
+      /* API-shared DEFAULT textures use canonical GPU storage. Initial
+       * contents are uploaded below without exposing that storage to Map. */
+      if (pCreateResource->MapFlags || templat.usage != PIPE_USAGE_DEFAULT) {
+         debug_printf("yttrium: ERROR optimal shared resource rejected owner=CreateResource component=d3d10umd reason=CPU-access-or-nondefault-usage action=fail-resource\n");
+         SetError(hDevice, E_INVALIDARG);
+         goto unlock;
+      }
+      /* GDI interop can request a render-target-only shared allocation.
+       * Retain sampling for these internal RTV storage binds without
+       * changing the API's resource permissions. */
+      if (templat.bind & PIPE_BIND_RENDER_TARGET)
+         templat.bind |= PIPE_BIND_SAMPLER_VIEW;
+      templat.flags |= YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED;
    }
 
    if (templat.target != PIPE_BUFFER) {
@@ -1057,6 +1073,22 @@ CreateResource(D3D10DDI_HDEVICE hDevice,                                // IN
             unsigned level;
             struct pipe_box box;
             subResourceBox(pResource->resource, SubResource, &level, &box);
+
+            if (yttrium &&
+                (templat.flags & YTTRIUM_GDI_RESOURCE_FLAG_OPTIMAL_SHARED)) {
+               /* Shared composition images deliberately reject CPU Map.
+                * Upload initial pixels through the canonical-image staging
+                * path, just as UpdateSubresource does for these images. */
+               pipe->texture_subdata(pipe,
+                                     pResource->resource,
+                                     level,
+                                     PIPE_MAP_UNSYNCHRONIZED,
+                                     &box,
+                                     pInitialDataUP->pSysMem,
+                                     pInitialDataUP->SysMemPitch,
+                                     pInitialDataUP->SysMemSlicePitch);
+               continue;
+            }
 
             struct pipe_transfer *transfer;
             void *map;
@@ -1512,6 +1544,26 @@ areResourcesFallbackCopyCompatible(const struct pipe_resource *src_resource,
    return src_format_desc->block.bits == dst_format_desc->block.bits;
 }
 
+/* CopyResource/CopySubresourceRegion preserve encoded bytes across compatible
+ * UNORM/sRGB views. Yttrium can copy these image pairs without CPU mapping. */
+static bool
+areYttriumSrgbCopyFormatsCompatible(const struct pipe_resource *src_resource,
+                                   const struct pipe_resource *dst_resource)
+{
+   switch (src_resource->format) {
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+      return dst_resource->format == PIPE_FORMAT_R8G8B8A8_SRGB;
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+      return dst_resource->format == PIPE_FORMAT_R8G8B8A8_UNORM;
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+      return dst_resource->format == PIPE_FORMAT_B8G8R8A8_SRGB;
+   case PIPE_FORMAT_B8G8R8A8_SRGB:
+      return dst_resource->format == PIPE_FORMAT_B8G8R8A8_UNORM;
+   default:
+      return false;
+   }
+}
+
 static bool
 areYttriumDepthReadbackFormatsCompatible(const struct pipe_resource *src_resource,
                                          const struct pipe_resource *dst_resource)
@@ -1567,7 +1619,10 @@ ResourceCopy(D3D10DDI_HDEVICE hDevice,          // IN
    assert(dst_resource->last_level == src_resource->last_level);
    assert(dst_resource->array_size == src_resource->array_size);
 
+   const bool yttrium_srgb_copy = is_yttrium_screen(pipe->screen) &&
+      areYttriumSrgbCopyFormatsCompatible(src_resource, dst_resource);
    compatible = areResourcesCompatible(src_resource, dst_resource) ||
+                yttrium_srgb_copy ||
                 (is_yttrium_screen(pipe->screen) &&
                  areYttriumDepthReadbackFormatsCompatible(src_resource,
                                                           dst_resource));
@@ -1699,7 +1754,10 @@ ResourceCopyRegion(D3D10DDI_HDEVICE hDevice,                // IN
       src_box.depth  = u_minify(src_resource->depth0,  src_level);
    }
 
+   const bool yttrium_srgb_copy = is_yttrium_screen(pipe->screen) &&
+      areYttriumSrgbCopyFormatsCompatible(src_resource, dst_resource);
    if (areResourcesCompatible(src_resource, dst_resource) ||
+       yttrium_srgb_copy ||
        (is_yttrium_screen(pipe->screen) &&
         areYttriumDepthReadbackFormatsCompatible(src_resource,
                                                  dst_resource))) {

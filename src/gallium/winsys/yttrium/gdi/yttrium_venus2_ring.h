@@ -57,7 +57,9 @@ bool
 yttrium_venus_ring_publish_for_submit(struct yttrium_venus *venus, uint32_t *seqno);
 
 bool
-yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t size);
+yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t size,
+                         const D3DKMT_HANDLE *primary_writes,
+                         uint32_t primary_write_count);
 
 void
 yttrium_venus_ring_forget_at_device_teardown(struct yttrium_venus *venus);

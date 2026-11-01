@@ -40,15 +40,27 @@ yttrium_venus_submit_path_name(uint32_t path)
 
 static bool
 yttrium_venus_resize_submit_buffers(struct yttrium_venus *venus,
-                                    size_t command_size)
+                                    size_t command_size,
+                                    uint32_t allocation_count)
 {
    struct gdikmt_context *ctx = venus->kmt_ctx;
 
-   if (!ctx || !ctx->pCommandBuffer)
+   if (!ctx || !ctx->pCommandBuffer ||
+       ctx->CommandBufferSize < sizeof(VIOGPU_COMMAND_HDR))
       return false;
 
-   if (ctx->CommandBufferSize >= command_size)
-      return true;
+   const bool resize_command = ctx->CommandBufferSize < command_size;
+   const bool resize_allocations = ctx->AllocationListSize < allocation_count;
+   if (!resize_command && !resize_allocations)
+      return !allocation_count || ctx->pAllocationList;
+
+   if (command_size > UINT_MAX)
+      return false;
+
+   /* The runtime can replace both pointers on every Render callback. Resize
+    * with a NOP before filling the actual command and primary-write list. */
+   if (!ctx->render)
+      return false;
 
    VIOGPU_COMMAND_HDR *hdr = (VIOGPU_COMMAND_HDR *)ctx->pCommandBuffer;
    memset(hdr, 0, sizeof(*hdr));
@@ -58,29 +70,54 @@ yttrium_venus_resize_submit_buffers(struct yttrium_venus *venus,
    struct gdikmt_render render;
    memset(&render, 0, sizeof(render));
    render.CommandLength = sizeof(*hdr);
-   render.ResizeCommandBuffer = true;
-   render.NewCommandBufferSize =
-      (UINT)MIN2((uint64_t)UINT_MAX, (uint64_t)command_size + 0x1000);
+   render.ResizeCommandBuffer = resize_command;
+   if (resize_command)
+      render.NewCommandBufferSize =
+         (UINT)MIN2((uint64_t)UINT_MAX, (uint64_t)command_size + 0x1000);
+   render.ResizeAllocationList = resize_allocations;
+   if (resize_allocations)
+      render.NewAllocationListSize = allocation_count;
 
    NTSTATUS status = ctx->render(ctx, &render);
    if (!NT_SUCCESS(status)) {
-      YTTRIUM_LOG("yttrium: Venus submit-buffer resize failed status=0x%lx need=%llu have=%u\n",
+      YTTRIUM_WARN("yttrium: Venus submit-buffer resize failed status=0x%lx need=%llu/%u have=%u/%u\n",
                    status, (unsigned long long)command_size,
-                   ctx->CommandBufferSize);
+                   allocation_count, ctx->CommandBufferSize,
+                   ctx->AllocationListSize);
       return false;
    }
 
-   return ctx->CommandBufferSize >= command_size;
+   if (!ctx->pCommandBuffer || ctx->CommandBufferSize < command_size ||
+       ctx->AllocationListSize < allocation_count ||
+       (allocation_count && !ctx->pAllocationList)) {
+      YTTRIUM_WARN("yttrium: Venus runtime returned insufficient submit buffers need=%llu/%u have=%u/%u\n",
+                   (unsigned long long)command_size, allocation_count,
+                   ctx->CommandBufferSize, ctx->AllocationListSize);
+      return false;
+   }
+   return true;
 }
 
 bool
-yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t size)
+yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t size,
+                         const D3DKMT_HANDLE *primary_writes,
+                         uint32_t primary_write_count)
 {
    const size_t overhead = sizeof(VIOGPU_COMMAND_HDR) + sizeof(VIOGPU_TIMELINE_SUBMIT);
    struct gdikmt_context *ctx = venus->kmt_ctx;
-   if (size > UINT_MAX - overhead ||
-       !yttrium_venus_resize_submit_buffers(venus, overhead + size))
+   if ((primary_write_count && !primary_writes) ||
+       size > UINT_MAX - overhead ||
+       !yttrium_venus_resize_submit_buffers(venus, overhead + size,
+                                            primary_write_count))
       return false;
+   /* Vulkan resource addresses need no patching, but the Windows scheduler
+    * still needs primary write references to order rendering against flips. */
+   for (uint32_t i = 0; i < primary_write_count; i++) {
+      D3DDDI_ALLOCATIONLIST *entry = &ctx->pAllocationList[i];
+      memset(entry, 0, sizeof(*entry));
+      entry->hAllocation = primary_writes[i];
+      entry->WriteOperation = 1;
+   }
    VIOGPU_COMMAND_HDR *header = ctx->pCommandBuffer;
    VIOGPU_TIMELINE_SUBMIT *packet = (VIOGPU_TIMELINE_SUBMIT *)(header + 1);
    header->type = VIOGPU_CMD_SUBMIT_TIMELINE;
@@ -90,20 +127,8 @@ yttrium_venus_submit_gpu(struct yttrium_venus *venus, const void *data, size_t s
    memcpy(packet + 1, data, size);
    struct gdikmt_render render = {0};
    render.CommandLength = (UINT)(overhead + size);
-   /* Process-only diagnostic: delay worker submission to exercise the
-    * Present issuance checkpoint. Never read on the normal path. */
-   char delay_text[16] = {0};
-   GetEnvironmentVariableA("D3D10UMD_YTTRIUM_SCHEDULED_SUBMIT_DELAY_MS",
-                          delay_text, sizeof(delay_text));
-   unsigned delay = (unsigned)strtoul(delay_text, NULL, 10);
-   if (delay && delay <= 1000) {
-      YTTRIUM_LOG("yttrium: scheduled GPU submit delay begin ms=%u\n", delay);
-      Sleep(delay);
-      YTTRIUM_LOG("yttrium: scheduled GPU submit delay end ms=%u\n", delay);
-   }
+   render.AllocationCount = primary_write_count;
    NTSTATUS status = ctx->render(ctx, &render);
-   YTTRIUM_LOG("yttrium: scheduled GPU submit context=0x%x bytes=%llu timeline=1 hr=%lx\n",
-               ctx->kmt_handle(ctx), (unsigned long long)size, (unsigned long)status);
    if (!NT_SUCCESS(status)) {
       YTTRIUM_WARN("yttrium: ERROR scheduled GPU submit owner=venus2 hr=%lx\n", (unsigned long)status);
       gdikmt_device_report_reset(venus->device, PIPE_UNKNOWN_CONTEXT_RESET);
@@ -233,7 +258,7 @@ yttrium_venus_raw_submit_with_event(struct yttrium_venus *venus,
    }
 
    if (size > UINT_MAX || command_size > UINT_MAX ||
-       !yttrium_venus_resize_submit_buffers(venus, command_size))
+       !yttrium_venus_resize_submit_buffers(venus, command_size, 0))
       return false;
 
    uint8_t *command = (uint8_t *)ctx->pCommandBuffer;
@@ -326,7 +351,30 @@ yttrium_venus_raw_submit_sync(struct yttrium_venus *venus,
    }
 
    const uint64_t wait_start_us = yttrium_trace_now_us();
-   const DWORD wait = WaitForSingleObject(event, YTTRIUM_VENUS_RING_WAIT_MS);
+   DWORD wait;
+   DWORD wait_error = ERROR_SUCCESS;
+   for (;;) {
+      wait = WaitForSingleObject(event, YTTRIUM_VENUS_RING_WAIT_MS);
+      if (wait != WAIT_TIMEOUT) {
+         if (wait == WAIT_FAILED)
+            wait_error = GetLastError();
+         break;
+      }
+      const bool ring_ok =
+         !yttrium_venus_ring_ready(&venus->ring) ||
+         yttrium_venus_ring_probe(venus, "raw-submit-wait-ring-probe");
+      const enum pipe_reset_status reset_status =
+         gdikmt_device_get_reset_status(venus->device);
+      if (!ring_ok || venus->failed || reset_status != PIPE_NO_RESET) {
+         YTTRIUM_WARN("yttrium: Venus sync raw submit wait aborted owner=venus2-transport reason=device-failed reset_status=%d label=%s\n",
+                      reset_status, label ? label : "<unknown>");
+         break;
+      }
+      YTTRIUM_WARN("yttrium: Venus sync raw submit still pending owner=venus2-transport wait_ms=%llu label=%s action=keep-waiting\n",
+                   (unsigned long long)((yttrium_trace_now_us() -
+                                         wait_start_us) / 1000),
+                   label ? label : "<unknown>");
+   }
    const uint64_t wait_elapsed_us = yttrium_trace_now_us() - wait_start_us;
    CloseHandle(event);
 
@@ -338,9 +386,11 @@ yttrium_venus_raw_submit_sync(struct yttrium_venus *venus,
       UINT32_MAX, size > UINT32_MAX ? UINT32_MAX : (uint32_t)size, 0);
 
    if (wait != WAIT_OBJECT_0) {
-      YTTRIUM_LOG("yttrium: Venus sync raw submit wait failed label=%s wait=%lu err=%lu timeout_ms=%u\n",
-                  label ? label : "<unknown>", wait, GetLastError(),
-                  YTTRIUM_VENUS_RING_WAIT_MS);
+      /* The command was accepted.  Failure to observe its completion does
+       * not revoke its ownership of the ring or reply backing. */
+      yttrium_venus2_retain_on_teardown(venus);
+      YTTRIUM_WARN("yttrium: Venus sync raw submit wait failed owner=venus2-transport label=%s wait=%lu err=%lu action=retain-unretired-resources\n",
+                   label ? label : "<unknown>", wait, wait_error);
       return false;
    }
 
@@ -447,9 +497,6 @@ yttrium_venus_bo_create(struct yttrium_venus *venus,
    bo->map_info = map.ResourceMapBlob.MapInfo;
    memset(bo->map, 0, bo->size);
 
-   YTTRIUM_LOG("yttrium: Venus BO hAllocation=0x%lx res_id=%u size=0x%llx map=%p\n",
-                (unsigned long)bo->hAllocation, bo->res_id,
-                (unsigned long long)bo->size, bo->map);
    return true;
 }
 
@@ -460,7 +507,7 @@ yttrium_venus_bo_destroy(struct yttrium_venus *venus,
    if (!bo->hAllocation)
       return;
 
-   if (bo->map) {
+   if (bo->map && !gdikmt_device_is_removed(venus->device)) {
       VIOGPU_ESCAPE unmap;
       memset(&unmap, 0, sizeof(unmap));
       unmap.Type = VIOGPU_RES_UNMAP_BLOB;

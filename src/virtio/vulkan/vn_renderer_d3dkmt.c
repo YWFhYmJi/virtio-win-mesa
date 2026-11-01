@@ -14,6 +14,9 @@
 #include <winternl.h>
 
 #include "virtio/wddm/viogpu_wddm_driver.h"
+#if defined(HAVE_YTTRIUM)
+#include "gallium/winsys/yttrium/gdi/yttrium_shared_image.h"
+#endif
 
 #include "virtio/virtio-gpu/venus_hw.h"
 
@@ -817,8 +820,10 @@ virtgpu_d3dkmt_prime_handle_to_fd(struct virtgpu *gpu,
 
 #if defined(HAVE_YTTRIUM)
 static uint32_t
-virtgpu_d3dkmt_shared_handle_to_handle(struct virtgpu *gpu, void *handle,
-                                       uint32_t *out_resource_handle)
+virtgpu_d3dkmt_shared_handle_to_handle(
+   struct virtgpu *gpu, void *handle,
+   struct yttrium_optimal_image_data *image_data,
+   uint32_t *out_resource_handle)
 {
    if (out_resource_handle)
       *out_resource_handle = 0;
@@ -863,9 +868,39 @@ virtgpu_d3dkmt_shared_handle_to_handle(struct virtgpu *gpu, void *handle,
    status = gpu->pfnOpenResource(&open);
    uint32_t alloc_handle =
       NT_SUCCESS(status) ? (uint32_t)alloc_info[0].hAllocation : 0;
+   if (alloc_handle) {
+      memset(image_data, 0, sizeof(*image_data));
+      uint32_t resource_magic = 0;
+      if (open.pResourcePrivateDriverData &&
+          open.ResourcePrivateDriverDataSize >= sizeof(resource_magic))
+         memcpy(&resource_magic, open.pResourcePrivateDriverData,
+                sizeof(resource_magic));
+      const uintptr_t data_start = (uintptr_t)total_private;
+      const uintptr_t allocation_data =
+         (uintptr_t)alloc_info[0].pPrivateDriverData;
+      const bool in_bounds = allocation_data >= data_start &&
+         allocation_data - data_start <= query.TotalPrivateDriverDataSize &&
+         sizeof(*image_data) <= query.TotalPrivateDriverDataSize -
+                                  (allocation_data - data_start);
+      if (in_bounds &&
+          alloc_info[0].PrivateDriverDataSize == sizeof(*image_data))
+         memcpy(image_data, alloc_info[0].pPrivateDriverData, sizeof(*image_data));
+      if (!yttrium_shared_image_wire_valid(
+             resource_magic, open.ResourcePrivateDriverDataSize,
+             image_data->magic, alloc_info[0].PrivateDriverDataSize) ||
+          image_data->version != YTTRIUM_OPTIMAL_IMAGE_DRM_VERSION ||
+          !yttrium_mesa_optimal_image_valid(image_data)) {
+         mesa_loge("venus: Win32 shared image import rejected "
+                   "owner=renderer-d3dkmt reason=invalid-v4-image-metadata "
+                   "version=%u bytes=%u action=fail-import",
+                   image_data->version, alloc_info[0].PrivateDriverDataSize);
+         virtgpu_d3dkmt_gem_close_resource(gpu, alloc_handle, open.hResource);
+         alloc_handle = 0;
+      }
+   }
    /* The allocation belongs to this resource; teardown needs it. */
    if (out_resource_handle)
-      *out_resource_handle = NT_SUCCESS(status) ? (uint32_t)open.hResource : 0;
+      *out_resource_handle = alloc_handle ? (uint32_t)open.hResource : 0;
 
    free(runtime_private);
    free(total_private);
@@ -1663,11 +1698,13 @@ fail:
 
 #if defined(HAVE_YTTRIUM)
 static VkResult
-virtgpu_bo_create_from_win32_handle(struct vn_renderer *renderer,
-                                    VkDeviceSize size,
-                                    void *handle,
-                                    VkMemoryPropertyFlags flags,
-                                    struct vn_renderer_bo **out_bo)
+virtgpu_bo_create_from_win32_handle(
+   struct vn_renderer *renderer,
+   VkDeviceSize size,
+   void *handle,
+   VkMemoryPropertyFlags flags,
+   struct yttrium_optimal_image_data *image_data,
+   struct vn_renderer_bo **out_bo)
 {
    struct virtgpu *gpu = (struct virtgpu *)renderer;
 
@@ -1675,7 +1712,8 @@ virtgpu_bo_create_from_win32_handle(struct vn_renderer *renderer,
 
    uint32_t resource_handle = 0;
    uint32_t alloc_handle =
-      virtgpu_d3dkmt_shared_handle_to_handle(gpu, handle, &resource_handle);
+      virtgpu_d3dkmt_shared_handle_to_handle(gpu, handle, image_data,
+                                            &resource_handle);
 
    VkResult result =
       virtgpu_bo_create_from_alloc_handle(gpu, size, alloc_handle, flags,

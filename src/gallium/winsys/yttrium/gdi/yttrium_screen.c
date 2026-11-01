@@ -12,80 +12,10 @@
 #include "util/u_memory.h"
 
 #include "yttrium_gdi_public.h"
-#include "yttrium_options.h"
 #include "yttrium_resource.h"
 #include "yttrium_shader.h"
 #include "yttrium_trace.h"
 #include "yttrium_venus.h"
-
-static char *
-yttrium_dup_option_string(const char *value)
-{
-   if (!value || !value[0])
-      return NULL;
-
-   const size_t len = strlen(value) + 1;
-   char *copy = MALLOC(len);
-   if (copy)
-      memcpy(copy, value, len);
-   return copy;
-}
-
-void
-yttrium_init_screen_options(struct yttrium_screen *screen)
-{
-   screen->capture_textured_draw_path =
-      yttrium_dup_option_string(
-         yttrium_gdi_debug_get_option(
-            "D3D10UMD_YTTRIUM_CAPTURE_TEXTURED_DRAW", NULL));
-   int64_t capture_limit =
-      yttrium_gdi_debug_get_num_option(
-         "D3D10UMD_YTTRIUM_CAPTURE_TEXTURED_DRAW_LIMIT", 1);
-   screen->capture_textured_draw_limit =
-      capture_limit > 0 ? (unsigned)MIN2(capture_limit, 1024) : 0;
-
-   screen->capture_skipped_draw_path =
-      yttrium_dup_option_string(
-         yttrium_gdi_debug_get_option(
-            "D3D10UMD_YTTRIUM_CAPTURE_SKIPPED_DRAW", NULL));
-   int64_t capture_skipped_limit =
-      yttrium_gdi_debug_get_num_option(
-         "D3D10UMD_YTTRIUM_CAPTURE_SKIPPED_DRAW_LIMIT", 0);
-   screen->capture_skipped_draw_limit =
-      capture_skipped_limit > 0 ?
-         (unsigned)MIN2(capture_skipped_limit, 1024) : 0;
-}
-
-void
-yttrium_log_screen_config_and_options(const struct yttrium_screen *screen)
-{
-   bool config_found = false;
-   const char *config_path = NULL;
-   unsigned config_entry_count = 0;
-
-   yttrium_gdi_debug_get_config_status(NULL, &config_found, &config_path,
-                                       &config_entry_count);
-   YTTRIUM_LOG("yttrium: config file %s entries=%u\n",
-                config_found && config_path ? config_path : "<none>",
-                config_entry_count);
-
-   YTTRIUM_LOG("yttrium: options present=KMD capture_textured_draw=%s capture_textured_draw_limit=%u capture_skipped_draw=%s capture_skipped_draw_limit=%u\n",
-                screen->capture_textured_draw_path ?
-                   screen->capture_textured_draw_path : "<none>",
-                screen->capture_textured_draw_limit,
-                screen->capture_skipped_draw_path ?
-                   screen->capture_skipped_draw_path : "<none>",
-                screen->capture_skipped_draw_limit);
-}
-
-void
-yttrium_free_screen_options(struct yttrium_screen *screen)
-{
-   FREE(screen->capture_textured_draw_path);
-   FREE(screen->capture_skipped_draw_path);
-   screen->capture_textured_draw_path = NULL;
-   screen->capture_skipped_draw_path = NULL;
-}
 
 const char *
 yttrium_get_name(struct pipe_screen *screen)
@@ -128,7 +58,6 @@ yttrium_destroy_screen(struct pipe_screen *pscreen)
    if (screen->glsl_type_singleton_ref)
       glsl_type_singleton_decref();
    yttrium_trace_shutdown();
-   yttrium_free_screen_options(screen);
    FREE(screen);
 }
 
@@ -183,6 +112,12 @@ yttrium_init_caps(struct yttrium_screen *screen)
       for (unsigned stage = 0; stage < MESA_SHADER_STAGES; stage++) {
          struct pipe_shader_caps *shader_caps =
             (struct pipe_shader_caps *)&screen->base.shader_caps[stage];
+
+         if (stage == MESA_SHADER_COMPUTE) {
+            /* TGSI needs integer support for byte-addressed UBO lowering. */
+            shader_caps->integers = true;
+            continue;
+         }
 
          if (stage != MESA_SHADER_VERTEX &&
              stage != MESA_SHADER_TESS_CTRL &&

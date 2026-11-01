@@ -69,19 +69,6 @@ yttrium_pipeline_trace_timing(uint32_t point,
 }
 
 static bool
-yttrium_pipeline_verbose_trace_enabled(void)
-{
-   static int enabled = -1;
-
-   if (enabled < 0) {
-      enabled = yttrium_gdi_debug_get_bool_option(
-         "D3D10UMD_YTTRIUM_VERBOSE_SAMPLER_DIAGNOSTIC", false) ? 1 : 0;
-   }
-
-   return enabled && yttrium_trace_is_enabled();
-}
-
-static bool
 yttrium_pipeline_key_equal(const struct yttrium_pipeline_key *a,
                            const struct yttrium_pipeline_key *b)
 {
@@ -130,6 +117,9 @@ yttrium_pipeline_key_hash(const struct yttrium_pipeline_key *key)
    hash = yttrium_pipeline_hash_mix(hash,
       (uint64_t)key->zs_format | ((uint64_t)key->zs_level << 32) |
       ((uint64_t)key->zs_layer << 48));
+   hash = yttrium_pipeline_hash_mix(hash,
+      (uint64_t)key->depth_bias_format |
+      ((uint64_t)key->depth_bias_units_unscaled << 32));
    hash = yttrium_pipeline_hash_mix(hash,
       (uint64_t)key->topology | ((uint64_t)key->patch_vertices << 32) |
       ((uint64_t)key->rasterization_samples << 40));
@@ -484,6 +474,68 @@ yttrium_pipeline_apply_x8_rt_state(
    }
 }
 
+/* A8 render targets store logical alpha in physical R8. Evaluate the alpha
+ * component of each factor in the physical color equation. In particular the
+ * R8 attachment has implicit alpha one, so destination alpha must read red.
+ * Keep source/secondary alpha and blend constants in their original channels;
+ * the A8 fragment rewrite preserves alpha while also exporting it to red.
+ */
+static VkBlendFactor
+yttrium_pipeline_a8_color_blend_factor(VkBlendFactor factor)
+{
+   switch (factor) {
+   case VK_BLEND_FACTOR_SRC_COLOR:
+      return VK_BLEND_FACTOR_SRC_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+   case VK_BLEND_FACTOR_DST_ALPHA:
+      return VK_BLEND_FACTOR_DST_COLOR;
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA:
+      return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+   case VK_BLEND_FACTOR_CONSTANT_COLOR:
+      return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+      return VK_BLEND_FACTOR_ONE;
+   case VK_BLEND_FACTOR_SRC1_COLOR:
+      return VK_BLEND_FACTOR_SRC1_ALPHA;
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:
+      return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+   default:
+      return factor;
+   }
+}
+
+static void
+yttrium_pipeline_apply_a8_rt_state(
+   const struct yttrium_pipeline_key *key,
+   struct yttrium_venus_draw_state *state)
+{
+   for (uint32_t i = 0; i < key->rt_count; i++) {
+      if (!(key->a8_rt_mask & (1u << i)))
+         continue;
+
+      state->rt_color_write_mask[i] =
+         (state->rt_color_write_mask[i] & VK_COLOR_COMPONENT_A_BIT) ?
+         VK_COLOR_COMPONENT_R_BIT : 0;
+      state->rt_src_color_blend_factor[i] =
+         yttrium_pipeline_a8_color_blend_factor(
+            state->rt_src_alpha_blend_factor[i]);
+      state->rt_dst_color_blend_factor[i] =
+         yttrium_pipeline_a8_color_blend_factor(
+            state->rt_dst_alpha_blend_factor[i]);
+      state->rt_color_blend_op[i] = state->rt_alpha_blend_op[i];
+
+      if (i == 0) {
+         state->color_write_mask = state->rt_color_write_mask[i];
+         state->src_color_blend_factor = state->rt_src_color_blend_factor[i];
+         state->dst_color_blend_factor = state->rt_dst_color_blend_factor[i];
+         state->color_blend_op = state->rt_color_blend_op[i];
+      }
+   }
+}
+
 static bool
 yttrium_pipeline_blend_factor_uses_src1(VkBlendFactor factor)
 {
@@ -541,76 +593,6 @@ yttrium_pipeline_peek_u32(const void *data, size_t size, unsigned index)
       memcpy(&value, (const uint8_t *)data + offset, sizeof(value));
 
    return value;
-}
-
-static uint32_t
-yttrium_pipeline_peek_u32_at(const void *data, size_t size, uint64_t offset)
-{
-   uint32_t value = 0;
-
-   if (data && offset <= size && sizeof(value) <= size - (size_t)offset)
-      memcpy(&value, (const uint8_t *)data + offset, sizeof(value));
-
-   return value;
-}
-
-static float
-yttrium_pipeline_peek_f32(const void *data, size_t size, unsigned index)
-{
-   float value = 0.0f;
-   const size_t offset = (size_t)index * sizeof(value);
-
-   if (data && offset <= size && sizeof(value) <= size - offset)
-      memcpy(&value, (const uint8_t *)data + offset, sizeof(value));
-
-   return value;
-}
-
-struct yttrium_pipeline_data_summary {
-   uint64_t inspected;
-   uint64_t nonzero_bytes;
-   uint64_t first_nonzero;
-   uint64_t last_nonzero;
-   uint32_t first_nonzero_u32;
-   uint32_t last_nonzero_u32;
-   uint32_t hash;
-};
-
-static struct yttrium_pipeline_data_summary
-yttrium_pipeline_summarize_data(const void *data, size_t size)
-{
-   struct yttrium_pipeline_data_summary summary = {
-      .first_nonzero = UINT64_MAX,
-      .last_nonzero = UINT64_MAX,
-      .hash = 2166136261u,
-   };
-   const uint8_t *bytes = data;
-   const size_t inspected = MIN2(size, (size_t)4 * 1024 * 1024);
-
-   summary.inspected = inspected;
-   if (!bytes)
-      return summary;
-
-   for (size_t i = 0; i < inspected; i++) {
-      const uint8_t value = bytes[i];
-      summary.hash ^= value;
-      summary.hash *= 16777619u;
-      if (value) {
-         summary.nonzero_bytes++;
-         if (summary.first_nonzero == UINT64_MAX)
-            summary.first_nonzero = i;
-         summary.last_nonzero = i;
-      }
-   }
-
-   if (summary.first_nonzero != UINT64_MAX)
-      summary.first_nonzero_u32 =
-         yttrium_pipeline_peek_u32_at(data, size, summary.first_nonzero);
-   if (summary.last_nonzero != UINT64_MAX)
-      summary.last_nonzero_u32 =
-         yttrium_pipeline_peek_u32_at(data, size, summary.last_nonzero);
-
-   return summary;
 }
 
 static uint32_t
@@ -1988,14 +1970,6 @@ yttrium_pipeline_add_sampled_layouts(
             if (view && util_format_is_pure_integer(view->format)) {
                yttrium_pipeline_sampler_state_force_integer_fetch(
                   &layout->sampler);
-               if (yttrium_pipeline_verbose_trace_enabled()) {
-                  yttrium_trace_debug_stringf(
-                     "yttrium: integer_sampler_state stage=%u sampler_slot=%u view_slot=%u format=%u min_filter=%u mag_filter=%u mipmap_mode=%u",
-                     sampled_stage, slot, view_slot, view->format,
-                     layout->sampler.min_filter,
-                     layout->sampler.mag_filter,
-                     layout->sampler.mipmap_mode);
-               }
             }
          }
          if (!yttrium_pipeline_sampler_border_color(
@@ -2316,10 +2290,11 @@ yttrium_pipeline_build_key(struct yttrium_context *yctx,
          draw_state->rt_dst_alpha_blend_factor[i];
       key->alpha_blend_op[i] = draw_state->rt_alpha_blend_op[i];
       if (i == 0 && key->blend_enable[i] &&
-          (yttrium_pipeline_blend_factor_uses_src1(
-              key->src_color_blend_factor[i]) ||
-           yttrium_pipeline_blend_factor_uses_src1(
-              key->dst_color_blend_factor[i]) ||
+          ((rt_format != PIPE_FORMAT_A8_UNORM &&
+            (yttrium_pipeline_blend_factor_uses_src1(
+                key->src_color_blend_factor[i]) ||
+             yttrium_pipeline_blend_factor_uses_src1(
+                key->dst_color_blend_factor[i]))) ||
            yttrium_pipeline_blend_factor_uses_src1(
               key->src_alpha_blend_factor[i]) ||
            yttrium_pipeline_blend_factor_uses_src1(
@@ -2363,6 +2338,8 @@ yttrium_pipeline_build_key(struct yttrium_context *yctx,
    key->front_face = draw_state->front_face;
    key->depth_bias_enable = draw_state->depth_bias_enable;
    key->depth_clamp_enable = draw_state->depth_clamp_enable;
+   key->depth_bias_format = draw_state->depth_bias_format;
+   key->depth_bias_units_unscaled = draw_state->depth_bias_units_unscaled;
    key->depth_bias_constant_factor =
       draw_state->depth_bias_constant_factor;
    key->depth_bias_clamp = draw_state->depth_bias_clamp;
@@ -2869,6 +2846,10 @@ yttrium_pipeline_current_identity_equal(
              (zs ? zs->cache_id : 0) &&
           yctx->current_pipeline_zs_image_id ==
              (zs ? zs->venus.image_obj.id : 0) &&
+          yctx->pipeline->key.depth_bias_format ==
+             draw_state->depth_bias_format &&
+          yctx->pipeline->key.depth_bias_units_unscaled ==
+             draw_state->depth_bias_units_unscaled &&
           yctx->current_pipeline_topology == draw_state->topology &&
           yctx->current_pipeline_primitive_restart_enable ==
              draw_state->primitive_restart_enable &&
@@ -3170,11 +3151,12 @@ yttrium_pipeline_get(struct yttrium_context *yctx,
 
    pipeline->key = key;
    pipeline->key_hash = key_hash;
-   struct yttrium_venus_draw_state x8_draw_state;
+   struct yttrium_venus_draw_state format_draw_state;
    const struct yttrium_venus_draw_state *pipeline_draw_state = draw_state;
-   if (key.x8_rt_mask) {
-      yttrium_pipeline_apply_x8_rt_state(&key, draw_state, &x8_draw_state);
-      pipeline_draw_state = &x8_draw_state;
+   if (key.x8_rt_mask || key.a8_rt_mask) {
+      yttrium_pipeline_apply_x8_rt_state(&key, draw_state, &format_draw_state);
+      yttrium_pipeline_apply_a8_rt_state(&key, &format_draw_state);
+      pipeline_draw_state = &format_draw_state;
    }
    struct yttrium_venus_draw_state forced_sample_draw_state;
    if (emulate_forced_sample_mask || key.forced_sample_count ||
@@ -3264,20 +3246,6 @@ yttrium_pipeline_get(struct yttrium_context *yctx,
    if (zs)
       pipe_resource_reference(&pipeline->zs_resource, &zs->base);
 
-   YTTRIUM_LOG("yttrium: shader_draw_probe pipeline create ok pipeline_id=%llu res_id=%u zs_res_id=%u vs=%u tcs=%u tes=%u gs=%u fs=%u rt_count=%u format0=%u zs_format=%u topology=%u patch_vertices=%u bindings=%u attribs=%u ubo_layouts=%u sampled_bindings=%u sampled_stage=0x%x vs_ubo=0x%x tcs_ubo=0x%x tes_ubo=0x%x gs_ubo=0x%x fs_ubo=0x%x depth_test=%u depth_write=%u depth_compare=%u\n",
-               (unsigned long long)pipeline->pipeline_obj.id,
-               dst->venus_res_id, zs ? zs->venus_res_id : 0,
-               key.vs_id, key.tcs_id, key.tes_id, key.gs_id, key.fs_id,
-               key.rt_count, key.rt_format[0], key.zs_format,
-               key.topology, key.patch_vertices,
-               key.num_bindings, key.num_attribs,
-               ubo_layout_count, sampled_binding_count,
-               key.sampled_stage_mask,
-               key.vs_ubo_used_mask, key.tcs_ubo_used_mask,
-               key.tes_ubo_used_mask, key.gs_ubo_used_mask,
-               key.fs_ubo_used_mask,
-               key.depth_test_enable, key.depth_write_enable,
-               key.depth_compare_op);
    yttrium_trace_debug_stringf(
       "yttrium: shader_draw_probe pipeline create ok pipeline_id=%llu res_id=%u zs_res_id=%u vs=%u tcs=%u tes=%u gs=%u fs=%u rt_count=%u format0=%u zs_format=%u topology=%u patch_vertices=%u bindings=%u attribs=%u ubo_layouts=%u sampled_bindings=%u sampled_stage=0x%x vs_ubo=0x%x tcs_ubo=0x%x tes_ubo=0x%x gs_ubo=0x%x fs_ubo=0x%x depth_test=%u depth_write=%u depth_compare=%u",
       (unsigned long long)pipeline->pipeline_obj.id,
@@ -3293,29 +3261,6 @@ yttrium_pipeline_get(struct yttrium_context *yctx,
       key.fs_ubo_used_mask,
       key.depth_test_enable, key.depth_write_enable,
       key.depth_compare_op);
-   YTTRIUM_LOG("yttrium: pipeline_create native pipeline=%p pipeline_id=%llu vs=%u tcs=%u tes=%u gs=%u fs=%u vs_hash=0x%llx tcs_hash=0x%llx tes_hash=0x%llx gs_hash=0x%llx fs_hash=0x%llx rt_count=%u rt_format0=%u zs_format=%u image_id0=%llu zs_image_id=%llu topology=%u patch_vertices=%u bindings=%u attribs=%u ubo_layouts=%u sampled_bindings=%u sampled_stage=0x%x vs_ubo=0x%x tcs_ubo=0x%x tes_ubo=0x%x gs_ubo=0x%x fs_ubo=0x%x depth_test=%u depth_write=%u depth_compare=%u\n",
-                pipeline,
-                (unsigned long long)pipeline->pipeline_obj.id,
-                key.vs_id, key.tcs_id, key.tes_id, key.gs_id, key.fs_id,
-                (unsigned long long)key.vs_hash,
-                (unsigned long long)key.tcs_hash,
-                (unsigned long long)key.tes_hash,
-                (unsigned long long)key.gs_hash,
-                (unsigned long long)key.fs_hash,
-                key.rt_count,
-                key.rt_format[0],
-                key.zs_format,
-                (unsigned long long)key.dst_image_id[0],
-                (unsigned long long)key.zs_image_id,
-                key.topology, key.patch_vertices,
-                key.num_bindings, key.num_attribs,
-                ubo_layout_count, sampled_binding_count,
-                key.sampled_stage_mask,
-                key.vs_ubo_used_mask, key.tcs_ubo_used_mask,
-                key.tes_ubo_used_mask, key.gs_ubo_used_mask,
-                key.fs_ubo_used_mask,
-                key.depth_test_enable, key.depth_write_enable,
-                key.depth_compare_op);
    uint32_t cache_slot;
    if (yctx->pipeline_cache_count < yctx->pipeline_cache_size) {
       cache_slot = yctx->pipeline_cache_count++;
@@ -3366,116 +3311,6 @@ yttrium_pipeline_draw_upload_cleanup(struct yttrium_pipeline_draw_upload *upload
    for (uint32_t i = 0; i < upload->vertex_upload_count; i++) {
       FREE(upload->owned_vertex_data[i]);
       upload->owned_vertex_data[i] = NULL;
-   }
-}
-
-static void
-yttrium_pipeline_trace_draw_upload(
-   const struct yttrium_context *yctx,
-   const struct pipe_draw_info *info,
-   const struct pipe_draw_start_count_bias *draw,
-   const struct yttrium_pipeline_draw_upload *upload)
-{
-   if (!yttrium_pipeline_verbose_trace_enabled() || !info || !draw || !upload)
-      return;
-
-   const struct yttrium_venus_vertex_upload *vb0 =
-      upload->vertex_upload_count ? &upload->vertex_uploads[0] : NULL;
-   const struct yttrium_pipeline_data_summary vb0_summary =
-      vb0 ? yttrium_pipeline_summarize_data(vb0->data, vb0->size) :
-            (struct yttrium_pipeline_data_summary) { 0 };
-
-   yttrium_trace_debug_stringf(
-      "yttrium: shader_draw_probe draw upload mode=%u index_size=%u restart=%u instances=%u start_instance=%u draw_count=%u start=%u bias=%d bounds=%u min=%u max=%u first_vertex=%u vertex_count=%u upload_instances=%u vertex_uploads=%u vertex_bytes=0x%llx indexed=%u index_count=%u index_type=%u index_bytes=0x%llx first_indices=%u,%u,%u,%u vb0_size=0x%llx vb0_first=%08x,%08x,%08x,%08x vb0_float=%f,%f,%f,%f,%f,%f,%f,%f vb0_inspected=0x%llx vb0_nonzero=0x%llx vb0_first_nz=0x%llx:%08x vb0_last_nz=0x%llx:%08x vb0_hash=0x%x num_vb=%u",
-      info->mode,
-      info->index_size,
-      info->primitive_restart,
-      info->instance_count,
-      info->start_instance,
-      draw->count,
-      draw->start,
-      draw->index_bias,
-      info->index_bounds_valid,
-      info->min_index,
-      info->max_index,
-      upload->first_vertex,
-      upload->vertex_count,
-      upload->instance_count,
-      upload->vertex_upload_count,
-      (unsigned long long)upload->vertex_data_size,
-      upload->index_count != 0,
-      upload->index_count,
-      upload->index_type,
-      (unsigned long long)upload->index_data_size,
-      yttrium_pipeline_peek_index(upload->index_data,
-                                  upload->index_data_size, 0,
-                                  upload->index_type),
-      yttrium_pipeline_peek_index(upload->index_data,
-                                  upload->index_data_size, 1,
-                                  upload->index_type),
-      yttrium_pipeline_peek_index(upload->index_data,
-                                  upload->index_data_size, 2,
-                                  upload->index_type),
-      yttrium_pipeline_peek_index(upload->index_data,
-                                  upload->index_data_size, 3,
-                                  upload->index_type),
-      vb0 ? (unsigned long long)vb0->size : 0,
-      vb0 ? yttrium_pipeline_peek_u32(vb0->data, vb0->size, 0) : 0,
-      vb0 ? yttrium_pipeline_peek_u32(vb0->data, vb0->size, 1) : 0,
-      vb0 ? yttrium_pipeline_peek_u32(vb0->data, vb0->size, 2) : 0,
-      vb0 ? yttrium_pipeline_peek_u32(vb0->data, vb0->size, 3) : 0,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 0) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 1) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 2) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 3) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 4) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 5) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 6) : 0.0f,
-      vb0 ? yttrium_pipeline_peek_f32(vb0->data, vb0->size, 7) : 0.0f,
-      (unsigned long long)vb0_summary.inspected,
-      (unsigned long long)vb0_summary.nonzero_bytes,
-      (unsigned long long)vb0_summary.first_nonzero,
-      vb0_summary.first_nonzero_u32,
-      (unsigned long long)vb0_summary.last_nonzero,
-      vb0_summary.last_nonzero_u32,
-      vb0_summary.hash,
-      yctx ? yctx->num_vertex_buffers : 0);
-
-   const struct yttrium_shader_state *fs =
-      yctx ? yctx->shaders[MESA_SHADER_FRAGMENT] : NULL;
-   if (!yctx || !yctx->vertex_elements ||
-       !yttrium_shader_state_is_sampled_texture_only(fs))
-      return;
-
-   for (unsigned i = 0; i < yctx->vertex_elements->num_bindings; i++) {
-      const VkVertexInputBindingDescription *binding =
-         &yctx->vertex_elements->bindings[i];
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_draw_probe vi binding[%u] source_vb=%u stride=%u rate=%u",
-         i,
-         yctx->vertex_elements->binding_map[i],
-         binding->stride,
-         binding->inputRate);
-   }
-
-   for (unsigned i = 0;
-        i < MIN2(yctx->vertex_elements->num_attribs, 8); i++) {
-      const VkVertexInputAttributeDescription *attrib =
-         &yctx->vertex_elements->attribs[i];
-      const struct pipe_vertex_element *ve =
-         &yctx->vertex_elements->elements[attrib->location];
-      yttrium_trace_debug_stringf(
-         "yttrium: shader_draw_probe vi attrib[%u] location=%u binding=%u vk_format=%u offset=%u source_vb=%u src_offset=%u src_stride=%u src_format=%u divisor=%u",
-         i,
-         attrib->location,
-         attrib->binding,
-         attrib->format,
-         attrib->offset,
-         ve->vertex_buffer_index,
-         ve->src_offset,
-         ve->src_stride,
-         ve->src_format,
-         ve->instance_divisor);
    }
 }
 
@@ -4837,10 +4672,6 @@ yttrium_pipeline_retire_sampled_texture_cpu_shadow(
 
    void *data = res->data;
    const uint64_t data_capacity = res->data_capacity;
-   YTTRIUM_LOG("yttrium: sampled texture retired authoritative CPU shadow resource=%p res_id=%u data=%p capacity=0x%llx image_id=%llu\n",
-               (void *)res, res->venus_res_id, data,
-               (unsigned long long)data_capacity,
-               (unsigned long long)res->venus.image_obj.id);
    res->data = NULL;
    res->data_capacity = 0;
    res->owns_data = false;
@@ -4885,7 +4716,7 @@ yttrium_pipeline_ensure_resource_venus_texture(struct pipe_context *ctx,
                                                  res->size,
                                                  &memory_id,
                                                  &allocation_size)) {
-            YTTRIUM_LOG("yttrium: shader_draw_probe sampled texture Venus image create failed texture=%p %ux%u format=%u\n",
+            YTTRIUM_WARN("yttrium: shader_draw_probe sampled texture Venus image create failed texture=%p %ux%u format=%u\n",
                         (void *)&res->base,
                         res->base.width0, res->base.height0,
                         res->base.format);
@@ -4917,7 +4748,7 @@ yttrium_pipeline_ensure_resource_venus_texture(struct pipe_context *ctx,
                res->base.array_size, res->base.format,
                &allocation_size);
          if (!created) {
-            YTTRIUM_LOG("yttrium: shader_draw_probe sampled texture Venus array image create failed texture=%p target=%u %ux%u levels=%u layers=%u format=%u\n",
+            YTTRIUM_WARN("yttrium: shader_draw_probe sampled texture Venus array image create failed texture=%p target=%u %ux%u levels=%u layers=%u format=%u\n",
                         (void *)&res->base, res->base.target,
                         res->base.width0, res->base.height0,
                         res->base.last_level + 1, res->base.array_size,
@@ -4929,46 +4760,10 @@ yttrium_pipeline_ensure_resource_venus_texture(struct pipe_context *ctx,
          res->venus_res_id = (uint32_t)res->venus.memory_obj.id;
       }
 
-      YTTRIUM_LOG("yttrium: shader_draw_probe sampled texture Venus image texture=%p image_id=%llu memory_id=%llu target=%u %ux%u levels=%u layers=%u format=%u\n",
-                  (void *)&res->base,
-                  (unsigned long long)res->venus.image_obj.id,
-                  (unsigned long long)res->venus_mem_id,
-                  res->base.target,
-                  res->base.width0, res->base.height0,
-                  res->base.last_level + 1, res->base.array_size,
-                  res->base.format);
    }
 
    if (res->data &&
        (!res->venus.contents_initialized || res->data_dirty)) {
-      if (yttrium_pipeline_verbose_trace_enabled()) {
-         const struct yttrium_pipeline_data_summary data_summary =
-            yttrium_pipeline_summarize_data(res->data, (size_t)res->size);
-         yttrium_trace_debug_stringf(
-            "yttrium: shader_draw_probe sampled texture cpu upload begin res_id=%u image_id=%llu display=%u primary=%u classic=%u initialized=%u contents=%u layout=%u data=%p size=0x%llx stride=%u first=%08x,%08x,%08x,%08x inspected=0x%llx nonzero=0x%llx first_nz=0x%llx:%08x last_nz=0x%llx:%08x hash=0x%x",
-            res->venus_res_id,
-            (unsigned long long)res->venus.image_obj.id,
-            res->display_target,
-            res->primary_target,
-            res->classic_display,
-            res->venus.initialized,
-            res->venus.contents_initialized,
-            res->venus.layout,
-            res->data,
-            (unsigned long long)res->size,
-            res->stride,
-            yttrium_pipeline_peek_u32(res->data, (size_t)res->size, 0),
-            yttrium_pipeline_peek_u32(res->data, (size_t)res->size, 1),
-            yttrium_pipeline_peek_u32(res->data, (size_t)res->size, 2),
-            yttrium_pipeline_peek_u32(res->data, (size_t)res->size, 3),
-            (unsigned long long)data_summary.inspected,
-            (unsigned long long)data_summary.nonzero_bytes,
-            (unsigned long long)data_summary.first_nonzero,
-            data_summary.first_nonzero_u32,
-            (unsigned long long)data_summary.last_nonzero,
-            data_summary.last_nonzero_u32,
-            data_summary.hash);
-      }
 
       bool upload_ok = true;
       for (unsigned level = 0; level <= res->base.last_level; level++) {
@@ -4993,7 +4788,7 @@ yttrium_pipeline_ensure_resource_venus_texture(struct pipe_context *ctx,
       }
 
       if (!upload_ok) {
-         YTTRIUM_LOG("yttrium: shader_draw_probe sampled texture CPU upload failed texture=%p image_id=%llu %ux%u format=%u\n",
+         YTTRIUM_WARN("yttrium: shader_draw_probe sampled texture CPU upload failed texture=%p image_id=%llu %ux%u format=%u\n",
                      (void *)&res->base,
                      (unsigned long long)res->venus.image_obj.id,
                      res->base.width0, res->base.height0,
@@ -5038,7 +4833,7 @@ yttrium_pipeline_ensure_resource_venus_sampled_buffer(
       if (!yttrium_venus_create_sampled_buffer(screen->venus, &res->venus,
                                                allocation_size, format,
                                                &memory_id)) {
-         YTTRIUM_LOG("yttrium: shader_draw_probe sampled buffer Venus create failed texture=%p size=0x%llx alloc_size=0x%llx format=%u\n",
+         YTTRIUM_WARN("yttrium: shader_draw_probe sampled buffer Venus create failed texture=%p size=0x%llx alloc_size=0x%llx format=%u\n",
                      (void *)&res->base,
                      (unsigned long long)res->size,
                      (unsigned long long)allocation_size,
@@ -5046,13 +4841,6 @@ yttrium_pipeline_ensure_resource_venus_sampled_buffer(
          return false;
       }
 
-      YTTRIUM_LOG("yttrium: shader_draw_probe sampled buffer Venus buffer texture=%p buffer_id=%llu memory_id=%llu size=0x%llx alloc_size=0x%llx format=%u\n",
-                  (void *)&res->base,
-                  (unsigned long long)res->venus.buffer_obj.id,
-                  (unsigned long long)memory_id,
-                  (unsigned long long)res->size,
-                  (unsigned long long)allocation_size,
-                  format);
    }
 
    return res->venus.initialized && res->venus.buffer_backed &&
@@ -5079,7 +4867,7 @@ yttrium_pipeline_ensure_resource_venus_storage_buffer(
       if (!yttrium_venus_create_sampled_buffer(screen->venus, &res->venus,
                                                allocation_size, format,
                                                &memory_id)) {
-         YTTRIUM_LOG("yttrium: shader_draw_probe storage buffer Venus create failed image=%p size=0x%llx alloc_size=0x%llx format=%u\n",
+         YTTRIUM_WARN("yttrium: shader_draw_probe storage buffer Venus create failed image=%p size=0x%llx alloc_size=0x%llx format=%u\n",
                      (void *)&res->base,
                      (unsigned long long)res->size,
                      (unsigned long long)allocation_size,
@@ -5099,6 +4887,8 @@ yttrium_pipeline_ensure_resource_venus_storage_buffer(
 static bool
 yttrium_pipeline_append_null_sampled_buffer(
    struct pipe_context *ctx,
+   const struct yttrium_shader_state *shader,
+   uint32_t slot,
    uint32_t binding,
    struct yttrium_venus_sampled_image *sampled_images,
    uint32_t *sampled_image_count)
@@ -5111,6 +4901,25 @@ yttrium_pipeline_append_null_sampled_buffer(
 
    if (!sampled_images || !sampled_image_count)
       return false;
+
+   if (shader && shader->stage == MESA_SHADER_COMPUTE) {
+      /* A real null descriptor preserves both zero fetches and zero dimensions.
+       * The compute backend requires nullDescriptor before accepting it. */
+      enum pipe_format null_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      if (slot < ARRAY_SIZE(shader->info.sampler_type)) {
+         if (shader->info.sampler_type[slot] == TGSI_RETURN_TYPE_UINT)
+            null_format = PIPE_FORMAT_R32G32B32A32_UINT;
+         else if (shader->info.sampler_type[slot] == TGSI_RETURN_TYPE_SINT)
+            null_format = PIPE_FORMAT_R32G32B32A32_SINT;
+      }
+      sampled_images[(*sampled_image_count)++] =
+         (struct yttrium_venus_sampled_image) {
+            .binding = binding,
+            .format = null_format,
+            .buffer = true,
+         };
+      return true;
+   }
 
    if (!yttrium_venus_ensure_null_sampled_buffer(
           screen->venus, format, sizeof(zeros), &null_resource,
@@ -5302,7 +5111,8 @@ yttrium_pipeline_collect_sampled_textures(
              yctx, shader, sampled_stage, sampler_mask, slot, &view_slot)) {
          if (sampled_buffer) {
             if (!yttrium_pipeline_append_null_sampled_buffer(
-                   ctx, binding, sampled_images, sampled_image_count)) {
+                   ctx, shader, slot, binding, sampled_images,
+                   sampled_image_count)) {
                yttrium_pipeline_trace_sampled_texture_fail(
                   "null_sampled_buffer_unavailable", slot, binding,
                   sampler_mask, dst, NULL, NULL);
@@ -5339,7 +5149,8 @@ yttrium_pipeline_collect_sampled_textures(
       if (!src) {
          if (sampled_buffer) {
             if (!yttrium_pipeline_append_null_sampled_buffer(
-                   ctx, binding, sampled_images, sampled_image_count)) {
+                   ctx, shader, slot, binding, sampled_images,
+                   sampled_image_count)) {
                yttrium_pipeline_trace_sampled_texture_fail(
                   "null_sampled_buffer_unavailable", slot, binding,
                   sampler_mask, dst, view, NULL);
@@ -5426,6 +5237,11 @@ yttrium_pipeline_collect_sampled_textures(
          sampled_buffer &&
          yttrium_pipeline_sampled_buffer_uses_r8_bitcast_coords(
             shader, slot, view->format);
+      if (sampled_bitcast_upload && sampled_stage == MESA_SHADER_COMPUTE) {
+         YTTRIUM_WARN("yttrium: compute dispatch skipped owner=yttrium-pipeline reason=sampled_buffer_requires_cpu_expansion slot=%u view_format=%u action=reject-dispatch\n",
+                      slot, view->format);
+         return false;
+      }
       if (sampled_buffer && sampled_format != view->format) {
          yttrium_trace_debug_stringf(
             "yttrium: shader_draw_probe sampled buffer format override slot=%u binding=%u sampler_return=%u view_format=%u sampled_format=%u bitcast_upload=%u",
@@ -5660,82 +5476,6 @@ yttrium_pipeline_collect_sampled_textures(
          };
       (*sampled_image_count)++;
 
-      if (yttrium_pipeline_verbose_trace_enabled()) {
-         const struct yttrium_pipeline_data_summary src_summary =
-            yttrium_pipeline_summarize_data(src->data, (size_t)src->size);
-         const struct yttrium_pipeline_data_summary upload_summary =
-            sampled_buffer ?
-               yttrium_pipeline_summarize_data(buffer_data,
-                                               (size_t)buffer_upload_size) :
-               (struct yttrium_pipeline_data_summary) { 0 };
-
-         yttrium_trace_debug_stringf(
-            "yttrium: shader_draw_probe sampled texture selected slot=%u binding=%u buffer=%u bitcast_upload=%u texture=%p alloc=0x%lx res_id=%u image_id=%llu buffer_id=%llu display=%u primary=%u classic=%u initialized=%u contents=%u layout=%u data=%p upload_data=%p size=0x%llx view_offset=0x%llx view_size=0x%llx buffer_offset=0x%llx buffer_range=0x%llx upload_size=0x%llx blocksize=%u %ux%u format=%u view_format=%u sampled_format=%u sampler_return=%u first=%08x,%08x,%08x,%08x view_first=%08x,%08x,%08x,%08x src_inspected=0x%llx src_nonzero=0x%llx src_first_nz=0x%llx:%08x src_last_nz=0x%llx:%08x src_hash=0x%x upload_inspected=0x%llx upload_nonzero=0x%llx upload_first_nz=0x%llx:%08x upload_last_nz=0x%llx:%08x upload_hash=0x%x",
-            slot,
-            binding,
-            sampled_buffer,
-            sampled_bitcast_upload,
-            (void *)view->texture,
-            (unsigned long)src->hAllocation,
-            src->venus_res_id,
-            (unsigned long long)src->venus.image_obj.id,
-            (unsigned long long)src->venus.buffer_obj.id,
-            src->display_target,
-            src->primary_target,
-            src->classic_display,
-            src->venus.initialized,
-            src->venus.contents_initialized,
-            src->venus.layout,
-            src->data,
-            buffer_data,
-            (unsigned long long)src->size,
-            (unsigned long long)(sampled_buffer ? view->u.buf.offset : 0),
-            (unsigned long long)(sampled_buffer ? view->u.buf.size : 0),
-            (unsigned long long)buffer_offset,
-            (unsigned long long)buffer_range,
-            (unsigned long long)buffer_upload_size,
-            buffer_blocksize,
-            src->base.width0,
-            src->base.height0,
-            src->base.format,
-            view->format,
-            sampled_format,
-            sampler_return,
-            yttrium_pipeline_peek_u32(src->data, (size_t)src->size, 0),
-            yttrium_pipeline_peek_u32(src->data, (size_t)src->size, 1),
-            yttrium_pipeline_peek_u32(src->data, (size_t)src->size, 2),
-            yttrium_pipeline_peek_u32(src->data, (size_t)src->size, 3),
-            yttrium_pipeline_peek_u32(
-               src->data ? (const uint8_t *)src->data + buffer_offset : NULL,
-               sampled_buffer && src->size >= buffer_offset ?
-                  (size_t)(src->size - buffer_offset) : 0, 0),
-            yttrium_pipeline_peek_u32(
-               src->data ? (const uint8_t *)src->data + buffer_offset : NULL,
-               sampled_buffer && src->size >= buffer_offset ?
-                  (size_t)(src->size - buffer_offset) : 0, 1),
-            yttrium_pipeline_peek_u32(
-               src->data ? (const uint8_t *)src->data + buffer_offset : NULL,
-               sampled_buffer && src->size >= buffer_offset ?
-                  (size_t)(src->size - buffer_offset) : 0, 2),
-            yttrium_pipeline_peek_u32(
-               src->data ? (const uint8_t *)src->data + buffer_offset : NULL,
-               sampled_buffer && src->size >= buffer_offset ?
-                  (size_t)(src->size - buffer_offset) : 0, 3),
-            (unsigned long long)src_summary.inspected,
-            (unsigned long long)src_summary.nonzero_bytes,
-            (unsigned long long)src_summary.first_nonzero,
-            src_summary.first_nonzero_u32,
-            (unsigned long long)src_summary.last_nonzero,
-            src_summary.last_nonzero_u32,
-            src_summary.hash,
-            (unsigned long long)upload_summary.inspected,
-            (unsigned long long)upload_summary.nonzero_bytes,
-            (unsigned long long)upload_summary.first_nonzero,
-            upload_summary.first_nonzero_u32,
-            (unsigned long long)upload_summary.last_nonzero,
-            upload_summary.last_nonzero_u32,
-            upload_summary.hash);
-      }
    }
 
    if (*sampled_image_count != pipeline->key.sampled_binding_count) {
@@ -5899,11 +5639,11 @@ yttrium_pipeline_collect_storage_images(
             const bool write = shader->formatless_image_write_mask & slot_mask;
             const bool uint_type = shader->formatless_image_uint_mask & slot_mask;
             const bool sint_type = shader->formatless_image_sint_mask & slot_mask;
-            if (src->base.target == PIPE_BUFFER ||
-                util_format_is_pure_uint(format) != uint_type ||
+            if (util_format_is_pure_uint(format) != uint_type ||
                 util_format_is_pure_sint(format) != sint_type ||
                 !yttrium_venus_storage_image_formatless_format_supported(
-                   yttrium_screen(ctx->screen)->venus, format, read, write)) {
+                   yttrium_screen(ctx->screen)->venus, format, read, write,
+                   src->base.target == PIPE_BUFFER)) {
                YTTRIUM_WARN("yttrium: storage image rejected owner=yttrium-pipeline stage=%s slot=%u format=%s read=%u write=%u uint=%u sint=%u reason=incompatible-formatless-view\n",
                             yttrium_shader_stage_name(candidate), slot,
                             util_format_name(format), read, write,
@@ -6180,17 +5920,10 @@ yttrium_launch_grid(struct pipe_context *ctx,
                    sampled_buffer_mask);
       return;
    }
-   /* Compute sampling is limited to native images. In particular, do not enter
-    * the graphics sampled-buffer expansion/upload path with GPU-written data. */
-   if (sampled_buffer_mask) {
-      YTTRIUM_WARN("yttrium: compute dispatch skipped owner=yttrium-pipeline reason=sampled_buffers_unsupported shader=%p samplers=0x%x buffers=0x%x action=reject-dispatch\n",
-                   cs, cs->sampler_used_mask, sampled_buffer_mask);
-      return;
-   }
-   if (sampled_image_mask)
+   if (sampled_image_mask | sampled_buffer_mask)
       pipeline.key.sampled_stage_mask = 1u << MESA_SHADER_COMPUTE;
    if (!yttrium_pipeline_add_sampled_layouts(
-          yctx, cs, sampled_image_mask, 0, &pipeline.key)) {
+          yctx, cs, sampled_image_mask, sampled_buffer_mask, &pipeline.key)) {
       YTTRIUM_WARN("yttrium: compute dispatch skipped sampled layout failed shader=%p samplers=0x%x\n",
                    cs, cs->sampler_used_mask);
       return;
@@ -6266,6 +5999,11 @@ yttrium_launch_grid(struct pipe_context *ctx,
                    info->grid[0], info->grid[1], info->grid[2],
                    storage_image_count, ubo_upload_count);
    } else {
+      for (uint32_t i = 0; i < sampled_image_count; i++) {
+         if (sampled_images[i].buffer && sampled_images[i].buffer_data &&
+             sampled_images[i].pipe_resource)
+            yttrium_resource(sampled_images[i].pipe_resource)->data_dirty = false;
+      }
       for (uint32_t i = 0; i < storage_image_count; i++) {
          struct yttrium_venus_resource *native = storage_images[i].resource;
          if (!storage_images[i].buffer || !native || !native->owner)
@@ -6502,8 +6240,6 @@ yttrium_pipeline_try_draw(struct pipe_context *ctx,
          info ? info->mode : 0,
          upload.instance_count,
          upload.vertex_upload_count);
-   } else if (!draw_indirect) {
-      yttrium_pipeline_trace_draw_upload(yctx, info, &draws[0], &upload);
    }
 
    struct yttrium_venus_ubo_upload ubo_uploads

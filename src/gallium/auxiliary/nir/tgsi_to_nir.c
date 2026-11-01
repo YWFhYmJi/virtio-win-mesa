@@ -104,6 +104,7 @@ struct ttn_compile {
 
    /* How many TGSI_FILE_IMMEDIATE vec4s have been parsed so far. */
    unsigned next_imm;
+   bool failed;
 
    bool cap_face_is_sysval;
    bool cap_position_is_sysval;
@@ -1262,6 +1263,57 @@ ttn_lit(nir_builder *b, nir_def **src)
                       nir_fmax(b, ttn_channel(b, src[0], X),
                                   nir_imm_float(b, 0.0)),
                       z, nir_imm_float(b, 1.0));
+}
+
+static bool
+ttn_membar(struct ttn_compile *c)
+{
+   const struct tgsi_full_instruction *inst = &c->token->FullInstruction;
+   const struct tgsi_src_register *src = &inst->Src[0].Register;
+   const unsigned supported = TGSI_MEMBAR_SHADER_BUFFER |
+                              TGSI_MEMBAR_ATOMIC_BUFFER |
+                              TGSI_MEMBAR_SHADER_IMAGE |
+                              TGSI_MEMBAR_SHARED |
+                              TGSI_MEMBAR_THREAD_GROUP;
+
+   if (inst->Instruction.NumSrcRegs != 1 ||
+       inst->Instruction.NumDstRegs != 0 ||
+       src->File != TGSI_FILE_IMMEDIATE || src->Indirect || src->Dimension ||
+       src->Absolute || src->Negate || src->Index < 0 ||
+       (unsigned)src->Index >= c->next_imm)
+      goto invalid;
+
+   nir_def *imm = c->imm_defs[src->Index];
+   if (!imm || nir_def_instr_type(imm) != nir_instr_type_load_const)
+      goto invalid;
+
+   const unsigned flags =
+      nir_def_as_load_const(imm)->value[src->SwizzleX].u32;
+   if (flags & ~supported)
+      goto invalid;
+
+   nir_variable_mode modes = 0;
+   if (flags & (TGSI_MEMBAR_SHADER_BUFFER | TGSI_MEMBAR_ATOMIC_BUFFER))
+      modes |= nir_var_mem_ssbo;
+   if (flags & TGSI_MEMBAR_SHADER_IMAGE)
+      modes |= nir_var_image;
+   if (flags & TGSI_MEMBAR_SHARED)
+      modes |= nir_var_mem_shared;
+
+   if (modes) {
+      nir_barrier(&c->build,
+                  .execution_scope = SCOPE_NONE,
+                  .memory_scope = flags & TGSI_MEMBAR_THREAD_GROUP ?
+                                     SCOPE_WORKGROUP : SCOPE_DEVICE,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = modes);
+   }
+   return true;
+
+invalid:
+   fprintf(stderr, "tgsi_to_nir: MEMBAR rejected owner=tgsi-to-nir "
+                   "reason=invalid_immediate action=fail-shader\n");
+   return false;
 }
 
 static void
@@ -2460,6 +2512,11 @@ ttn_emit_instruction(struct ttn_compile *c)
    if (tgsi_op == TGSI_OPCODE_END)
       return;
 
+   if (tgsi_op == TGSI_OPCODE_MEMBAR) {
+      c->failed = !ttn_membar(c);
+      return;
+   }
+
    if ((tgsi_op == TGSI_OPCODE_CASE ||
         tgsi_op == TGSI_OPCODE_DEFAULT ||
         tgsi_op == TGSI_OPCODE_ENDSWITCH) &&
@@ -3080,7 +3137,7 @@ ttn_parse_tgsi(struct ttn_compile *c, const void *tgsi_tokens)
    ret = tgsi_parse_init(&parser, tgsi_tokens);
    assert(ret == TGSI_PARSE_OK);
 
-   while (!tgsi_parse_end_of_tokens(&parser)) {
+   while (!c->failed && !tgsi_parse_end_of_tokens(&parser)) {
       tgsi_parse_token(&parser);
       c->token = &parser.FullToken;
 
@@ -3338,6 +3395,11 @@ ttn_compile_init(const void *tgsi_tokens,
       c->samp_types[i] = nir_type_float32;
 
    ttn_parse_tgsi(c, tgsi_tokens);
+   if (c->failed) {
+      ralloc_free(s);
+      ralloc_free(c);
+      return NULL;
+   }
    if (s->info.stage != MESA_SHADER_GEOMETRY)
       ttn_add_output_stores(c);
 
@@ -3653,6 +3715,8 @@ tgsi_to_nir(const void *tgsi_tokens,
    /* Not in the cache */
 
    c = ttn_compile_init(tgsi_tokens, NULL, screen);
+   if (!c)
+      return NULL;
    s = c->build.shader;
    ttn_finalize_nir(c, screen);
    ralloc_free(c);
@@ -3676,6 +3740,8 @@ tgsi_to_nir_noscreen(const void *tgsi_tokens,
    struct nir_shader *s;
 
    c = ttn_compile_init(tgsi_tokens, options, NULL);
+   if (!c)
+      return NULL;
    s = c->build.shader;
    ralloc_free(c);
 

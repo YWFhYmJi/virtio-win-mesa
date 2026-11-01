@@ -77,6 +77,7 @@ struct D3D9Device
    D3DDDI_DEVICECALLBACKS callbacks;
    struct pipe_screen *screen;
    struct pipe_context *pipe;
+   D3D9Resource *resources;
    struct gdikmt_device_d3dddi gdi_device;
    UINT render_states[256];
    UINT texture_stage_states[D3D9_TEXTURE_STAGE_COUNT][D3D9_TEXTURE_STAGE_STATE_COUNT];
@@ -160,6 +161,9 @@ struct D3D9SubResource
 
 struct D3D9Resource
 {
+   D3D9Device *device;
+   D3D9Resource *previous;
+   D3D9Resource *next;
    HANDLE runtime_handle;
    D3DDDIFORMAT format;
    D3DDDI_POOL pool;
@@ -168,7 +172,8 @@ struct D3D9Resource
    UINT surf_count;
    UINT mip_levels;
    struct pipe_resource *pipe_resource;
-   struct pipe_resource *primary_display_resource;
+   /* Runtime-visible linear Present/capture allocation; never a draw target. */
+   struct pipe_resource *display_resource;
    D3D9SubResource *surfaces;
    UINT notify_lock_mip_cursor;
    UINT notify_lock_subresource;
@@ -315,12 +320,13 @@ D3D9ResourceUsesCpuBufferStorage(const D3D9Resource *resource)
        resource->flags.MightDrawFromLocked);
 }
 
-void D3D9Tracef(const char *format, ...);
 void D3D9Warnf(const char *format, ...);
 void D3D9WarnOncef(volatile LONG *logged, const char *format, ...);
 D3D9Resource *D3D9CastResource(HANDLE resource);
 D3D9SubResource *D3D9GetSubResource(HANDLE resource_handle,
                                     UINT subresource_index);
+bool D3D9PublishResource(D3D9Device *device, D3D9Resource *resource);
+
 bool D3D9UploadSubResource(D3D9Device *device, D3D9Resource *resource,
                            UINT subresource_index);
 D3D9Object *D3D9CreateObject(D3D9ObjectKind kind, size_t payload_size,

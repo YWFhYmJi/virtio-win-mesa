@@ -34,6 +34,7 @@
 
 #include <initguid.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <intrin.h>
 
 #include <d3d11.h>
@@ -70,8 +71,503 @@ static void
 usage(const char *argv0)
 {
    fprintf(stderr,
-             "Usage: %s [--hardware] [--api d3d11|d3d9|d3d9ex] [--bgra] [--srgb] [--fullscreen] [--width W] [--height H] [--frames N] [--flip-sequential] [--flip-discard] [--discard] [--clear-black] [--viewport-inset N] [--scissor-inset N] [--indexed] [--triangle-list] [--strip-quad] [--line-box] [--texture-probe] [--vertex-id-texture-probe] [--ubo-probe] [--cpu-vertex-probe] [--depth-state-probe] [--stencil-mask-probe] [--alpha-blend] [--dst-only-blend] [--write-mask-red] [--sample-mask-zero] [--cull-front] [--cull-back] [--front-cw] [--list-adapters] [--adapter N] [--adapter-name SUBSTR] [--output N] [--benchmark] [--present-only] [--animate] [--warmup N] [--sync-interval N] [--draw-batch-perf] [--draw-count N] [--retire-resource-probe] [--retire-count N] [--upload-perf] [--upload-bytes N] [--upload-iters N]\n",
+             "Usage: %s [--hardware] [--api d3d11|d3d9|d3d9ex] [--bgra] [--srgb] [--fullscreen] [--width W] [--height H] [--frames N] [--flip-sequential] [--flip-discard] [--discard] [--sequential] [--clear-only] [--shared-publication|--shared-publication-flush|--shared-publication-async-present] [--optimal-present-checker] [--optimal-present-tones] [--capture-hold-ms N] [--clear-black] [--viewport-inset N] [--scissor-inset N] [--indexed] [--triangle-list] [--strip-quad] [--line-box] [--texture-probe] [--vertex-id-texture-probe] [--ubo-probe] [--cpu-vertex-probe] [--depth-state-probe] [--stencil-mask-probe] [--alpha-blend] [--dst-only-blend] [--write-mask-red] [--sample-mask-zero] [--cull-front] [--cull-back] [--front-cw] [--list-adapters] [--adapter N] [--adapter-name SUBSTR] [--output N] [--benchmark] [--present-only] [--animate] [--warmup N] [--sync-interval N] [--frame-delay-ms N] [--draw-batch-perf] [--draw-count N] [--retire-resource-probe] [--retire-count N] [--upload-perf] [--upload-bytes N] [--upload-iters N]\n",
             argv0);
+}
+
+static const char *
+dxgiSwapEffectName(DXGI_SWAP_EFFECT effect)
+{
+    switch (effect) {
+    case DXGI_SWAP_EFFECT_DISCARD: return "discard";
+    case DXGI_SWAP_EFFECT_SEQUENTIAL: return "sequential";
+    case DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL: return "flip-sequential";
+    case DXGI_SWAP_EFFECT_FLIP_DISCARD: return "flip-discard";
+    default: return "other";
+    }
+}
+
+/* Restore the desktop on every return after a fullscreen swapchain is created. */
+class FullscreenRestore {
+public:
+    FullscreenRestore(IDXGISwapChain *swapchain, bool fullscreen)
+        : swapchain(swapchain), active(fullscreen) {}
+    ~FullscreenRestore() { restore(); }
+
+    bool restore()
+    {
+        if (!active)
+            return true;
+        const HRESULT set = swapchain->SetFullscreenState(FALSE, nullptr);
+        printf("SetFullscreenState(FALSE) returned %lx\n", set);
+        BOOL fullscreen = TRUE;
+        ComPtr<IDXGIOutput> output;
+        const HRESULT get = swapchain->GetFullscreenState(&fullscreen,
+                                                          output.GetAddressOf());
+        printf("GetFullscreenState after cleanup returned %lx state=%u output=%p\n",
+               get, fullscreen ? 1 : 0, output.Get());
+        active = false;
+        if (FAILED(set) || FAILED(get) || fullscreen) {
+            fprintf(stderr, "Fullscreen cleanup failed set=%lx get=%lx state=%u\n",
+                    set, get, fullscreen ? 1 : 0);
+            return false;
+        }
+        return true;
+    }
+
+private:
+    IDXGISwapChain *swapchain;
+    bool active;
+};
+
+static int
+runD3D11ClearOnly(ID3D11Device *device, ID3D11DeviceContext *context,
+                  IDXGISwapChain *swapchain, DXGI_FORMAT format, unsigned frames,
+                  unsigned syncInterval, unsigned frameDelayMs, bool clearBlack)
+{
+    static const float colors[][4] = {
+        { 1.0f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 1.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, 1.0f, 1.0f },
+        { 1.0f, 1.0f, 1.0f, 1.0f },
+    };
+    static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    for (unsigned frame = 0; frame < frames; ++frame) {
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                fprintf(stderr, "clear-only interrupted before frame=%u\n", frame);
+                return EXIT_FAILURE;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+
+        /* Buffer zero is the current D3D11 backbuffer after each rotation.
+         * Reacquire it and clear every frame, including both flip buffers. */
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        ComPtr<ID3D11Texture2D> backBuffer;
+        HRESULT hr = swapchain->GetBuffer(0, IID_ID3D11Texture2D,
+                                          (void **)backBuffer.GetAddressOf());
+        if (FAILED(hr)) {
+            fprintf(stderr, "clear-only GetBuffer frame=%u failed %lx\n", frame, hr);
+            return EXIT_FAILURE;
+        }
+        ComPtr<ID3D11RenderTargetView> rtv;
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+        rtvDesc.Format = format;
+        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        hr = device->CreateRenderTargetView(backBuffer.Get(), &rtvDesc,
+                                           rtv.GetAddressOf());
+        if (FAILED(hr)) {
+            fprintf(stderr, "clear-only CreateRenderTargetView frame=%u failed %lx\n",
+                    frame, hr);
+            return EXIT_FAILURE;
+        }
+        const float *color = clearBlack ? black : colors[frame % _countof(colors)];
+        context->ClearRenderTargetView(rtv.Get(), color);
+        hr = swapchain->Present(syncInterval, 0);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        printf("clear-only present frame=%u color=%.0f,%.0f,%.0f,%.0f hr=%lx removed=%lx\n",
+               frame, color[0], color[1], color[2], color[3], hr, removed);
+        fflush(stdout);
+        if (hr != S_OK || removed != S_OK) {
+            fprintf(stderr, "clear-only failed frame=%u present=%lx removed=%lx\n",
+                    frame, hr, removed);
+            return EXIT_FAILURE;
+        }
+        if (frameDelayMs)
+            Sleep(frameDelayMs);
+    }
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    context->Flush();
+    /* Match the ordinary smoke test's interval for observing the last frame. */
+    Sleep(5000);
+    const HRESULT removed = device->GetDeviceRemovedReason();
+    printf("clear-only complete frames=%u removed=%lx\n", frames, removed);
+    fflush(stdout);
+    return removed == S_OK ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+static bool optimalPresentNativeModules(bool requireUmd, bool print);
+
+/* Render one swapchain image across internal batches, optionally flushing
+ * before any readback can drain the pending native draw batch.
+ * The staging check proves authoritative rendering contents, while Present
+ * exercises publication. Driver copy counters and host-visible output must be
+ * checked separately: reading our own staging image cannot prove public bytes.
+ */
+static int
+runD3D11SharedPublication(ID3D11Device *device, ID3D11DeviceContext *context,
+                          IDXGISwapChain *swapchain, unsigned draws,
+                          unsigned syncInterval, bool flushBeforeReadback,
+                          bool asyncPresent, unsigned checkerFrames = 0,
+                          unsigned captureHoldMs = 0, bool checkerTones = false)
+{
+    DXGI_SWAP_CHAIN_DESC swapDesc = {};
+    HRESULT hr = swapchain->GetDesc(&swapDesc);
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication GetDesc failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    ComPtr<ID3D11Texture2D> backBuffer;
+    hr = swapchain->GetBuffer(0, IID_ID3D11Texture2D,
+                              (void **)backBuffer.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication GetBuffer failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    D3D11_TEXTURE2D_DESC desc = {};
+    backBuffer->GetDesc(&desc);
+    const bool bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                      desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    const bool rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                      desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    static const UINT grid = 16;
+    if ((!rgba && !bgra) || desc.SampleDesc.Count != 1 ||
+        desc.Width < grid || desc.Height < grid ||
+        desc.Width > 4096 || desc.Height > 4096) {
+        fprintf(stderr, "shared-publication unsupported image %ux%u format=%u samples=%u\n",
+                desc.Width, desc.Height, (unsigned)desc.Format,
+                desc.SampleDesc.Count);
+        return EXIT_FAILURE;
+    }
+
+    printf("shared-publication route=swapchain-present effect=%s windowed=%u swap-flags=0x%x backbuffer-misc=0x%x format=%u width=%u height=%u draws=%u api-shared-handle=0 flush-before-readback=%u\n",
+           dxgiSwapEffectName(swapDesc.SwapEffect), swapDesc.Windowed ? 1 : 0,
+           swapDesc.Flags, desc.MiscFlags, (unsigned)desc.Format,
+           desc.Width, desc.Height, draws, flushBeforeReadback ? 1 : 0);
+    printf("shared-publication DRAW_BATCH_LIMIT=%s storage=canonical-optimal (driver counters required to verify endpoint copies)\n",
+           getenv("D3D10UMD_YTTRIUM_DRAW_BATCH_LIMIT") ?
+               getenv("D3D10UMD_YTTRIUM_DRAW_BATCH_LIMIT") : "default");
+    fflush(stdout);
+
+    ComPtr<ID3D11RenderTargetView> rtv;
+    hr = device->CreateRenderTargetView(backBuffer.Get(), nullptr,
+                                       rtv.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreateRenderTargetView failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    ComPtr<ID3D11VertexShader> vs;
+    hr = device->CreateVertexShader(g_VS, sizeof g_VS, nullptr,
+                                    vs.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreateVertexShader failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    ComPtr<ID3D11PixelShader> ps;
+    hr = device->CreatePixelShader(g_PS, sizeof g_PS, nullptr,
+                                   ps.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreatePixelShader failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    struct Vertex {
+        float position[4];
+        float color[4];
+    };
+    static const D3D11_INPUT_ELEMENT_DESC elements[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, position), D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, offsetof(Vertex, color), D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    ComPtr<ID3D11InputLayout> layout;
+    hr = device->CreateInputLayout(elements, _countof(elements), g_VS,
+                                   sizeof g_VS, layout.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreateInputLayout failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    /* Two oversized triangles with exact endpoint colours. Clipping and the
+     * changing scissor select disjoint tiles without new vertex uploads. */
+    Vertex vertices[] = {
+        {{-1, -1, 0, 1}, {1, 0, 0, 1}},
+        {{-1,  3, 0, 1}, {1, 0, 0, 1}},
+        {{ 3, -1, 0, 1}, {1, 0, 0, 1}},
+        {{-1, -1, 0, 1}, {0, 1, 1, 1}},
+        {{-1,  3, 0, 1}, {0, 1, 1, 1}},
+        {{ 3, -1, 0, 1}, {0, 1, 1, 1}},
+    };
+    if (checkerTones) {
+        static const float tones[][4] = {
+            {0.25f, 0.5f, 0.75f, 1.0f},
+            {0.75f, 0.25f, 0.5f, 1.0f},
+        };
+        for (unsigned i = 0; i < _countof(vertices); ++i)
+            memcpy(vertices[i].color, tones[i / 3], sizeof vertices[i].color);
+    }
+    D3D11_BUFFER_DESC vbDesc = {};
+    vbDesc.ByteWidth = sizeof vertices;
+    vbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA data = {};
+    data.pSysMem = vertices;
+    ComPtr<ID3D11Buffer> vb;
+    hr = device->CreateBuffer(&vbDesc, &data, vb.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreateBuffer failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    D3D11_RASTERIZER_DESC rasterDesc = {};
+    rasterDesc.FillMode = D3D11_FILL_SOLID;
+    rasterDesc.CullMode = D3D11_CULL_NONE;
+    rasterDesc.DepthClipEnable = TRUE;
+    rasterDesc.ScissorEnable = TRUE;
+    ComPtr<ID3D11RasterizerState> raster;
+    hr = device->CreateRasterizerState(&rasterDesc, raster.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreateRasterizerState failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    if (checkerFrames) {
+        /* This branch submits only rendering and Present. In particular, even
+         * a queued staging copy could change submission/publication behavior. */
+        auto pumpMessages = []() {
+            MSG msg;
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                if (msg.message == WM_QUIT)
+                    return false;
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+            return true;
+        };
+        const bool flip = swapDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ||
+                          swapDesc.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        const bool legacy = swapDesc.SwapEffect == DXGI_SWAP_EFFECT_DISCARD ||
+                            swapDesc.SwapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL;
+        const bool srgb = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+                          desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        const DXGI_FORMAT checkerFormat = swapDesc.BufferDesc.Format;
+        if (swapDesc.BufferCount != 2 || (!flip && !(legacy && !swapDesc.Windowed)) ||
+            (srgb && flip) || desc.Format != checkerFormat) {
+            fprintf(stderr, "optimal-present-checker requires two flip buffers or fullscreen legacy buffers, with actual requested format\n");
+            return EXIT_FAILURE;
+        }
+        printf("optimal-present-checker pid=%lu native-only=1 generations=2 frames-per-generation=%u draws-per-frame=%u grid=16 %s barcode=top-row-lsb-left no-readback=1 no-explicit-flush=1 storage=requires-driver-diagnostics\n",
+               GetCurrentProcessId(), checkerFrames, draws,
+               checkerTones ? "tone0-linear=0.25,0.5,0.75 tone1-linear=0.75,0.25,0.5" :
+                              "red-rgb=255,0,0 cyan-rgb=0,255,255");
+        printf("optimal-present-format format=%u srgb=%u palette=%s rgb-tolerance=%u\n",
+               (unsigned)checkerFormat, srgb ? 1 : 0,
+               checkerTones ? "midtones" : "red-cyan", checkerTones ? 1 : 0);
+        fflush(stdout);
+        for (unsigned generation = 0; generation < 2; ++generation) {
+            context->OMSetRenderTargets(0, nullptr, nullptr);
+            rtv.Reset();
+            backBuffer.Reset();
+            if (generation) {
+                hr = swapchain->ResizeBuffers(2, swapDesc.BufferDesc.Width,
+                    swapDesc.BufferDesc.Height, checkerFormat,
+                    swapDesc.Flags);
+                const HRESULT removed = device->GetDeviceRemovedReason();
+                printf("optimal-present-checker resize generation=%u hr=%lx removed=%lx\n",
+                       generation, hr, removed);
+                fflush(stdout);
+                if (hr != S_OK || removed != S_OK)
+                    return EXIT_FAILURE;
+            }
+            for (unsigned frame = 0; frame < checkerFrames; ++frame) {
+                if (!pumpMessages())
+                    return EXIT_FAILURE;
+                context->OMSetRenderTargets(0, nullptr, nullptr);
+                rtv.Reset();
+                backBuffer.Reset();
+                hr = swapchain->GetBuffer(0, IID_ID3D11Texture2D,
+                                          (void **)backBuffer.GetAddressOf());
+                if (FAILED(hr))
+                    return EXIT_FAILURE;
+                backBuffer->GetDesc(&desc);
+                if (desc.Format != checkerFormat ||
+                    desc.SampleDesc.Count != 1 || desc.SampleDesc.Quality ||
+                    desc.MipLevels != 1 || desc.ArraySize != 1 ||
+                    desc.Usage != D3D11_USAGE_DEFAULT || desc.CPUAccessFlags ||
+                    !(desc.BindFlags & D3D11_BIND_RENDER_TARGET)) {
+                    fprintf(stderr, "optimal-present-checker unsupported backbuffer\n");
+                    return EXIT_FAILURE;
+                }
+                hr = device->CreateRenderTargetView(backBuffer.Get(), nullptr,
+                                                    rtv.GetAddressOf());
+                if (FAILED(hr))
+                    return EXIT_FAILURE;
+                D3D11_RENDER_TARGET_VIEW_DESC actualRtv = {};
+                rtv->GetDesc(&actualRtv);
+                if (actualRtv.Format != checkerFormat) {
+                    fprintf(stderr, "optimal-present-checker RTV format mismatch actual=%u expected=%u\n",
+                            (unsigned)actualRtv.Format, (unsigned)checkerFormat);
+                    return EXIT_FAILURE;
+                }
+                const float black[4] = {0, 0, 0, 1};
+                context->ClearRenderTargetView(rtv.Get(), black);
+                context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+                context->IASetInputLayout(layout.Get());
+                context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                const UINT stride = sizeof(Vertex), offset = 0;
+                context->IASetVertexBuffers(0, 1, vb.GetAddressOf(), &stride, &offset);
+                context->VSSetShader(vs.Get(), nullptr, 0);
+                context->PSSetShader(ps.Get(), nullptr, 0);
+                context->RSSetState(raster.Get());
+                D3D11_VIEWPORT viewport = {};
+                viewport.Width = (float)desc.Width;
+                viewport.Height = (float)desc.Height;
+                viewport.MaxDepth = 1;
+                context->RSSetViewports(1, &viewport);
+                const unsigned token = generation * checkerFrames + frame + 1;
+                for (unsigned draw = 0; draw < draws; ++draw) {
+                    const UINT tile = draw % (grid * grid);
+                    const UINT x = tile % grid, y = tile / grid;
+                    const UINT color = y == 0 ? ((token >> x) & 1u) :
+                        ((x + y + draw / (grid * grid) + token) & 1u);
+                    const D3D11_RECT rect = {
+                        (LONG)(x * desc.Width / grid),
+                        (LONG)(y * desc.Height / grid),
+                        (LONG)((x + 1) * desc.Width / grid),
+                        (LONG)((y + 1) * desc.Height / grid),
+                    };
+                    context->RSSetScissorRects(1, &rect);
+                    context->Draw(3, color * 3);
+                }
+                context->OMSetRenderTargets(0, nullptr, nullptr);
+                hr = swapchain->Present(syncInterval, 0);
+                const HRESULT removed = device->GetDeviceRemovedReason();
+                printf("optimal-present-checker present generation=%u frame=%u token=%u hr=%lx removed=%lx\n",
+                       generation, frame, token, hr, removed);
+                fflush(stdout);
+                if (hr != S_OK || removed != S_OK ||
+                    !optimalPresentNativeModules(true, false))
+                    return EXIT_FAILURE;
+            }
+            RECT client = {};
+            POINT origin = {};
+            if (!GetClientRect(swapDesc.OutputWindow, &client) ||
+                !ClientToScreen(swapDesc.OutputWindow, &origin))
+                return EXIT_FAILURE;
+            const unsigned token = (generation + 1) * checkerFrames;
+            printf("optimal-present-checker capture-ready generation=%u frame=%u token=%u checker-phase=%u width=%u height=%u client-screen={%ld,%ld,%ld,%ld} hold-ms=%u public-pixels=requires-host-check\n",
+                   generation, checkerFrames - 1, token,
+                   (draws / (grid * grid) - 1 + token) & 1u,
+                   desc.Width, desc.Height, origin.x, origin.y,
+                   origin.x + client.right, origin.y + client.bottom, captureHoldMs);
+            fflush(stdout);
+            const ULONGLONG deadline = GetTickCount64() + captureHoldMs;
+            while (GetTickCount64() < deadline) {
+                if (!pumpMessages())
+                    return EXIT_FAILURE;
+                Sleep(10);
+            }
+        }
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        printf("optimal-present-checker complete generations=2 presents=%u removed=%lx public-pixels=requires-host-check storage=requires-driver-diagnostics\n",
+               checkerFrames * 2, removed);
+        fflush(stdout);
+        return removed == S_OK ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    D3D11_TEXTURE2D_DESC stagingDesc = desc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    hr = device->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf());
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication CreateTexture2D(staging) failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+
+    const float black[4] = {0, 0, 0, 1};
+    context->ClearRenderTargetView(rtv.Get(), black);
+    context->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    context->IASetInputLayout(layout.Get());
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const UINT stride = sizeof(Vertex), offset = 0;
+    context->IASetVertexBuffers(0, 1, vb.GetAddressOf(), &stride, &offset);
+    context->VSSetShader(vs.Get(), nullptr, 0);
+    context->PSSetShader(ps.Get(), nullptr, 0);
+    context->RSSetState(raster.Get());
+    D3D11_VIEWPORT viewport = {};
+    viewport.Width = (float)desc.Width;
+    viewport.Height = (float)desc.Height;
+    viewport.MaxDepth = 1;
+    context->RSSetViewports(1, &viewport);
+
+    std::vector<UINT> expected((size_t)desc.Width * desc.Height, 0xff000000u);
+    for (unsigned draw = 0; draw < draws; draw++) {
+        const UINT tile = draw % (grid * grid);
+        const UINT x = tile % grid, y = tile / grid;
+        const UINT color = (x + y + draw / (grid * grid)) & 1u;
+        D3D11_RECT rect = {
+            (LONG)(x * desc.Width / grid),
+            (LONG)(y * desc.Height / grid),
+            (LONG)((x + 1) * desc.Width / grid),
+            (LONG)((y + 1) * desc.Height / grid),
+        };
+        context->RSSetScissorRects(1, &rect);
+        context->Draw(3, color * 3);
+        const UINT pixel = bgra ? (color ? 0xff00ffffu : 0xffff0000u) :
+                                  (color ? 0xffffff00u : 0xff0000ffu);
+        for (LONG row = rect.top; row < rect.bottom; row++) {
+            for (LONG column = rect.left; column < rect.right; column++)
+                expected[(size_t)row * desc.Width + column] = pixel;
+        }
+    }
+
+    context->OMSetRenderTargets(0, nullptr, nullptr);
+    if (flushBeforeReadback)
+        context->Flush();
+    context->CopyResource(staging.Get(), backBuffer.Get());
+    /* Record the reference copy before Present can discard the backbuffer.
+     * In this mode the host must capture the published image before Map adds
+     * a CPU completion wait. Submission alone must supply the GPU ordering. */
+    if (asyncPresent) {
+        hr = swapchain->Present(syncInterval, 0);
+        const HRESULT removed = device->GetDeviceRemovedReason();
+        printf("shared-publication present-before-readback=1 present=%lx removed=%lx public-pixels=requires-host-check\n",
+               hr, removed);
+        fflush(stdout);
+        if (hr != S_OK || removed != S_OK)
+            return EXIT_FAILURE;
+        Sleep(5000);
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        fprintf(stderr, "shared-publication Map failed %lx removed=%lx\n", hr,
+                device->GetDeviceRemovedReason());
+        return EXIT_FAILURE;
+    }
+    unsigned mismatches = 0;
+    for (UINT row = 0; row < desc.Height; row++) {
+        const UINT *pixels = (const UINT *)((const BYTE *)mapped.pData +
+                                          (size_t)row * mapped.RowPitch);
+        for (UINT column = 0; column < desc.Width; column++) {
+            const UINT reference = expected[(size_t)row * desc.Width + column];
+            if (pixels[column] != reference) {
+                if (mismatches < 8) {
+                    fprintf(stderr, "shared-publication pixel %u,%u got=0x%08x expected=0x%08x\n",
+                            column, row, pixels[column], reference);
+                }
+                mismatches++;
+            }
+        }
+    }
+    context->Unmap(staging.Get(), 0);
+    if (mismatches) {
+        fprintf(stderr, "shared-publication FAIL mismatches=%u pixels=%u\n",
+                mismatches, desc.Width * desc.Height);
+        return EXIT_FAILURE;
+    }
+    if (!asyncPresent)
+        hr = swapchain->Present(syncInterval, 0);
+    const HRESULT removed = device->GetDeviceRemovedReason();
+    printf("shared-publication authoritative-pixels=PASS pixels=%u draws=%u present=%lx removed=%lx public-pixels=requires-host-check copies=requires-driver-counters\n",
+           desc.Width * desc.Height, draws, hr, removed);
+    fflush(stdout);
+    if (hr != S_OK || removed != S_OK)
+        return EXIT_FAILURE;
+    if (!asyncPresent)
+        Sleep(5000);
+    return EXIT_SUCCESS;
 }
 
 static bool
@@ -115,6 +611,46 @@ wideContainsAsciiCaseInsensitive(const wchar_t *haystack, const char *needle)
     }
 
     return false;
+}
+
+static bool
+optimalPresentNativeModules(bool requireUmd, bool print)
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "optimal-present-checker module snapshot failed %lu\n", GetLastError());
+        return false;
+    }
+    MODULEENTRY32W module = {};
+    module.dwSize = sizeof(module);
+    bool nativeUmd = false, allowed = true;
+    if (!Module32FirstW(snapshot, &module)) {
+        CloseHandle(snapshot);
+        return false;
+    }
+    do {
+        const bool umd = wideContainsAsciiCaseInsensitive(module.szModule, "viogpu_d3d10");
+        nativeUmd = nativeUmd || umd;
+        if (wideContainsAsciiCaseInsensitive(module.szModule, "on12")) {
+            fprintf(stderr, "optimal-present-checker native-only rejected module=%ls path=%ls\n",
+                    module.szModule, module.szExePath);
+            allowed = false;
+        } else if (print && (umd ||
+                   wideContainsAsciiCaseInsensitive(module.szModule, "d3d11.dll") ||
+                   wideContainsAsciiCaseInsensitive(module.szModule, "dxgi.dll"))) {
+            printf("optimal-present-checker module=%ls path=%ls\n",
+                   module.szModule, module.szExePath);
+        }
+    } while (Module32NextW(snapshot, &module));
+    const DWORD error = GetLastError();
+    CloseHandle(snapshot);
+    if (error != ERROR_NO_MORE_FILES || (requireUmd && !nativeUmd)) {
+        fprintf(stderr, "optimal-present-checker native-only enumeration error=%lu native-umd=%u\n",
+                error, nativeUmd ? 1 : 0);
+        return false;
+    }
+    return allowed;
 }
 
 static void
@@ -316,7 +852,8 @@ reportUploadBenchmark(std::vector<double> &mapMs, std::vector<double> &writeMs,
 static void
 reportPresentBenchmark(std::vector<double> &presentMs, bool presentOnly,
                        unsigned syncInterval, unsigned width, unsigned height,
-                       const char *swapName, const char *formatName)
+                       const char *swapName, const char *formatName,
+                       unsigned frameDelayMs)
 {
     if (presentMs.empty()) {
         return;
@@ -342,9 +879,9 @@ reportPresentBenchmark(std::vector<double> &presentMs, bool presentOnly,
         return presentMs[idx];
     };
     printf("\n=== present benchmark ===\n");
-    printf("samples=%u present-only=%u sync-interval=%u %ux%u swap=%s format=%s\n",
-           (unsigned)n, presentOnly ? 1 : 0, syncInterval, width, height,
-           swapName, formatName);
+    printf("samples=%u present-only=%u sync-interval=%u frame-delay-ms=%u %ux%u swap=%s format=%s\n",
+           (unsigned)n, presentOnly ? 1 : 0, syncInterval, frameDelayMs,
+           width, height, swapName, formatName);
     printf("present ms: avg=%.4f min=%.4f median=%.4f p95=%.4f p99=%.4f max=%.4f stddev=%.4f\n",
            mean, presentMs.front(), pct(50), pct(95), pct(99),
            presentMs.back(), stddev);
@@ -420,7 +957,8 @@ runD3D9(bool ex,
         unsigned windowWidth, unsigned windowHeight, bool fullscreen,
         unsigned frames, bool framesExplicitlySet, bool benchmark,
         bool presentOnly, bool animate, unsigned warmupFrames,
-        unsigned syncInterval, bool clearBlack, bool writeMaskRed)
+        unsigned syncInterval, unsigned frameDelayMs,
+        bool clearBlack, bool writeMaskRed)
 {
     HINSTANCE hInstance = GetModuleHandle(nullptr);
 
@@ -576,9 +1114,9 @@ runD3D9(bool ex,
         QueryPerformanceFrequency(&qpf);
         qpcToMs = 1000.0 / (double)qpf.QuadPart;
         presentMs.reserve(frames);
-        printf("benchmark: frames=%u warmup=%u present-only=%u sync-interval=%u %ux%u swap=%s format=D3DFMT_X8R8G8B8\n",
+        printf("benchmark: frames=%u warmup=%u present-only=%u sync-interval=%u frame-delay-ms=%u %ux%u swap=%s format=D3DFMT_X8R8G8B8\n",
                frames, warmupFrames, presentOnly ? 1 : 0, syncInterval,
-               windowWidth, windowHeight, swapName);
+               frameDelayMs, windowWidth, windowHeight, swapName);
     }
 
     LARGE_INTEGER animQpf = {};
@@ -702,6 +1240,10 @@ runD3D9(bool ex,
             fprintf(stderr, "Present failed %lx\n", hr);
             break;
         }
+        /* Test pacing belongs outside the Present timing interval. */
+        if (frameDelayMs) {
+            Sleep(frameDelayMs);
+        }
     }
 
     if (writeMaskRed && !colorMaskProbeRan) {
@@ -713,7 +1255,7 @@ runD3D9(bool ex,
     if (benchmark && !presentMs.empty()) {
         reportPresentBenchmark(presentMs, presentOnly, syncInterval,
                                windowWidth, windowHeight, swapName,
-                               "D3DFMT_X8R8G8B8");
+                               "D3DFMT_X8R8G8B8", frameDelayMs);
     } else if (!benchmark && !animate) {
         Sleep(5000);
     }
@@ -771,12 +1313,22 @@ main(int argc, char *argv[])
     UINT selectedOutputIndex = 0;
     bool benchmark = false;
     bool presentOnly = false;
+    bool clearOnly = false;
+    bool sharedPublication = false;
+    bool sharedPublicationFlush = false;
+    bool sharedPublicationAsyncPresent = false;
+    bool optimalPresentChecker = false;
+    bool optimalPresentTones = false;
+    unsigned captureHoldMs = 20000;
+    bool captureHoldExplicitlySet = false;
     bool animate = false;
     bool framesExplicitlySet = false;
     unsigned warmupFrames = 100;
     unsigned syncInterval = 0;
+    unsigned frameDelayMs = 0;
     bool drawBatchPerf = false;
     unsigned drawCount = 50000;
+    bool drawCountExplicitlySet = false;
     bool retireResourceProbe = false;
     unsigned retireCount = 256;
     bool uploadPerf = false;
@@ -852,6 +1404,28 @@ main(int argc, char *argv[])
             swapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         } else if (strcmp(argv[i], "--discard") == 0) {
             swapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        } else if (strcmp(argv[i], "--sequential") == 0) {
+            swapEffect = DXGI_SWAP_EFFECT_SEQUENTIAL;
+        } else if (strcmp(argv[i], "--clear-only") == 0) {
+            clearOnly = true;
+        } else if (strcmp(argv[i], "--shared-publication") == 0) {
+            sharedPublication = true;
+        } else if (strcmp(argv[i], "--shared-publication-flush") == 0) {
+            sharedPublication = true;
+            sharedPublicationFlush = true;
+        } else if (strcmp(argv[i], "--shared-publication-async-present") == 0) {
+            sharedPublication = true;
+            sharedPublicationAsyncPresent = true;
+        } else if (strcmp(argv[i], "--optimal-present-checker") == 0) {
+            optimalPresentChecker = true;
+        } else if (strcmp(argv[i], "--optimal-present-tones") == 0) {
+            optimalPresentTones = true;
+        } else if (strcmp(argv[i], "--capture-hold-ms") == 0) {
+            if (!parseUIntArg(argc, argv, &i, &captureHoldMs)) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            captureHoldExplicitlySet = true;
         } else if (strcmp(argv[i], "--clear-black") == 0) {
             clearBlack = true;
         } else if (strcmp(argv[i], "--viewport-inset") == 0) {
@@ -994,6 +1568,22 @@ main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             syncInterval = (unsigned)value;
+        } else if (strcmp(argv[i], "--frame-delay-ms") == 0) {
+            if (i + 1 >= argc || !argv[i + 1][0] || argv[i + 1][0] == '-' ||
+                !parseUIntArg(argc, argv, &i, &frameDelayMs) ||
+                frameDelayMs > 1000) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+        } else if (strncmp(argv[i], "--frame-delay-ms=", 17) == 0) {
+            const char *valueText = argv[i] + 17;
+            char *end = nullptr;
+            unsigned long value = strtoul(valueText, &end, 0);
+            if (!*valueText || *valueText == '-' || !end || *end || value > 1000) {
+                usage(argv[0]);
+                return EXIT_FAILURE;
+            }
+            frameDelayMs = (unsigned)value;
         } else if (strcmp(argv[i], "--draw-batch-perf") == 0) {
             drawBatchPerf = true;
         } else if (strcmp(argv[i], "--draw-count") == 0) {
@@ -1001,6 +1591,7 @@ main(int argc, char *argv[])
                 usage(argv[0]);
                 return EXIT_FAILURE;
             }
+            drawCountExplicitlySet = true;
         } else if (strncmp(argv[i], "--draw-count=", 13) == 0) {
             char *end = nullptr;
             unsigned long value = strtoul(argv[i] + 13, &end, 0);
@@ -1009,6 +1600,7 @@ main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
             drawCount = (unsigned)value;
+            drawCountExplicitlySet = true;
         } else if (strcmp(argv[i], "--upload-perf") == 0) {
             uploadPerf = true;
         } else if (strcmp(argv[i], "--upload-bytes") == 0) {
@@ -1050,6 +1642,39 @@ main(int argc, char *argv[])
         }
     }
 
+    if (optimalPresentChecker) {
+        if (!framesExplicitlySet)
+            frames = 8;
+        if (!drawCountExplicitlySet)
+            drawCount = 512;
+        const bool flip = swapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ||
+                          swapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        const bool legacy = swapEffect == DXGI_SWAP_EFFECT_DISCARD ||
+                            swapEffect == DXGI_SWAP_EFFECT_SEQUENTIAL;
+        if (api != Api::D3D11 || listAdapters ||
+            (!selectAdapterByIndex && !selectedAdapterName) ||
+            (!flip && !(legacy && fullscreen)) || (srgb && flip) ||
+            frames < 8 || frames > 32 || drawCount < 512 ||
+            drawCount > 65536 || drawCount % 256 ||
+            captureHoldMs < 1000 || captureHoldMs > 30000 ||
+            windowWidth < 16 || windowHeight < 16 ||
+            windowWidth > 4096 || windowHeight > 4096 ||
+            benchmark || presentOnly || animate || clearOnly || sharedPublication ||
+            drawBatchPerf || retireResourceProbe || uploadPerf || frameDelayMs ||
+            clearBlack || viewportInset || useScissor || useIndexed ||
+            useTriangleList || useStripQuad || useLineBox || textureProbe ||
+            vertexIdTextureProbe || uboProbe || cpuVertexProbe || depthStateProbe ||
+            stencilMaskProbe || blendMode != BlendMode::None || writeMaskRed ||
+            sampleMaskZero || cullMode != D3D11_CULL_NONE || !frontCounterClockwise) {
+            fprintf(stderr, "--optimal-present-checker requires exclusive native D3D11, explicit VirtIO adapter, flip or fullscreen legacy swap effect (sRGB requires legacy), frames8..32, draws512..65536 multiple256, hold1000..30000ms and dimensions16..4096\n");
+            return EXIT_FAILURE;
+        }
+        if (!optimalPresentNativeModules(false, false))
+            return EXIT_FAILURE;
+    } else if (captureHoldExplicitlySet || optimalPresentTones) {
+        fprintf(stderr, "--capture-hold-ms and --optimal-present-tones require --optimal-present-checker\n");
+        return EXIT_FAILURE;
+    }
     if (selectAdapterByIndex && selectedAdapterName) {
         fprintf(stderr, "--adapter and --adapter-name are mutually exclusive\n");
         return EXIT_FAILURE;
@@ -1066,6 +1691,30 @@ main(int argc, char *argv[])
         fprintf(stderr, "--upload-perf is only supported with --api d3d11\n");
         return EXIT_FAILURE;
     }
+    if (clearOnly && (api != Api::D3D11 || sharedPublication || benchmark || presentOnly || animate ||
+                      drawBatchPerf || retireResourceProbe || uploadPerf ||
+                      viewportInset || useScissor || useIndexed || useTriangleList ||
+                      useStripQuad || useLineBox || textureProbe || vertexIdTextureProbe ||
+                      uboProbe || cpuVertexProbe || depthStateProbe || stencilMaskProbe ||
+                      blendMode != BlendMode::None || writeMaskRed || sampleMaskZero ||
+                      cullMode != D3D11_CULL_NONE || !frontCounterClockwise)) {
+        fprintf(stderr, "--clear-only requires --api d3d11 and cannot be combined with draw or benchmark modes\n");
+        return EXIT_FAILURE;
+    }
+    if (sharedPublication &&
+        (api != Api::D3D11 || benchmark || presentOnly || animate || clearOnly ||
+         drawBatchPerf || retireResourceProbe || uploadPerf || frames != 1 ||
+         clearBlack || viewportInset || useScissor || useIndexed ||
+         useTriangleList || useStripQuad || useLineBox || textureProbe ||
+         vertexIdTextureProbe || uboProbe || cpuVertexProbe || depthStateProbe ||
+         stencilMaskProbe || blendMode != BlendMode::None || writeMaskRed ||
+         sampleMaskZero || cullMode != D3D11_CULL_NONE ||
+         !frontCounterClockwise)) {
+        fprintf(stderr, "shared-publication modes require --api d3d11, one frame, and cannot be combined with other draw or benchmark modes\n");
+        return EXIT_FAILURE;
+    }
+    if (sharedPublication && !drawCountExplicitlySet)
+        drawCount = 512;
     if (uboProbe && vertexIdTextureProbe) {
         fprintf(stderr, "--ubo-probe and --vertex-id-texture-probe are mutually exclusive\n");
         return EXIT_FAILURE;
@@ -1116,12 +1765,17 @@ main(int argc, char *argv[])
         frames = 1000;
     }
 
+    if (frameDelayMs) {
+        printf("frame-delay-ms=%u test pacing excluded from Present timing\n",
+               frameDelayMs);
+    }
+
     if (api != Api::D3D11) {
         return runD3D9(api == Api::D3D9Ex,
                        windowWidth, windowHeight, fullscreen,
                        frames, framesExplicitlySet, benchmark,
                        presentOnly, animate, warmupFrames,
-                       syncInterval, clearBlack, writeMaskRed);
+                       syncInterval, frameDelayMs, clearBlack, writeMaskRed);
     }
 
     ComPtr<IDXGIFactory1> pFactory;
@@ -1143,6 +1797,16 @@ main(int argc, char *argv[])
                            selectedAdapterIndex,
                            selectedAdapterName,
                            pSelectedAdapter.GetAddressOf())) {
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (optimalPresentChecker) {
+        DXGI_ADAPTER_DESC1 selected = {};
+        if (FAILED(pSelectedAdapter->GetDesc1(&selected)) ||
+            (selected.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ||
+            !wideContainsAsciiCaseInsensitive(selected.Description, "VirtIO")) {
+            fprintf(stderr, "optimal-present-checker requires hardware VirtIO adapter\n");
             return EXIT_FAILURE;
         }
     }
@@ -1292,13 +1956,27 @@ main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    FullscreenRestore fullscreenRestore(pSwapChain.Get(), fullscreen);
+
     if (fullscreen) {
         DXGI_MODE_DESC mode = SwapChainDesc.BufferDesc;
+        if (optimalPresentChecker && srgb) {
+            /* Display mode stays UNORM; the legacy backbuffer and RTV remain
+             * the explicitly requested sRGB format. */
+            mode.Format = bgra ? DXGI_FORMAT_B8G8R8A8_UNORM :
+                                 DXGI_FORMAT_R8G8B8A8_UNORM;
+            printf("optimal-present-format display-mode=%u render-format=%u\n",
+                   (unsigned)mode.Format, (unsigned)SwapChainDesc.BufferDesc.Format);
+        }
         hr = pSwapChain->ResizeTarget(&mode);
         printf("ResizeTarget fullscreen mode returned %lx\n", hr);
+        if (FAILED(hr))
+            return EXIT_FAILURE;
 
         hr = pSwapChain->SetFullscreenState(TRUE, pSelectedOutput.Get());
         printf("SetFullscreenState(TRUE) returned %lx\n", hr);
+        if (FAILED(hr))
+            return EXIT_FAILURE;
 
         BOOL fullscreenState = FALSE;
         ComPtr<IDXGIOutput> fullscreenOutput;
@@ -1306,7 +1984,25 @@ main(int argc, char *argv[])
                                             fullscreenOutput.GetAddressOf());
         printf("GetFullscreenState returned %lx state=%u output=%p\n",
                hr, fullscreenState ? 1 : 0, fullscreenOutput.Get());
+        if (FAILED(hr) || !fullscreenState) {
+            fprintf(stderr, "Fullscreen entry failed get=%lx state=%u\n",
+                    hr, fullscreenState ? 1 : 0);
+            return EXIT_FAILURE;
+        }
     }
+
+    DXGI_SWAP_CHAIN_DESC effectiveDesc;
+    hr = pSwapChain->GetDesc(&effectiveDesc);
+    if (FAILED(hr)) {
+        fprintf(stderr, "GetDesc swapchain failed %lx\n", hr);
+        return EXIT_FAILURE;
+    }
+    printf("swapchain effect=%s windowed=%u format=%u clear-only=%u width=%u height=%u buffers=%u\n",
+           dxgiSwapEffectName(effectiveDesc.SwapEffect), effectiveDesc.Windowed ? 1 : 0,
+           (unsigned)effectiveDesc.BufferDesc.Format, clearOnly ? 1 : 0,
+           effectiveDesc.BufferDesc.Width, effectiveDesc.BufferDesc.Height,
+           effectiveDesc.BufferCount);
+    fflush(stdout);
 
     ComPtr<IDXGIDevice> pDXGIDevice;
     hr = pDevice->QueryInterface(IID_IDXGIDevice, (void **)&pDXGIDevice);
@@ -1330,6 +2026,40 @@ main(int argc, char *argv[])
     }
 
     printf("using %S\n", Desc.Description);
+    if (optimalPresentChecker) {
+        if (effectiveDesc.BufferDesc.Format != SwapChainDesc.BufferDesc.Format) {
+            fprintf(stderr, "optimal-present-checker swapchain format mismatch requested=%u actual=%u\n",
+                    (unsigned)SwapChainDesc.BufferDesc.Format,
+                    (unsigned)effectiveDesc.BufferDesc.Format);
+            return EXIT_FAILURE;
+        }
+        if (!wideContainsAsciiCaseInsensitive(Desc.Description, "VirtIO") ||
+            !optimalPresentNativeModules(true, true))
+            return EXIT_FAILURE;
+        const int result = runD3D11SharedPublication(
+            pDevice.Get(), pDeviceContext.Get(), pSwapChain.Get(), drawCount,
+            syncInterval, false, false, frames, captureHoldMs, optimalPresentTones);
+        const bool restored = fullscreenRestore.restore();
+        DestroyWindow(hWnd);
+        return restored ? result : EXIT_FAILURE;
+    }
+    if (sharedPublication) {
+        const int result = runD3D11SharedPublication(
+            pDevice.Get(), pDeviceContext.Get(), pSwapChain.Get(), drawCount,
+            syncInterval, sharedPublicationFlush, sharedPublicationAsyncPresent);
+        const bool restored = fullscreenRestore.restore();
+        DestroyWindow(hWnd);
+        return restored ? result : EXIT_FAILURE;
+    }
+    if (clearOnly) {
+        const int result = runD3D11ClearOnly(pDevice.Get(), pDeviceContext.Get(),
+                                            pSwapChain.Get(), effectiveDesc.BufferDesc.Format,
+                                            frames, syncInterval,
+                                            frameDelayMs, clearBlack);
+        const bool restored = fullscreenRestore.restore();
+        DestroyWindow(hWnd);
+        return restored ? result : EXIT_FAILURE;
+    }
     const bool usesVertexIdShader = vertexIdTextureProbe || uboProbe;
 
     ComPtr<ID3D11Texture2D> pBackBuffer;
@@ -1770,11 +2500,7 @@ main(int argc, char *argv[])
         frames = 1000;
     }
 
-    const char *swapEffectName =
-        swapEffect == DXGI_SWAP_EFFECT_DISCARD ? "discard" :
-        swapEffect == DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL ? "flip-sequential" :
-        swapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD ? "flip-discard" :
-                                                         "other";
+    const char *swapEffectName = dxgiSwapEffectName(swapEffect);
     const char *swapFormatName =
         bgra ? (srgb ? "B8G8R8A8_UNORM_SRGB" : "B8G8R8A8_UNORM") :
                (srgb ? "R8G8B8A8_UNORM_SRGB" : "R8G8B8A8_UNORM");
@@ -1793,9 +2519,10 @@ main(int argc, char *argv[])
         QueryPerformanceFrequency(&qpf);
         qpcToMs = 1000.0 / (double)qpf.QuadPart;
         presentMs.reserve(frames);
-        printf("benchmark: frames=%u warmup=%u present-only=%u sync-interval=%u %ux%u swap=%s format=%s\n",
+        printf("benchmark: frames=%u warmup=%u present-only=%u sync-interval=%u frame-delay-ms=%u %ux%u swap=%s format=%s\n",
                frames, warmupFrames, presentOnly ? 1 : 0, syncInterval,
-               windowWidth, windowHeight, swapEffectName, swapFormatName);
+               frameDelayMs, windowWidth, windowHeight, swapEffectName,
+               swapFormatName);
     }
 
     LARGE_INTEGER animQpf = {};
@@ -2132,6 +2859,10 @@ main(int argc, char *argv[])
             fprintf(stderr,"Present failed %lx\n\r", hr);
             return EXIT_FAILURE;
         }
+        /* Keep the deliberate test delay out of Present latency statistics. */
+        if (frameDelayMs) {
+            Sleep(frameDelayMs);
+        }
     }
 
     if (wallTiming) {
@@ -2141,7 +2872,7 @@ main(int argc, char *argv[])
     if (benchmark && !presentMs.empty()) {
         reportPresentBenchmark(presentMs, presentOnly, syncInterval,
                                windowWidth, windowHeight, swapEffectName,
-                               swapFormatName);
+                               swapFormatName, frameDelayMs);
         if (wallTiming) {
             reportFrameRate((unsigned)presentMs.size(),
                             (double)(wallEnd.QuadPart - wallStart.QuadPart) *
@@ -2176,8 +2907,9 @@ main(int argc, char *argv[])
 
     pDeviceContext->RSSetState(nullptr);
 
-    if (fullscreen) {
-        pSwapChain->SetFullscreenState(FALSE, nullptr);
+    if (!fullscreenRestore.restore()) {
+        DestroyWindow(hWnd);
+        return EXIT_FAILURE;
     }
 
     DestroyWindow(hWnd);

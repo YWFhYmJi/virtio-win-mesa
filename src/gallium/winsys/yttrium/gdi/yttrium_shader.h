@@ -8,7 +8,6 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "compiler/shader_enums.h"
 #include "pipe/p_context.h"
@@ -78,6 +77,7 @@ struct yttrium_shader_state {
    uint16_t push_constant_source_words[YTTRIUM_SHADER_MAX_PUSH_CONSTANT_WORDS];
    uint32_t sampler_used_mask;
    uint64_t image_used_mask;
+   uint64_t typed_buffer_image_mask;
    uint32_t sampler_binding_valid_mask;
    uint32_t sampler_mixed_return_mask;
    uint16_t sampler_view_index[PIPE_MAX_SAMPLERS];
@@ -310,14 +310,6 @@ yttrium_delete_tes_state(struct pipe_context *ctx, void *state);
 
 void
 yttrium_delete_compute_state(struct pipe_context *ctx, void *state);
-
-void
-yttrium_dump_capture_shader(const struct yttrium_shader_state *shader,
-                            const char *path);
-
-void
-yttrium_write_shader_capture_metadata(FILE *file,
-                                      const struct yttrium_shader_state *shader);
 
 #ifdef __cplusplus
 }

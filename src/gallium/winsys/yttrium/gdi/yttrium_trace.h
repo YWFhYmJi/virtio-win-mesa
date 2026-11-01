@@ -375,9 +375,6 @@ bool
 yttrium_trace_verbose_etw_text_enabled(void);
 
 void
-yttrium_trace_sync_wait_summary(const char *message);
-
-void
 yttrium_trace_screen_create(uint32_t supports_3d,
                             uint32_t has_resource_blob,
                             uint32_t has_host_visible,
