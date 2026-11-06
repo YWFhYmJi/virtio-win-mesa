@@ -55,7 +55,7 @@ jobs:
         cd build
         
         meson setup .. --prefix=$env:MESA_PREFIX_ARM64 --cross-file "$CROSS_FILE" `
-          -Dgallium-drivers=virgl `
+          -Dgallium-drivers=zink `
           -Dgallium-d3d10umd=true `
           -Dgallium-yttrium=true `
           -Dgallium-wgl-dll-name=viogpu_wgl `
